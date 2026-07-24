@@ -128,8 +128,16 @@ The interface should be a local webserver with no authentication required. It sh
 The backend is written in Rust. The client code should be responsive and the UI should work on mobile or a desktop
 browser.
 
-The AI used is Gemini 3.6 Flash. The user must provide an API key in ~/gemini_creds.txt or a similar file.
+The default AI used is Gemini 3.6 Flash. The user must provide an API key in ~/gemini_creds.txt or a similar file.
 It can also be specified as an environment variable.
+
+Codex is also available as an alternative. For Codex to work the user must authenticate via the Codex CLI
+and then the local credentials are used. All the DAW AI tooling integration is optimized for Gemini,
+but the same tools should be available to Codex and registered with it. Because Codex cannot take
+audio as input, the "listening" tool that renders audio should save it to a local file and return
+the path to Codex for it to analyze.
+
+There is a dropdown menu on the Debug tab to switch between Codex and Gemini.
 
 Since Gemini is best at writing code and config files, the internal synth and other tools that DAW-AI uses should
 be represented a way that is friendly for Gemini:
