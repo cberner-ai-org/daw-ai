@@ -56,6 +56,9 @@ The following sound tools should be implemented and available in the advanced vi
 These are all implemented in the DAW AI backend. The client-side JS contains a basic editor to modify the sound graph and view it,
 but all execution of it is in the backend server process.
 
+The MIDI clips are built into DAW AI, but everything else: Instrument, Effects, Modulation, Routing primarily relies on
+those implementations in Surge XT. DAW AI adds only a minimal layer on top to expose them to Gemini, persist settings...etc.
+
 #### MIDI Clip
 Contains notes, including their timing, duration, pitch, and velocity.
 
@@ -75,6 +78,7 @@ that the model uses.
 #### Modulator / Automation
 Generates time-varying control values—such as envelopes, LFOs, or arbitrary curves—which can control any Instrument or Effect parameter.
 My also be tempo sync'ed, or configured to trigger off a MIDI note event
+
 
 #### Routing
 Instruments, effects, and modulators can be connected into a sound graph.
@@ -119,7 +123,8 @@ DO NOT include extra code to support legacy project files
 
 The interface should be a local webserver with no authentication required. It should run on port 8888 by default.
 
-The backend is written in Rust. The client code should be responsive and the UI should work on mobile or a desktop
+The backend is written in Rust and the sound engine primarily relies on Surge XT, and should minimize the amount
+of custom audio code in DAW AI. The client code should be responsive and the UI should work on mobile or a desktop
 browser.
 
 The default AI used is Gemini 3.6 Flash. The user must provide an API key in ~/gemini_creds.txt or a similar file.
