@@ -49,9 +49,6 @@ that is useful to a coding assistant. The information is easy for the user to co
 external coding assistant, if they need help debugging issues in DAW AI itself. It can be assumed that
 the user and coding assistant have access to the machine DAW AI is deployed on, to read additional logs...etc.
 
-This tab also has a dropdown selector to change the sound engine between "Surge XT" and "built-in". The
-latter uses a built-in custom audio engine. Surge XT is the default.
-
 ### Sound tools
 
 The following sound tools should be implemented and available in the advanced view of the UI and also to the AI model.
@@ -69,14 +66,11 @@ For the current MVP, this should be a basic implementation, which relying on [Su
 and exposes basic presets and parameters. Use the official [surge-rs](https://github.com/surge-synthesizer/surge-rs) Rust bindings.
 They are alpha quality, so if there are critical bugs, it is ok to vendor it and patch the bugs.
 
-There is also a separate "built-in" backend that is entirely custom. This does not need to be production quality, and is mainly for debugging.
-Apply reasonable effort here to make it sound good and support the same range of things as we use from Surge for the Surge synthesizer.
-
 #### Effect
 Processes sound produced by an instrument, such as a filter, distortion, compressor, delay, or reverb, and exposes configurable parameters. May be chained with previous Effect.
 
-Like Instrument Surge XT is the default sound effects engine and it should expose the Surge native effects, including those from presets
-that the model uses. The built-in backend is also implemented, for the same debugging use cases as Instrument.
+Like Instrument Surge XT is the sound effects engine and it should expose the Surge native effects, including those from presets
+that the model uses.
 
 #### Modulator / Automation
 Generates time-varying control values—such as envelopes, LFOs, or arbitrary curves—which can control any Instrument or Effect parameter.
@@ -116,7 +110,7 @@ it to the backend server to be included in the logs.
 The implementation MUST NOT hardcode niche sound tools such as a dubstep "drop" tool. All the tools should
 be simple primitives that the AI (or user) uses to build the sound.
 
-The implementation MUST NOT use Web Audio. It must be a custom backend that runs in the server process.
+The implementation MUST NOT use Web Audio. It must be a backend built on Surge XT that runs in the server process.
 
 ### Implementation
 
