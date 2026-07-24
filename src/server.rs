@@ -12,26 +12,38 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::audio_analysis;
+use crate::audio_stream::{
+    ByteRange, WAV_HEADER_BYTES, bounded_audio_byte_range, wait_for_playback_window,
+};
+use crate::concurrency::Limiter;
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
 use crate::gemini_tools::render_audio_request_with_backend;
 use crate::model::{ChannelOperationAction, Project, Studio, StudioError, json_string};
+#[cfg(test)]
+use crate::project_history::{MAX_HISTORY_BYTES, load_project_history};
+use crate::project_history::{
+    ProjectHistory, open_project_with_history, project_document, save_project_state,
+    trim_project_history,
+};
 use crate::prompt::{EditPlan, PromptEngine};
 use crate::storage::{ProjectStore, replace_text_file};
 
 const MAX_REQUEST_BYTES: usize = 6 * 1024 * 1024;
+const MAX_ACTIVE_CONNECTIONS: usize = 64;
 const MAX_ACTIVE_EDIT_JOBS: usize = 4;
 const MAX_RETAINED_EDIT_JOBS: usize = 64;
 const AUDIO_REQUEST_HEADER: &str = "x-daw-ai-audio";
-const WAV_HEADER_BYTES: usize = 44;
 const AUDIO_RANGE_SAMPLES: usize =
     (audio_analysis::MAX_REGION_SECONDS * audio_analysis::SAMPLE_RATE as f32) as usize;
-const AUDIO_STREAM_LOOKAHEAD_SAMPLES: usize = AUDIO_RANGE_SAMPLES * 2;
+const PLAYBACK_CHUNK_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 2;
+const AUDIO_STREAM_LOOKAHEAD_SAMPLES: usize = PLAYBACK_CHUNK_SAMPLES * 2;
 const GEMINI_POLL_INTERVAL_MS: u64 = 1_000;
 const DEMO_POLL_INTERVAL_MS: u64 = 25;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn run(port: u16) -> io::Result<()> {
     install_shutdown_handlers();
@@ -41,16 +53,29 @@ pub fn run(port: u16) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     println!("DAW-AI is ready at http://{address}");
     println!("Sound graph: {}", router.project_path().display());
+    let connections = Limiter::new(MAX_ACTIVE_CONNECTIONS);
 
     while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                let Some(permit) = connections.acquire() else {
+                    let _ = Response::json(503, error_json("server is busy; retry shortly"))
+                        .write(&mut stream);
+                    continue;
+                };
                 let router = router.clone();
-                thread::spawn(move || {
-                    if let Err(error) = serve_connection(&mut stream, &router) {
-                        eprintln!("request failed: {error}");
-                    }
-                });
+                if let Err(error) =
+                    thread::Builder::new()
+                        .name("daw-ai-http".to_owned())
+                        .spawn(move || {
+                            let _permit = permit;
+                            if let Err(error) = serve_connection(&mut stream, &router) {
+                                eprintln!("request failed: {error}");
+                            }
+                        })
+                {
+                    eprintln!("error: outcome=request_thread_rejected error={error}");
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
@@ -82,6 +107,8 @@ fn install_shutdown_handlers() {
 fn install_shutdown_handlers() {}
 
 fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
+    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let response = match Request::read(stream) {
@@ -111,11 +138,15 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
             }
             let mut response = scoped.handle(&request);
             response.set_cookie = new_user_cookie;
-            log_http_response(&request, &response);
+            log_http_response(request_id, started, &request, &response);
             response
         }
         Err(error) => {
-            eprintln!("warning: rejected HTTP request: {error}");
+            eprintln!(
+                "warning: http request_id={request_id} outcome=rejected latency_ms={} error={}",
+                started.elapsed().as_millis(),
+                single_line(&error)
+            );
             Response::json(400, error_json(&error))
         }
     };
@@ -161,79 +192,17 @@ fn stream_disconnected(stream: &TcpStream) -> bool {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ByteRange {
-    start: usize,
-    end: usize,
-}
-
-impl ByteRange {
-    fn len(self) -> usize {
-        self.end - self.start + 1
-    }
-}
-
 fn audio_byte_range(value: &str, total_length: usize) -> Result<ByteRange, ()> {
-    let (unit, requested) = value.trim().split_once('=').ok_or(())?;
-    if !unit.eq_ignore_ascii_case("bytes") || requested.contains(',') {
-        return Err(());
-    }
-    let (first, last) = requested.split_once('-').ok_or(())?;
-    let (start, end) = if first.is_empty() {
-        let suffix = last.parse::<usize>().map_err(|_| ())?;
-        if suffix == 0 {
-            return Err(());
-        }
-        (total_length.saturating_sub(suffix), total_length - 1)
-    } else {
-        let start = first.parse::<usize>().map_err(|_| ())?;
-        if start >= total_length {
-            return Err(());
-        }
-        let end = if last.is_empty() {
-            total_length - 1
-        } else {
-            last.parse::<usize>().map_err(|_| ())?.min(total_length - 1)
-        };
-        if end < start {
-            return Err(());
-        }
-        (start, end)
-    };
-
-    let first_pcm_sample = start.saturating_sub(WAV_HEADER_BYTES) / 2;
-    let bounded_end = WAV_HEADER_BYTES
-        .saturating_add(
-            first_pcm_sample
-                .saturating_add(AUDIO_RANGE_SAMPLES)
-                .saturating_mul(2),
-        )
-        .saturating_sub(1)
-        .min(end);
-    Ok(ByteRange {
-        start,
-        end: bounded_end,
-    })
+    bounded_audio_byte_range(value, total_length, AUDIO_RANGE_SAMPLES * 2)
 }
 
-fn wait_for_stream_window(
-    generated_samples: usize,
-    stream_started: Instant,
-    is_cancelled: &impl Fn() -> bool,
-) -> bool {
-    let paced_samples = generated_samples.saturating_sub(AUDIO_STREAM_LOOKAHEAD_SAMPLES);
-    let target =
-        Duration::from_secs_f64(paced_samples as f64 / f64::from(audio_analysis::SAMPLE_RATE));
-    loop {
-        if is_cancelled() {
-            return false;
-        }
-        let elapsed = stream_started.elapsed();
-        if elapsed >= target {
-            return true;
-        }
-        thread::sleep((target - elapsed).min(Duration::from_millis(50)));
+fn instrument_parameter_path(path: &str) -> Option<(u64, &str)> {
+    let suffix = path.strip_prefix("/api/instrument-parameters/")?;
+    let (track_id, group) = suffix.split_once('/')?;
+    if group.contains('/') {
+        return None;
     }
+    Some((track_id.parse().ok()?, group))
 }
 
 #[derive(Clone)]
@@ -247,131 +216,6 @@ struct Router {
     users: Option<Arc<UserRegistry>>,
     history: Arc<Mutex<ProjectHistory>>,
     builtin_backend: Arc<AtomicBool>,
-}
-
-#[derive(Clone)]
-struct ProjectHistory {
-    snapshots: Vec<Project>,
-    current: usize,
-}
-
-impl ProjectHistory {
-    fn new(project: Project) -> Self {
-        Self {
-            snapshots: vec![project],
-            current: 0,
-        }
-    }
-
-    fn push(&mut self, project: Project) {
-        self.snapshots.truncate(self.current + 1);
-        self.snapshots.push(project);
-        self.current = self.snapshots.len() - 1;
-        if self.snapshots.len() > 128 {
-            self.snapshots.remove(0);
-            self.current -= 1;
-        }
-    }
-}
-
-fn load_project_history(path: &std::path::Path, project: &Project) -> io::Result<ProjectHistory> {
-    let source = fs::read_to_string(path)?;
-    let value: serde_json::Value = serde_json::from_str(&source)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let Some(history) = value.get("history") else {
-        return Ok(ProjectHistory::new(project.clone()));
-    };
-    let snapshots = history
-        .get("snapshots")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "history snapshots are required")
-        })?;
-    if snapshots.is_empty() || snapshots.len() > 128 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "history must contain between 1 and 128 snapshots",
-        ));
-    }
-    let snapshots = snapshots
-        .iter()
-        .enumerate()
-        .map(|(index, snapshot)| {
-            if snapshot.is_null() {
-                return Ok((index, None));
-            }
-            Project::from_json(&snapshot.to_string())
-                .map(|snapshot| (index, Some(snapshot)))
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    let current = history
-        .get("current")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|current| usize::try_from(current).ok())
-        .filter(|current| *current < snapshots.len())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "history current is invalid"))?;
-    if snapshots
-        .iter()
-        .filter(|(_, snapshot)| snapshot.is_none())
-        .count()
-        > 1
-        || snapshots
-            .iter()
-            .any(|(index, snapshot)| snapshot.is_none() && *index != current)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "only the current history snapshot may be omitted",
-        ));
-    }
-    let snapshots = snapshots
-        .into_iter()
-        .map(|(_, snapshot)| snapshot.unwrap_or_else(|| project.clone()))
-        .collect::<Vec<_>>();
-    if snapshots[current].to_json() != project.to_json() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "history current does not match the saved project",
-        ));
-    }
-    Ok(ProjectHistory { snapshots, current })
-}
-
-fn project_document(project: &Project, history: &ProjectHistory) -> String {
-    let snapshots = history
-        .snapshots
-        .iter()
-        .enumerate()
-        .map(|(index, snapshot)| {
-            if index == history.current {
-                "null".to_owned()
-            } else {
-                snapshot.to_json()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut source = project.to_json();
-    source.pop();
-    format!(
-        "{source},\"history\":{{\"current\":{},\"snapshots\":[{}]}}}}\n",
-        history.current, snapshots
-    )
-}
-
-const MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
-
-fn trim_project_history(project: &Project, history: &mut ProjectHistory) {
-    let maximum = project.to_json().len() + MAX_HISTORY_BYTES;
-    while history.snapshots.len() > 1 && project_document(project, history).len() > maximum {
-        if history.current > 0 {
-            history.snapshots.remove(0);
-            history.current -= 1;
-        } else {
-            history.snapshots.pop();
-        }
-    }
 }
 
 struct UserRegistry {
@@ -451,6 +295,7 @@ fn request_needs_user_scope(request: &Request) -> bool {
             | "/api/audio-access"
             | "/api/export.wav"
     ) || request.path.starts_with("/api/edits/")
+        || request.path.starts_with("/api/instrument-parameters/")
         || request.path.starts_with("/api/edit-operations/")
         || (request.path.starts_with("/api/audio-stream/") && request.user_id().is_some())
 }
@@ -592,33 +437,6 @@ enum AudioRenderError {
 }
 
 impl AudioRenderer {
-    fn stream_region(
-        &self,
-        project: &crate::model::Project,
-        start_sample: usize,
-        builtin: bool,
-        is_cancelled: &impl Fn() -> bool,
-    ) -> Result<(audio_analysis::AudioRegion, usize), AudioRenderError> {
-        let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
-        let end_sample = start_sample
-            .saturating_add(AUDIO_RANGE_SAMPLES)
-            .min(project_end_sample);
-        self.stream_region_with(
-            project,
-            start_sample,
-            end_sample,
-            is_cancelled,
-            |project, start, end| {
-                if builtin {
-                    audio_analysis::render_project_sample_range_builtin(project, start, end)
-                } else {
-                    audio_analysis::render_project_sample_range(project, start, end)
-                }
-            },
-        )
-        .map(|region| (region, end_sample))
-    }
-
     fn stream_sample_range(
         &self,
         project: &crate::model::Project,
@@ -960,10 +778,9 @@ impl Router {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("users");
         fs::create_dir_all(&root)?;
-        let (store, studio) = ProjectStore::open(project_path)?;
-        let mut history = load_project_history(store.path(), studio.project())?;
+        let (store, studio, mut history) = open_project_with_history(project_path)?;
         trim_project_history(studio.project(), &mut history);
-        store.save_source(&project_document(studio.project(), &history))?;
+        save_project_state(&store, studio.project(), &history)?;
         let users = Arc::new(UserRegistry {
             root,
             planner: planner.clone(),
@@ -1072,10 +889,9 @@ impl Router {
             let history = ProjectHistory::new(studio.project().clone());
             replace_text_file(&project_path, &project_document(studio.project(), &history))?;
         }
-        let (store, studio) = ProjectStore::open(project_path)?;
-        let mut history = load_project_history(store.path(), studio.project())?;
+        let (store, studio, mut history) = open_project_with_history(project_path)?;
         trim_project_history(studio.project(), &mut history);
-        store.save_source(&project_document(studio.project(), &history))?;
+        save_project_state(&store, studio.project(), &history)?;
         persist_user_use(&directory)?;
         let router = Self {
             history: Arc::new(Mutex::new(history)),
@@ -1152,6 +968,13 @@ impl Router {
         }
         if request.path.starts_with("/api/edits/") {
             return Response::json(404, error_json("edit job not found"));
+        }
+        if let Some((track_id, group)) = instrument_parameter_path(&request.path) {
+            return if request.method == "GET" {
+                self.instrument_parameters(track_id, group)
+            } else {
+                Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
+            };
         }
 
         match (request.method.as_str(), request.path.as_str()) {
@@ -1371,21 +1194,36 @@ impl Router {
         let mut remaining = sample_count;
         let mut cursor = stream_start_sample;
         let stream_started = Instant::now();
+        let stream_id = new_operation_id(version);
+        let mut bytes_written = WAV_HEADER_BYTES;
         while remaining > 0 {
-            let next_region_samples = remaining.min(AUDIO_RANGE_SAMPLES);
+            let next_region_samples = remaining.min(PLAYBACK_CHUNK_SAMPLES);
             let generated_samples = cursor - stream_start_sample + next_region_samples;
-            if !wait_for_stream_window(generated_samples, stream_started, &is_cancelled) {
+            if !wait_for_playback_window(
+                generated_samples,
+                AUDIO_STREAM_LOOKAHEAD_SAMPLES,
+                audio_analysis::SAMPLE_RATE,
+                stream_started,
+                &is_cancelled,
+            ) {
+                eprintln!(
+                    "audio_stream id={stream_id} outcome=cancelled version={version} bytes_written={bytes_written}"
+                );
                 return Ok(());
             }
-            let (region, end) = match self.audio_renderer.stream_region(
+            let end = cursor + next_region_samples;
+            let region = match self.audio_renderer.stream_sample_range(
                 &project,
                 cursor,
+                end,
                 self.builtin_backend.load(Ordering::SeqCst),
                 &is_cancelled,
             ) {
                 Ok(rendered) => rendered,
                 Err(AudioRenderError::Render(error)) => {
-                    eprintln!("error: could not render playback stream: {error}");
+                    eprintln!(
+                        "error: audio_stream id={stream_id} outcome=render_failed version={version} bytes_written={bytes_written}: {error}"
+                    );
                     return Err(io::Error::other("could not render playback stream"));
                 }
                 Err(AudioRenderError::Cancelled) => return Ok(()),
@@ -1394,10 +1232,16 @@ impl Router {
             if is_cancelled() {
                 return Ok(());
             }
-            output.write_all(&audio_analysis::pcm_bytes(&region.samples[..count]))?;
+            let pcm = audio_analysis::pcm_bytes(&region.samples[..count]);
+            output.write_all(&pcm)?;
+            bytes_written += pcm.len();
             remaining -= count;
             cursor = end;
         }
+        eprintln!(
+            "audio_stream id={stream_id} outcome=completed version={version} bytes_written={bytes_written} elapsed_ms={}",
+            stream_started.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -1472,6 +1316,7 @@ impl Router {
     }
 
     fn run_edit_job(&self, job_id: u64, edit: EditRequest) {
+        let operation_id = edit.operation_id.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.perform_edit(job_id, edit)
         }));
@@ -1479,18 +1324,43 @@ impl Router {
             Ok(Ok(message)) => self.edit_jobs.complete(job_id, message),
             Ok(Err(failure)) => {
                 eprintln!(
-                    "error: edit job {job_id} failed: {}",
+                    "error: edit_job job_id={job_id} operation_id={} status={} outcome=failed error={}",
+                    operation_id,
+                    failure.status,
                     single_line(&failure.message)
+                );
+                self.persist_failed_operation(
+                    &operation_id,
+                    self.edit_jobs.is_interrupted(job_id),
+                    &failure.message,
                 );
                 self.edit_jobs.fail(job_id, failure.status, failure.message);
             }
             Err(_) => {
                 let message = "the edit worker stopped unexpectedly".to_owned();
-                eprintln!("error: edit job {job_id} failed: {message}");
+                eprintln!(
+                    "error: edit_job job_id={job_id} operation_id={} status=500 outcome=panicked error={message}",
+                    operation_id
+                );
+                self.persist_failed_operation(&operation_id, false, &message);
                 self.edit_jobs.fail(job_id, 500, message);
             }
         }
         self.edit_jobs.worker_finished(job_id);
+    }
+
+    fn persist_failed_operation(&self, operation_id: &str, interrupted: bool, message: &str) {
+        let mut studio = self.lock_studio();
+        let mut candidate = studio.clone();
+        if !candidate.mark_operation_failed(operation_id, interrupted, message) {
+            return;
+        }
+        if self.commit_metadata(&mut studio, candidate).is_err() {
+            eprintln!(
+                "error: operation_id={} could not persist terminal partial-edit state",
+                operation_id
+            );
+        }
     }
 
     fn perform_edit(&self, job_id: u64, edit: EditRequest) -> Result<String, EditFailure> {
@@ -2021,6 +1891,59 @@ impl Router {
         Response::json(200, studio.to_json_with_can_undo(can_undo))
     }
 
+    fn instrument_parameters(&self, track_id: u64, group: &str) -> Response {
+        let studio = self.lock_studio();
+        let Some(track) = studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+        else {
+            return Response::json(404, error_json("track not found"));
+        };
+        let common = match group {
+            "common" => true,
+            "advanced" => false,
+            _ => return Response::json(422, error_json("parameter group is invalid")),
+        };
+        let mut body = String::from("{\"parameters\":[");
+        let mut first = true;
+        for parameter in crate::surge::instrument_parameters(&track.instrument.preset)
+            .into_iter()
+            .filter(|parameter| parameter.common == common)
+        {
+            if !first {
+                body.push(',');
+            }
+            first = false;
+            let value = track
+                .instrument
+                .native_overrides
+                .get(&parameter.id)
+                .copied()
+                .unwrap_or(parameter.value);
+            write!(
+                body,
+                concat!(
+                    "{{\"parameter\":{},\"name\":{},\"value\":{},\"presetValue\":{},",
+                    "\"display\":{},\"overridden\":{}}}"
+                ),
+                json_string(&format!("native:{}", parameter.id)),
+                json_string(&parameter.name),
+                value,
+                parameter.value,
+                json_string(&parameter.display),
+                track
+                    .instrument
+                    .native_overrides
+                    .contains_key(&parameter.id)
+            )
+            .expect("writing to a string cannot fail");
+        }
+        body.push_str("]}");
+        Response::json(200, body)
+    }
+
     fn commit(
         &self,
         studio: &mut std::sync::MutexGuard<'_, Studio>,
@@ -2081,7 +2004,7 @@ impl Router {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        store.save_source(&project_document(project, history))
+        save_project_state(store, project, history)
     }
 
     fn project_path(&self) -> &std::path::Path {
@@ -2411,26 +2334,36 @@ fn recovered_operation_json(operation: &crate::model::EditOperation) -> String {
     let common = format!(
         concat!(
             "\"id\":\"recovered\",\"operationId\":{},\"elapsedSeconds\":0,",
-            "\"timeoutSeconds\":{},\"appliedSteps\":{},\"projectVersion\":{}"
+            "\"timeoutSeconds\":{},\"appliedSteps\":{},\"initialVersion\":{},",
+            "\"projectVersion\":{}"
         ),
         json_string(&operation.operation_id),
         EDIT_TIMEOUT_SECONDS,
         operation.applied_steps,
+        operation.initial_version,
         operation.project_version
     );
-    if operation.completed {
+    if operation.status == crate::model::EditOperationStatus::Completed {
         format!(
             "{{{common},\"status\":\"completed\",\"phase\":\"completed\",\"message\":{}}}",
             json_string(&operation.message)
         )
     } else {
+        let recovered_status = match operation.status {
+            crate::model::EditOperationStatus::Interrupted => "interrupted_with_changes",
+            crate::model::EditOperationStatus::Running
+            | crate::model::EditOperationStatus::Failed => "failed_with_changes",
+            crate::model::EditOperationStatus::Completed => unreachable!(),
+        };
         format!(
             concat!(
-                "{{{},\"status\":\"failed\",\"phase\":\"failed\",",
+                "{{{},\"status\":{},\"phase\":\"failed\",",
                 "\"errorStatus\":500,",
-                "\"error\":\"Gemini stopped before completing the edit.\"}}"
+                "\"error\":{}}}"
             ),
-            common
+            common,
+            json_string(recovered_status),
+            json_string(&operation.message)
         )
     }
 }
@@ -2672,16 +2605,19 @@ fn single_line(value: &str) -> String {
         .collect()
 }
 
-fn log_http_response(request: &Request, response: &Response) {
-    if response.status >= 500 {
+fn log_http_response(request_id: u64, started: Instant, request: &Request, response: &Response) {
+    let latency_ms = started.elapsed().as_millis();
+    if request.is_mutation() || response.status >= 400 || latency_ms >= 1_000 {
+        let level = if response.status >= 500 {
+            "error"
+        } else if response.status >= 400 {
+            "warning"
+        } else {
+            "info"
+        };
         eprintln!(
-            "error: {} {} returned {}",
-            request.method, request.path, response.status
-        );
-    } else if response.status >= 400 {
-        eprintln!(
-            "warning: {} {} returned {}",
-            request.method, request.path, response.status
+            "{level}: http request_id={request_id} method={} path={} status={} latency_ms={}",
+            request.method, request.path, response.status, latency_ms
         );
     }
 }
@@ -2780,6 +2716,36 @@ mod tests {
             },
             path,
         )
+    }
+
+    #[test]
+    fn recovers_an_invalid_persisted_project_and_preserves_the_source() {
+        let id = TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "daw-ai-server-invalid-{}-{id}.json",
+            std::process::id()
+        ));
+        fs::write(&path, "{not json}\n").expect("invalid graph fixture");
+
+        let (_, studio, history) =
+            open_project_with_history(path.clone()).expect("recovered project");
+
+        assert_eq!(history.snapshots.len(), 1);
+        assert_eq!(history.snapshots[0].to_json(), studio.project().to_json());
+        ProjectStore::open(path.clone()).expect("replacement project is valid");
+        let prefix = format!("{}.invalid-", path.file_name().unwrap().to_string_lossy());
+        let quarantined = fs::read_dir(path.parent().unwrap())
+            .expect("temporary directory")
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .expect("quarantined invalid graph")
+            .path();
+        assert_eq!(
+            fs::read_to_string(&quarantined).expect("quarantined graph"),
+            "{not json}\n"
+        );
+        fs::remove_file(path).expect("remove replacement project");
+        fs::remove_file(quarantined).expect("remove quarantine");
     }
 
     #[test]
@@ -2931,8 +2897,16 @@ mod tests {
         assert_eq!(tracks.len(), 4);
         let lead = tracks.last().expect("lead track");
         assert_eq!(lead["role"], "lead");
-        assert_eq!(lead["clips"][0]["start"], 0.0);
-        assert_eq!(lead["clips"][0]["end"], added["duration"]);
+        assert_eq!(lead["volume"], 1.0);
+        assert_eq!(lead["instrument"]["preset"], "Init");
+        assert!(lead["clips"].as_array().expect("clips").is_empty());
+        assert!(lead["effects"].as_array().expect("effects").is_empty());
+        assert!(
+            lead["modulators"]
+                .as_array()
+                .expect("modulators")
+                .is_empty()
+        );
         let track_id = lead["id"].as_u64().expect("lead track ID");
         assert_eq!(added["channelOperations"][0]["operationId"], "add-lead");
         assert_eq!(added["channelOperations"][0]["trackId"], track_id);
@@ -3073,7 +3047,10 @@ mod tests {
         );
         let operation = &studio.project().edit_operations[0];
         assert_eq!(operation.operation_id, operation_id);
-        assert!(operation.completed);
+        assert_eq!(
+            operation.status,
+            crate::model::EditOperationStatus::Completed
+        );
         assert_eq!(operation.applied_steps, 2);
         assert_eq!(operation.message, "Finished shaping the bass");
         crate::model::Project::from_json(&studio.project().to_json())
@@ -3170,7 +3147,8 @@ mod tests {
             Err(PlannerError::Interrupted)
         ));
         assert!(
-            !router.lock_studio().project().edit_operations[0].completed,
+            router.lock_studio().project().edit_operations[0].status
+                != crate::model::EditOperationStatus::Completed,
             "an interrupted job must remain recoverably partial"
         );
 
@@ -3198,7 +3176,7 @@ mod tests {
         assert_eq!(retried.status, 200);
         let retried_json: serde_json::Value =
             serde_json::from_str(&retried.body).expect("retried edit job");
-        assert_eq!(retried_json["status"], "failed");
+        assert_eq!(retried_json["status"], "failed_with_changes");
         assert_eq!(retried_json["operationId"], operation_id);
         assert_eq!(retried_json["appliedSteps"], 1);
         assert_eq!(retried_json["projectVersion"], expected_version);
@@ -3211,7 +3189,7 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&recovered.body)
                 .expect("recovered partial operation")["status"],
-            "failed"
+            "failed_with_changes"
         );
     }
 
@@ -3306,10 +3284,14 @@ mod tests {
             .iter()
             .find(|operation| operation.operation_id == operation_id)
             .expect("Gemini operation record");
-        assert!(completed.completed);
+        assert_eq!(
+            completed.status,
+            crate::model::EditOperationStatus::Completed
+        );
         assert_eq!(completed.message, "Changed the bass patch");
         assert!(studio.project().edit_operations.iter().any(|operation| {
-            operation.operation_id == "previous-operation" && operation.completed
+            operation.operation_id == "previous-operation"
+                && operation.status == crate::model::EditOperationStatus::Completed
         }));
     }
 

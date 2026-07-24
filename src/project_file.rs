@@ -47,6 +47,19 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .enumerate()
         .map(|(index, value)| parse_track(value, index, duration, &mut ids, &mut event_ids))
         .collect::<Result<Vec<_>, _>>()?;
+    let track_ids = tracks.iter().map(|track| track.id).collect::<HashSet<_>>();
+    if tracks.iter().any(|track| {
+        track.modulators.iter().any(|modulator| {
+            modulator.trigger != "free"
+                && modulator
+                    .source_track_id
+                    .is_some_and(|source| !track_ids.contains(&source))
+        })
+    }) {
+        return Err(invalid(
+            "modulator sourceTrackId references an unknown track",
+        ));
+    }
     let edit_values = array(root, "edits")?;
     if edit_values.len() > MAX_EDITS {
         return Err(invalid(format!(
@@ -162,6 +175,8 @@ fn parse_track(
         field(instrument_object, "parameters")?,
         "instrument parameters",
     )?;
+    let (default_decay, default_sustain, default_timbre, default_output) =
+        instrument_migration_defaults(preset);
     let overrides = if let Some(value) = instrument_object.get("overrides") {
         value
             .as_array()
@@ -173,7 +188,15 @@ fn parse_track(
                     .ok_or_else(|| invalid("instrument overrides must be strings"))?;
                 if !matches!(
                     parameter,
-                    "attack" | "release" | "cutoff" | "resonance" | "pitch"
+                    "attack"
+                        | "decay"
+                        | "sustain"
+                        | "release"
+                        | "cutoff"
+                        | "resonance"
+                        | "pitch"
+                        | "timbre"
+                        | "output"
                 ) {
                     return Err(invalid("instrument override is unsupported"));
                 }
@@ -198,13 +221,17 @@ fn parse_track(
         engine: SURGE_ENGINE.to_owned(),
         preset: preset.to_owned(),
         attack: range(instrument_parameters, "attack", 0.0, 1.0)?,
+        decay: optional_range(instrument_parameters, "decay", 0.0, 1.0, default_decay)?,
+        sustain: optional_range(instrument_parameters, "sustain", 0.0, 1.0, default_sustain)?,
         release: range(instrument_parameters, "release", 0.0, 1.0)?,
         cutoff: range(instrument_parameters, "cutoff", 0.0, 1.0)?,
         resonance: range(instrument_parameters, "resonance", 0.0, 1.0)?,
         pitch: range(instrument_parameters, "pitch", 0.0, 1.0)?,
+        timbre: optional_range(instrument_parameters, "timbre", 0.0, 1.0, default_timbre)?,
+        output: optional_range(instrument_parameters, "output", 0.0, 1.0, default_output)?,
         parameter_overrides: overrides,
+        native_overrides: parse_native_overrides(instrument_object, preset)?,
     };
-
     let effect_values = array(track, "effects")?;
     if effect_values.len() > MAX_TOOLS_PER_TRACK {
         return Err(invalid(format!(
@@ -224,7 +251,7 @@ fn parse_track(
     }
     let modulators = modulator_values
         .iter()
-        .map(|value| parse_modulator(value, ids))
+        .map(|value| parse_modulator(value, ids, id))
         .collect::<Result<Vec<_>, _>>()?;
 
     let routing_object = object(field(track, "routing")?, "routing")?;
@@ -240,6 +267,7 @@ fn parse_track(
         &effect_order,
         &output,
         &modulators,
+        id,
     )?;
 
     let clip_values = array(track, "clips")?;
@@ -291,6 +319,18 @@ fn parse_track(
     }
     validate_modulator_targets(&parsed)?;
     Ok(parsed)
+}
+
+fn instrument_migration_defaults(preset: &str) -> (f32, f32, f32, f32) {
+    match preset {
+        "Surge Kick" => (0.4, 0.0, 0.4, 1.0),
+        "Surge Snare" => (0.38, 0.0, 0.78, 1.0),
+        "Surge Closed Hat" => (0.18, 0.0, 1.0, 1.0),
+        "Surge Open Hat" => (0.42, 0.0, 0.95, 1.0),
+        "Surge Crash" => (0.7, 0.0, 0.92, 1.0),
+        "Surge Percussion" => (0.35, 0.0, 0.72, 0.9),
+        _ => (0.4, 0.7, 0.5, 0.72),
+    }
 }
 
 fn parse_audio_clip(
@@ -408,6 +448,7 @@ fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, Pro
 fn parse_modulator(
     value: &JsonValue,
     ids: &mut HashSet<u64>,
+    owner_track_id: u64,
 ) -> Result<Modulator, ProjectFileError> {
     let modulator = object(value, "modulator")?;
     let id = unique_id(modulator, "id", ids, "modulator")?;
@@ -415,19 +456,54 @@ fn parse_modulator(
     let shape = limited_string(modulator, "shape", 1, 32)?;
     if !matches!(
         shape.as_str(),
-        "sine" | "triangle" | "square" | "random" | "envelope"
+        "sine" | "triangle" | "square" | "random" | "envelope" | "formula"
     ) {
         return Err(invalid("modulator shape is unsupported"));
     }
     let parameters = object(field(modulator, "parameters")?, "modulator parameters")?;
     let target = limited_string(modulator, "target", 1, 64)?;
+    let trigger = required_enum(modulator, "trigger", &["free", "midi", "audio"])?;
+    let source_track_id = if trigger == "free" {
+        None
+    } else {
+        modulator
+            .get("sourceTrackId")
+            .and_then(JsonValue::as_u64)
+            .or(Some(owner_track_id))
+    };
     Ok(Modulator {
         id,
         name: limited_string(modulator, "name", 1, 64)?,
         shape,
         rate: range(parameters, "rate", 0.01, 20.0)?,
         rate_mode: required_enum(modulator, "rateMode", &["hz", "tempo"])?,
-        trigger: required_enum(modulator, "trigger", &["free", "midi"])?,
+        trigger,
+        source_track_id,
+        attack_ms: parameters
+            .get("attackMs")
+            .map(|_| range(parameters, "attackMs", 0.0, 1_000.0))
+            .transpose()?
+            .unwrap_or(5.0),
+        release_ms: parameters
+            .get("releaseMs")
+            .map(|_| range(parameters, "releaseMs", 1.0, 5_000.0))
+            .transpose()?
+            .unwrap_or(180.0),
+        threshold: parameters
+            .get("threshold")
+            .map(|_| range(parameters, "threshold", 0.0, 1.0))
+            .transpose()?
+            .unwrap_or(0.1),
+        polarity: modulator
+            .get("polarity")
+            .map(|_| required_enum(modulator, "polarity", &["increase", "decrease"]))
+            .transpose()?
+            .unwrap_or_else(|| "increase".to_owned()),
+        formula: modulator
+            .get("formula")
+            .map(|_| limited_string(modulator, "formula", 0, 8_192))
+            .transpose()?
+            .unwrap_or_default(),
         depth: range(parameters, "depth", 0.0, 1.0)?,
         target,
         enabled: boolean(modulator, "enabled")?,
@@ -515,18 +591,26 @@ fn validate_routing_edges(
     effect_order: &[u64],
     output: &str,
     modulators: &[Modulator],
+    owner_track_id: u64,
 ) -> Result<(), ProjectFileError> {
     let instrument = format!("instrument:{instrument_id}");
     let mut expected = HashSet::from([("clips".to_owned(), instrument.clone(), "midi".to_owned())]);
     expected.extend(
         modulators
             .iter()
-            .filter(|modulator| modulator.enabled && modulator.trigger == "midi")
+            .filter(|modulator| modulator.enabled && modulator.trigger != "free")
             .map(|modulator| {
+                let source_track_id = modulator.source_track_id.unwrap_or(owner_track_id);
                 (
-                    "clips".to_owned(),
+                    if modulator.trigger == "audio" {
+                        format!("track:{source_track_id}:output")
+                    } else if source_track_id == owner_track_id {
+                        "clips".to_owned()
+                    } else {
+                        format!("track:{source_track_id}:clips")
+                    },
                     format!("modulator:{}", modulator.id),
-                    "midi".to_owned(),
+                    modulator.trigger.clone(),
                 )
             }),
     );
@@ -712,15 +796,28 @@ fn parse_edit_operation(
             "{context} projectVersion cannot exceed the project version"
         )));
     }
-    let completed = match string(operation, "status")? {
-        "partial" => false,
-        "completed" => true,
+    let status = match string(operation, "status")? {
+        "running" => crate::model::EditOperationStatus::Running,
+        "partial" | "failed_with_changes" => crate::model::EditOperationStatus::Failed,
+        "interrupted_with_changes" => crate::model::EditOperationStatus::Interrupted,
+        "completed" => crate::model::EditOperationStatus::Completed,
         _ => return Err(invalid(format!("{context} status is invalid"))),
     };
+    let initial_version = operation
+        .get("initialVersion")
+        .map(|_| integer(operation, "initialVersion"))
+        .transpose()?
+        .unwrap_or_else(|| project_version.saturating_sub(applied_steps));
+    if initial_version > project_version {
+        return Err(invalid(format!(
+            "{context} initialVersion cannot exceed its projectVersion"
+        )));
+    }
     Ok(EditOperation {
         operation_id,
-        completed,
+        status,
         applied_steps: applied_steps as usize,
+        initial_version,
         project_version,
         message: limited_string(operation, "message", 1, 160)?,
     })
@@ -1220,6 +1317,61 @@ fn range(object: &Object, name: &str, minimum: f32, maximum: f32) -> Result<f32,
     Ok(value)
 }
 
+fn optional_range(
+    object: &Object,
+    name: &str,
+    minimum: f32,
+    maximum: f32,
+    default: f32,
+) -> Result<f32, ProjectFileError> {
+    if object.contains_key(name) {
+        range(object, name, minimum, maximum)
+    } else {
+        Ok(default)
+    }
+}
+
+fn parse_native_overrides(
+    object: &Object,
+    preset: &str,
+) -> Result<std::collections::BTreeMap<i32, f32>, ProjectFileError> {
+    let Some(value) = object.get("nativeOverrides") else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let values = value
+        .as_object()
+        .ok_or_else(|| invalid("instrument nativeOverrides must be an object"))?;
+    let overrides = values
+        .iter()
+        .map(|(id, value)| {
+            let id = id
+                .parse::<i32>()
+                .ok()
+                .filter(|id| *id >= 0)
+                .ok_or_else(|| invalid("instrument native parameter ID is invalid"))?;
+            let value = value
+                .as_f64()
+                .map(|value| value as f32)
+                .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                .ok_or_else(|| invalid("instrument native parameter value is invalid"))?;
+            Ok((id, value))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    if overrides.is_empty() {
+        return Ok(overrides);
+    }
+    let available = crate::surge::instrument_parameters(preset);
+    if overrides
+        .keys()
+        .any(|id| !available.iter().any(|parameter| parameter.id == *id))
+    {
+        return Err(invalid(
+            "instrument native parameter ID is unavailable for the selected preset",
+        ));
+    }
+    Ok(overrides)
+}
+
 fn relative_range(object: &Object, name: &str) -> Result<f32, ProjectFileError> {
     range(object, name, 0.0, 1.0)
 }
@@ -1281,6 +1433,15 @@ mod tests {
         let original = Project::demo();
         let parsed = parse_project(&original.to_json()).expect("valid demo graph");
         assert_eq!(parsed.to_json(), original.to_json());
+    }
+
+    #[test]
+    fn rejects_unavailable_native_parameter_overrides_before_opening() {
+        let mut project: JsonValue =
+            serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+        project["tracks"][0]["instrument"]["nativeOverrides"] = serde_json::json!({"999999": 0.5});
+        let error = parse_project(&project.to_string()).expect_err("unknown native parameter");
+        assert!(error.to_string().contains("unavailable"));
     }
 
     #[test]

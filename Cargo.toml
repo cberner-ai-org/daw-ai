@@ -10,6 +10,7 @@ license = "MIT"
 exclude = ["vendor/surge-bridge", "vendor/surge-rs", "vendor/surge-sys"]
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 surge-rs = { git = "https://github.com/surge-synthesizer/surge-rs.git", rev = "7bfeafc76d1c57860a177e9e076bed7ec764009a" }
 

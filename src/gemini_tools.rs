@@ -9,8 +9,8 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::audio_analysis::{self, MAX_REGION_SECONDS};
 use crate::model::{
-    AudioClip, AudioClipSliceSpec, MidiClipSpec, Project, Studio, StudioError, TrackRole,
-    json_string,
+    AudioClip, AudioClipSliceSpec, MidiClipSpec, ModulatorSpec, Project, Studio, StudioError,
+    TrackRole, json_string,
 };
 use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
 use crate::storage::ProjectStore;
@@ -18,6 +18,7 @@ use crate::storage::ProjectStore;
 pub(crate) const READ_TOOL_NAME: &str = "read_sound_graph";
 pub(crate) const AUDIO_TOOL_NAME: &str = "render_audio_region";
 pub(crate) const PRESET_TOOL_NAME: &str = "list_surge_presets";
+pub(crate) const INSTRUMENT_PARAMETER_TOOL_NAME: &str = "list_instrument_parameters";
 const GRAPH_FILE: &str = "sound-graph.json";
 const REQUEST_FILE: &str = "request.json";
 const SESSION_FILE: &str = "session.json";
@@ -43,6 +44,7 @@ pub(crate) const MUTATION_TOOL_NAMES: &[&str] = &[
     "update_modulator",
     "delete_modulator",
     "set_parameter",
+    "set_track_volume",
     "set_track_mute",
     "set_tempo",
     "undo",
@@ -78,6 +80,38 @@ const AUDIO_REGION_SCHEMA: &str = r#"{
   }
 }"#;
 static SESSION_ID: AtomicU64 = AtomicU64::new(1);
+const DEFAULT_SESSION_RETENTION_DAYS: u64 = 30;
+const DEFAULT_SESSION_RETENTION_COUNT: usize = 100;
+const DEFAULT_SESSION_RETENTION_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct SessionRetention {
+    maximum_age: Duration,
+    maximum_count: usize,
+    maximum_bytes: u64,
+}
+
+impl SessionRetention {
+    fn configured() -> Self {
+        Self {
+            maximum_age: Duration::from_secs(
+                configured_u64(
+                    "DAW_AI_GEMINI_SESSION_RETENTION_DAYS",
+                    DEFAULT_SESSION_RETENTION_DAYS,
+                )
+                .saturating_mul(24 * 60 * 60),
+            ),
+            maximum_count: configured_u64(
+                "DAW_AI_GEMINI_SESSION_RETENTION_COUNT",
+                DEFAULT_SESSION_RETENTION_COUNT as u64,
+            ) as usize,
+            maximum_bytes: configured_u64(
+                "DAW_AI_GEMINI_SESSION_RETENTION_BYTES",
+                DEFAULT_SESSION_RETENTION_BYTES,
+            ),
+        }
+    }
+}
 
 pub(crate) struct EditSession {
     path: PathBuf,
@@ -102,6 +136,7 @@ impl EditSession {
         start: f32,
         end: f32,
     ) -> io::Result<Self> {
+        apply_session_retention_with(root, SessionRetention::configured())?;
         let path = reserve_session_directory(root)?;
         let result = (|| {
             let project = project.clone();
@@ -299,7 +334,7 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "type": "function",
             "name": AUDIO_TOOL_NAME,
-            "description": "Optionally render all tracks (the default) or a list of model-chosen track IDs and absolute project start/end times from the latest sound graph as WAV audio. Use it whenever hearing the original or an edited result would improve your decision; you decide whether and when to listen. The listening range is independent of the selected edit scope.",
+            "description": "Optionally render all tracks (the default) or a list of model-chosen track IDs and absolute project start/end times from the latest sound graph as WAV audio with objective mix and per-track measurements. Listening is optional but recommended after every major change; you decide whether and when to listen. The listening range is independent of the selected edit scope.",
             "parameters": audio_schema
         }),
         function(
@@ -310,6 +345,18 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
                     "path":{"type":"string","minLength":7,"maxLength":160,"description":"Exact folder path returned by a prior call. Omit to browse the Factory root."}
                 }),
                 &[],
+            ),
+        ),
+        function(
+            INSTRUMENT_PARAMETER_TOOL_NAME,
+            "Discover exact native Surge XT controls for one track. Use common for concise musical controls and advanced to search all remaining controls. Set a result with set_parameter using its exact parameter value, such as native:123.",
+            object_schema(
+                serde_json::json!({
+                    "trackId":{"type":"integer","minimum":1},
+                    "group":{"type":"string","enum":["common","advanced"]},
+                    "query":{"type":"string","maxLength":64}
+                }),
+                &["trackId", "group"],
             ),
         ),
     ];
@@ -364,11 +411,11 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
     vec![
         function(
             "new_track",
-            "Create one empty Surge XT instrument track with no MIDI clips. For drums, one track is one drum voice, not a General MIDI kit: choose drumVoice and create separate tracks for kick, snare, hats, and crash. Returns stable IDs for subsequent calls.",
+            "Create one neutral Surge XT track at unity gain with the Init preset, no MIDI clips, effects, or modulators. You must explicitly choose every desired preset, effect, modulator, and mix change. For drums, one track is one drum voice: drumVoice is required and explicitly selects that Surge starter patch. Returns stable IDs for subsequent calls.",
             object_schema(
                 serde_json::json!({
                     "role":role(),
-                    "drumVoice":{"type":"string","enum":["kick","snare","closedHat","openHat","crash"],"description":"Only for role=drums; defaults to kick. Each drum track renders one dedicated Surge patch."}
+                    "drumVoice":{"type":"string","enum":["kick","snare","closedHat","openHat","crash"],"description":"Required for role=drums and invalid for other roles. Explicitly selects one dedicated Surge starter patch."}
                 }),
                 &["role"],
             ),
@@ -512,15 +559,15 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "add_modulator",
-            "Add a modulator to one track and return its stable ID.",
+            "Add modulation and return its stable ID. Same-track instrument/native targets run inside Surge XT using its LFO, envelope, or Formula (Lua) system; discover exact native:<id> targets with list_instrument_parameters. Cross-track MIDI, audio envelope followers, track volume, and graph-effect targets are DAW routing. Formula is native-only and requires formula source. For sidechain ducking use trigger=audio, the kick sourceTrackId, target=track.volume, and polarity=decrease.",
             object_schema(
-                serde_json::json!({"trackId":id(),"target":{"type":"string","minLength":1,"maxLength":96},"shape":{"type":"string","enum":["sine","triangle","square","random","envelope"]},"rate":{"type":"number","minimum":0.01,"maximum":20},"depth":{"type":"number","minimum":0,"maximum":1}}),
-                &["trackId", "target", "shape", "rate", "depth"],
+                serde_json::json!({"trackId":id(),"target":{"type":"string","minLength":1,"maxLength":96},"shape":{"type":"string","enum":["sine","triangle","square","random","envelope","formula"]},"formula":{"type":"string","minLength":1,"maxLength":8192},"rate":{"type":"number","minimum":0.01,"maximum":20},"depth":{"type":"number","minimum":0,"maximum":1},"trigger":{"type":"string","enum":["free","midi","audio"]},"sourceTrackId":id(),"attackMs":{"type":"number","minimum":0,"maximum":1000},"releaseMs":{"type":"number","minimum":1,"maximum":5000},"threshold":{"type":"number","minimum":0,"maximum":1},"polarity":{"type":"string","enum":["increase","decrease"]}}),
+                &["trackId", "target", "shape", "rate", "depth", "trigger"],
             ),
         ),
         function(
             "update_modulator",
-            "Update one modulator parameter by stable IDs.",
+            "Update one modulator parameter by stable IDs, including native Surge Formula source with parameter=formula.",
             parameter_schema("modulatorId"),
         ),
         function(
@@ -533,10 +580,18 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "set_parameter",
-            "Set one instrument, effect, modulator, MIDI event, or routing parameter using stable IDs from read_sound_graph.",
+            "Set one instrument, effect, modulator, MIDI event, or routing parameter using stable IDs. For instruments, first call list_instrument_parameters and pass its exact native:<id> parameter. Surge preset defaults remain unchanged until this explicit override.",
             object_schema(
                 serde_json::json!({"trackId":id(),"tool":{"type":"string","enum":["instrument","effect","modulator","event","routing"]},"toolId":id(),"clipId":{"type":"integer","minimum":0},"parameter":{"type":"string","minLength":1,"maxLength":64},"value":{"type":"string","minLength":1,"maxLength":96}}),
                 &["trackId", "tool", "toolId", "clipId", "parameter", "value"],
+            ),
+        ),
+        function(
+            "set_track_volume",
+            "Set one track's static mix volume. Use the track.volume target in automationTargets instead when the level must change over time.",
+            object_schema(
+                serde_json::json!({"trackId":id(),"volume":{"type":"number","minimum":0,"maximum":1.5}}),
+                &["trackId", "volume"],
             ),
         ),
         function(
@@ -578,6 +633,7 @@ fn parameter_schema(id_name: &str) -> JsonValue {
 #[derive(Debug)]
 pub(crate) struct AudioRender {
     pub(crate) description: String,
+    pub(crate) measurements: JsonValue,
     pub(crate) wav: Vec<u8>,
 }
 
@@ -647,6 +703,61 @@ pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String
         "suggestedRoles":suggested_roles,
         "folders":folders,
         "presets":presets
+    })
+    .to_string())
+}
+
+pub(crate) fn list_instrument_parameters(
+    session_path: &Path,
+    arguments: &JsonValue,
+) -> Result<String, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "tool arguments must be an object".to_owned())?;
+    let track_id = required_id(object, "trackId")?;
+    let group = required_string(object, "group")?;
+    if !matches!(group, "common" | "advanced") {
+        return Err("group must be common or advanced".to_owned());
+    }
+    let query = object
+        .get("query")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let project = current_project(session_path)?;
+    let track = project
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .ok_or_else(|| format!("track {track_id} does not exist"))?;
+    let parameters = crate::surge::instrument_parameters(&track.instrument.preset)
+        .into_iter()
+        .filter(|parameter| parameter.common == (group == "common"))
+        .filter(|parameter| {
+            query.is_empty() || parameter.name.to_ascii_lowercase().contains(&query)
+        })
+        .map(|parameter| {
+            let value = track
+                .instrument
+                .native_overrides
+                .get(&parameter.id)
+                .copied()
+                .unwrap_or(parameter.value);
+            serde_json::json!({
+                "parameter": format!("native:{}", parameter.id),
+                "name": parameter.name,
+                "value": value,
+                "presetValue": parameter.value,
+                "display": parameter.display,
+                "overridden": track.instrument.native_overrides.contains_key(&parameter.id)
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "trackId": track_id,
+        "preset": track.instrument.preset,
+        "group": group,
+        "parameters": parameters
     })
     .to_string())
 }
@@ -786,8 +897,11 @@ pub(crate) fn apply_agent_mutation(
             if role != TrackRole::Drums && drum_voice.is_some() {
                 return Err("drumVoice is only valid when role is drums".to_owned());
             }
+            if role == TrackRole::Drums && drum_voice.is_none() {
+                return Err("drumVoice is required when role is drums".to_owned());
+            }
             let voice = if role == TrackRole::Drums {
-                Some(drum_voice.unwrap_or("kick"))
+                drum_voice
             } else {
                 None
             };
@@ -968,8 +1082,36 @@ pub(crate) fn apply_agent_mutation(
             let shape = required_string(object, "shape")?;
             let rate = required_number(object, "rate")? as f32;
             let depth = required_number(object, "depth")? as f32;
+            let trigger = required_string(object, "trigger")?;
+            let source_track_id = object.get("sourceTrackId").and_then(JsonValue::as_u64);
+            let attack_ms = optional_number(object, "attackMs", 5.0)? as f32;
+            let release_ms = optional_number(object, "releaseMs", 180.0)? as f32;
+            let threshold = optional_number(object, "threshold", 0.1)? as f32;
+            let polarity = object
+                .get("polarity")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("increase");
+            let formula = object
+                .get("formula")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
             let id = studio
-                .create_modulator(track_id, target, shape, rate, depth)
+                .create_modulator(
+                    track_id,
+                    ModulatorSpec {
+                        target,
+                        shape,
+                        rate,
+                        depth,
+                        trigger,
+                        source_track_id,
+                        attack_ms,
+                        release_ms,
+                        threshold,
+                        polarity,
+                        formula,
+                    },
+                )
                 .map_err(studio_error_message)?;
             result_id = Some(id);
             format!("Added modulator {id} to track {track_id}")
@@ -997,6 +1139,14 @@ pub(crate) fn apply_agent_mutation(
                 .configure_sound_tool(track_id, tool, tool_id, clip_id, parameter, value)
                 .map_err(studio_error_message)?;
             format!("Set {tool} {tool_id} {parameter} on track {track_id}")
+        }
+        "set_track_volume" => {
+            let track_id = required_id(object, "trackId")?;
+            let volume = required_number(object, "volume")? as f32;
+            studio
+                .set_mix(track_id, Some(volume), None)
+                .map_err(studio_error_message)?;
+            format!("Set track {track_id} volume to {volume}")
         }
         "set_track_mute" => {
             let track_id = required_id(object, "trackId")?;
@@ -1157,6 +1307,19 @@ fn required_number(object: &Map<String, JsonValue>, name: &str) -> Result<f64, S
         .and_then(JsonValue::as_f64)
         .filter(|value| value.is_finite())
         .ok_or_else(|| format!("{name} must be a finite number"))
+}
+
+fn optional_number(
+    object: &Map<String, JsonValue>,
+    name: &str,
+    default: f64,
+) -> Result<f64, String> {
+    object.get(name).map_or(Ok(default), |value| {
+        value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| format!("{name} must be a finite number"))
+    })
 }
 
 fn required_string<'a>(object: &'a Map<String, JsonValue>, name: &str) -> Result<&'a str, String> {
@@ -1337,15 +1500,15 @@ pub(crate) fn render_audio_request_with_backend(
     request: AudioRenderRequest,
     builtin: bool,
 ) -> Result<AudioRender, String> {
-    let region = if builtin {
-        audio_analysis::render_region_builtin(
+    let regions = if builtin {
+        audio_analysis::render_region_builtin_with_tracks(
             &request.project,
             &request.track_ids,
             request.start,
             request.end,
         )
     } else {
-        audio_analysis::render_region(
+        audio_analysis::render_region_with_tracks(
             &request.project,
             &request.track_ids,
             request.start,
@@ -1353,12 +1516,116 @@ pub(crate) fn render_audio_request_with_backend(
         )
     }?;
     let backend = if builtin { "built-in" } else { "Surge XT" };
+    let measurements = audio_measurements(&request, backend, &regions);
     Ok(AudioRender {
         description: format!(
             "{} using the {backend} rendering engine selected for DAW playback. Listen to the audio itself and describe the audible rhythm, subdivision, energy contour, timbre, transitions, and shortcomings before deciding what to do next.",
             request.description
         ),
-        wav: audio_analysis::wav_bytes(&region.samples),
+        measurements,
+        wav: audio_analysis::wav_bytes(&regions.mix.samples),
+    })
+}
+
+fn audio_measurements(
+    request: &AudioRenderRequest,
+    backend: &str,
+    regions: &audio_analysis::AudioRegions,
+) -> JsonValue {
+    let seconds = |value: f32| (f64::from(value) * 1_000_000.0).round() / 1_000_000.0;
+    let tracks = regions
+        .tracks
+        .iter()
+        .filter_map(|(track_id, region)| {
+            request
+                .project
+                .tracks
+                .iter()
+                .find(|track| track.id == *track_id)
+                .map(|track| {
+                    serde_json::json!({
+                        "trackId": track.id,
+                        "name": track.name,
+                        "role": track.role.as_str(),
+                        "muted": track.muted,
+                        "measurements": region_measurements(region)
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "renderer": backend,
+        "sampleRateHz": audio_analysis::SAMPLE_RATE,
+        "channelCount": 1,
+        "startSeconds": seconds(request.start),
+        "endSeconds": seconds(request.end),
+        "durationSeconds": seconds(request.end - request.start),
+        "frequencyBandsHz": {
+            "low": [0, 250],
+            "mid": [250, 2500],
+            "high": [2500, audio_analysis::SAMPLE_RATE / 2]
+        },
+        "mix": region_measurements(&regions.mix),
+        "tracks": tracks
+    })
+}
+
+fn region_measurements(region: &audio_analysis::AudioRegion) -> JsonValue {
+    let analysis = audio_analysis::analyze(region);
+    let amplitude_dbfs = |amplitude: f32| {
+        if amplitude > 0.0 {
+            Some(20.0 * amplitude.log10())
+        } else {
+            None
+        }
+    };
+    let dc_offset = if region.samples.is_empty() {
+        0.0
+    } else {
+        region.samples.iter().sum::<f32>() / region.samples.len() as f32
+    };
+    let time_series = region
+        .samples
+        .chunks(audio_analysis::SAMPLE_RATE as usize)
+        .enumerate()
+        .map(|(index, samples)| {
+            let peak = samples.iter().copied().map(f32::abs).fold(0.0, f32::max);
+            let rms = if samples.is_empty() {
+                0.0
+            } else {
+                (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32)
+                    .sqrt()
+            };
+            serde_json::json!({
+                "startOffsetSeconds": index,
+                "durationSeconds": samples.len() as f32 / audio_analysis::SAMPLE_RATE as f32,
+                "peakDbfs": amplitude_dbfs(peak),
+                "rmsDbfs": amplitude_dbfs(rms)
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "sampleCount": region.samples.len(),
+        "eventCount": region.event_count,
+        "peakAmplitude": analysis.peak,
+        "peakDbfs": amplitude_dbfs(analysis.peak),
+        "rmsAmplitude": analysis.rms,
+        "rmsDbfs": amplitude_dbfs(analysis.rms),
+        "crestFactorDb": if analysis.rms > 0.0 {
+            Some(20.0 * (analysis.peak / analysis.rms).log10())
+        } else {
+            None
+        },
+        "clippedSampleCount": region.samples.iter().filter(|sample| sample.abs() >= 1.0).count(),
+        "dcOffset": dc_offset,
+        "zeroCrossingRate": analysis.zero_crossing_rate,
+        "spectralCentroidHz": analysis.spectral_centroid_hz,
+        "energyRatios": {
+            "low": analysis.low_energy_ratio,
+            "mid": analysis.mid_energy_ratio,
+            "high": analysis.high_energy_ratio
+        },
+        "oneSecondWindows": time_series
     })
 }
 
@@ -1482,6 +1749,7 @@ fn sound_tool_inventory(project: &Project) -> Vec<JsonValue> {
                 "name": track.name,
                 "role": track.role.as_str(),
                 "instrumentId": track.instrument.id,
+                "instrumentParameters": crate::model::instrument_parameter_names(),
                 "effects": track.effects.iter().map(|effect| {
                     serde_json::json!({"id": effect.id, "name": effect.name})
                 }).collect::<Vec<_>>(),
@@ -1489,7 +1757,9 @@ fn sound_tool_inventory(project: &Project) -> Vec<JsonValue> {
                     serde_json::json!({
                         "id": modulator.id,
                         "name": modulator.name,
-                        "target": modulator.target
+                        "target": modulator.target,
+                        "trigger": modulator.trigger,
+                        "sourceTrackId": modulator.source_track_id
                     })
                 }).collect::<Vec<_>>(),
                 "clips": track.clips.iter().map(|clip| {
@@ -1679,6 +1949,126 @@ pub(crate) fn session_summaries_in(root: &Path) -> io::Result<Vec<JsonValue>> {
     Ok(sessions)
 }
 
+pub(crate) fn apply_session_retention(root: &Path) -> io::Result<()> {
+    apply_session_retention_with(root, SessionRetention::configured())
+}
+
+struct RetainedSession {
+    path: PathBuf,
+    updated: SystemTime,
+    running: bool,
+    bytes: u64,
+}
+
+fn apply_session_retention_with(root: &Path, policy: SessionRetention) -> io::Result<()> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut sessions = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let metadata_path = entry.path().join(SESSION_FILE);
+        let Some(metadata) = fs::read_to_string(&metadata_path)
+            .ok()
+            .and_then(|source| serde_json::from_str::<JsonValue>(&source).ok())
+            .filter(|metadata| valid_session_metadata(&entry.path(), metadata))
+        else {
+            continue;
+        };
+        let running = metadata.get("status").and_then(JsonValue::as_str) == Some("running");
+        let updated = metadata
+            .get("updatedAt")
+            .and_then(JsonValue::as_u64)
+            .map(|milliseconds| UNIX_EPOCH + Duration::from_millis(milliseconds))
+            .unwrap_or(UNIX_EPOCH);
+        sessions.push(RetainedSession {
+            bytes: directory_bytes(&entry.path())?,
+            path: entry.path(),
+            updated,
+            running,
+        });
+    }
+    sessions.sort_by_key(|session| session.updated);
+    let now = SystemTime::now();
+    let mut total_bytes = sessions.iter().map(|session| session.bytes).sum::<u64>();
+
+    for session in sessions.iter_mut().filter(|session| !session.running) {
+        let expired = now.duration_since(session.updated).unwrap_or_default() > policy.maximum_age;
+        let over_budget = total_bytes > policy.maximum_bytes;
+        if !expired && !over_budget {
+            continue;
+        }
+        for entry in fs::read_dir(&session.path)? {
+            let entry = entry?;
+            let is_audio = entry.path().extension().and_then(|value| value.to_str()) == Some("wav");
+            if is_audio {
+                let bytes = entry.metadata()?.len();
+                fs::remove_file(entry.path())?;
+                session.bytes = session.bytes.saturating_sub(bytes);
+                total_bytes = total_bytes.saturating_sub(bytes);
+            }
+        }
+    }
+
+    let mut retained_count = sessions.len();
+    for session in sessions.iter().filter(|session| !session.running) {
+        let expired = now.duration_since(session.updated).unwrap_or_default() > policy.maximum_age;
+        if !expired && retained_count <= policy.maximum_count && total_bytes <= policy.maximum_bytes
+        {
+            continue;
+        }
+        fs::remove_dir_all(&session.path)?;
+        retained_count = retained_count.saturating_sub(1);
+        total_bytes = total_bytes.saturating_sub(session.bytes);
+    }
+    Ok(())
+}
+
+fn valid_session_metadata(path: &Path, metadata: &JsonValue) -> bool {
+    let directory_id = path.file_name().and_then(|name| name.to_str());
+    metadata.get("id").and_then(JsonValue::as_str) == directory_id
+        && metadata
+            .get("createdAt")
+            .and_then(JsonValue::as_u64)
+            .is_some()
+        && metadata
+            .get("updatedAt")
+            .and_then(JsonValue::as_u64)
+            .is_some()
+        && matches!(
+            metadata.get("status").and_then(JsonValue::as_str),
+            Some("running" | "completed" | "failed")
+        )
+        && path.join(GRAPH_FILE).is_file()
+        && path.join(REQUEST_FILE).is_file()
+}
+
+fn directory_bytes(path: &Path) -> io::Result<u64> {
+    let mut bytes = 0_u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        bytes = bytes.saturating_add(if metadata.is_dir() {
+            directory_bytes(&entry.path())?
+        } else {
+            metadata.len()
+        });
+    }
+    Ok(bytes)
+}
+
+fn configured_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 fn unix_milliseconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1748,10 +2138,15 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str))
             .collect::<Vec<_>>();
         assert_eq!(
-            names[0..3],
-            [READ_TOOL_NAME, AUDIO_TOOL_NAME, PRESET_TOOL_NAME]
+            names[0..4],
+            [
+                READ_TOOL_NAME,
+                AUDIO_TOOL_NAME,
+                PRESET_TOOL_NAME,
+                INSTRUMENT_PARAMETER_TOOL_NAME,
+            ]
         );
-        assert_eq!(&names[3..], MUTATION_TOOL_NAMES);
+        assert_eq!(&names[4..], MUTATION_TOOL_NAMES);
         assert!(
             declarations[1]["description"]
                 .as_str()
@@ -1779,9 +2174,14 @@ mod tests {
     #[test]
     fn studio_contract_documents_every_registered_tool() {
         let contract = include_str!("../gemini/STUDIO.md");
-        for name in [READ_TOOL_NAME, AUDIO_TOOL_NAME, PRESET_TOOL_NAME]
-            .into_iter()
-            .chain(MUTATION_TOOL_NAMES.iter().copied())
+        for name in [
+            READ_TOOL_NAME,
+            AUDIO_TOOL_NAME,
+            PRESET_TOOL_NAME,
+            INSTRUMENT_PARAMETER_TOOL_NAME,
+        ]
+        .into_iter()
+        .chain(MUTATION_TOOL_NAMES.iter().copied())
         {
             assert!(
                 contract.contains(&format!("`{name}`")),
@@ -1820,6 +2220,60 @@ mod tests {
     }
 
     #[test]
+    fn retention_preserves_running_sessions_and_prunes_old_audio_first() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-retention-{}-{}",
+            std::process::id(),
+            SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("retention root");
+        let old = root.join("old");
+        let running = root.join("running");
+        let unknown = root.join("unrelated");
+        let malformed = root.join("malformed");
+        fs::create_dir(&old).expect("old session");
+        fs::create_dir(&running).expect("running session");
+        fs::create_dir(&unknown).expect("unrelated directory");
+        fs::create_dir(&malformed).expect("malformed directory");
+        write_new(
+            &old.join(SESSION_FILE),
+            r#"{"id":"old","status":"completed","createdAt":1,"updatedAt":1}"#,
+        )
+        .expect("old metadata");
+        write_new(
+            &running.join(SESSION_FILE),
+            r#"{"id":"running","status":"running","createdAt":1,"updatedAt":1}"#,
+        )
+        .expect("running metadata");
+        for session in [&old, &running] {
+            write_new(&session.join(GRAPH_FILE), "{}").expect("session graph marker");
+            write_new(&session.join(REQUEST_FILE), "{}").expect("session request marker");
+        }
+        fs::write(unknown.join("keep.txt"), b"not a DAW-AI session").expect("unrelated content");
+        fs::write(malformed.join(SESSION_FILE), b"{not JSON").expect("malformed metadata");
+        fs::write(malformed.join("keep.txt"), b"keep malformed session")
+            .expect("malformed content");
+        fs::write(old.join("audio-001.wav"), vec![0_u8; 128]).expect("old audio");
+        fs::write(running.join("audio-001.wav"), vec![0_u8; 128]).expect("running audio");
+
+        apply_session_retention_with(
+            &root,
+            SessionRetention {
+                maximum_age: Duration::ZERO,
+                maximum_count: 10,
+                maximum_bytes: u64::MAX,
+            },
+        )
+        .expect("retention");
+
+        assert!(!old.exists());
+        assert!(running.join("audio-001.wav").is_file());
+        assert!(unknown.join("keep.txt").is_file());
+        assert!(malformed.join("keep.txt").is_file());
+        fs::remove_dir_all(root).expect("remove retention root");
+    }
+
+    #[test]
     fn crud_mutations_publish_stable_ids_and_undo_the_last_change() {
         let original = Project::demo();
         let session =
@@ -1840,6 +2294,10 @@ mod tests {
             .find(|track| track.id == track_id)
             .expect("created track");
         assert!(track.clips.is_empty());
+        assert_eq!(track.volume, 1.0);
+        assert_eq!(track.instrument.preset, "Init");
+        assert!(track.effects.is_empty());
+        assert!(track.modulators.is_empty());
 
         apply_agent_mutation(session.path(), "undo", &serde_json::json!({})).expect("undo");
         let (_, project) = session.take_update().unwrap().expect("published undo");
@@ -1851,6 +2309,14 @@ mod tests {
     fn drum_tracks_are_dedicated_surge_voices() {
         let original = Project::initial();
         let session = EditSession::create(&original, "add hats", 0.0, 4.0).expect("edit session");
+        let error = apply_agent_mutation(
+            session.path(),
+            "new_track",
+            &serde_json::json!({"role":"drums"}),
+        )
+        .expect_err("drum voice must be explicit");
+        assert!(error.contains("drumVoice is required"), "{error}");
+
         let response = apply_agent_mutation(
             session.path(),
             "new_track",
@@ -2148,9 +2614,27 @@ mod tests {
     }
 
     #[test]
-    fn mute_is_an_explicit_reversible_track_state_and_effect_delete_is_physical() {
+    fn track_mix_is_explicit_reversible_and_effect_delete_is_physical() {
         let session =
             EditSession::create(&Project::demo(), "edit safely", 0.0, 4.0).expect("edit session");
+        apply_agent_mutation(
+            session.path(),
+            "set_track_volume",
+            &serde_json::json!({"trackId":2,"volume":1.25}),
+        )
+        .expect("volume");
+        let (_, louder) = session.take_update().unwrap().expect("volume update");
+        assert_eq!(louder.tracks[1].volume, 1.25);
+
+        let error = apply_agent_mutation(
+            session.path(),
+            "set_track_volume",
+            &serde_json::json!({"trackId":2,"volume":1.51}),
+        )
+        .expect_err("out-of-range volume");
+        assert!(error.contains("mixer value is outside"));
+        assert!(session.take_update().unwrap().is_none());
+
         apply_agent_mutation(
             session.path(),
             "set_track_mute",
@@ -2249,6 +2733,29 @@ mod tests {
         assert!(surge.description.contains("Surge XT rendering engine"));
         assert!(builtin.description.contains("built-in rendering engine"));
         assert!(!surge.description.contains("custom Rust audio engine"));
+        for rendered in [&surge, &builtin] {
+            assert_eq!(rendered.measurements["sampleRateHz"], 16_000);
+            assert_eq!(rendered.measurements["channelCount"], 1);
+            assert_eq!(rendered.measurements["startSeconds"], 0.0);
+            assert_eq!(rendered.measurements["endSeconds"], 0.1);
+            assert_eq!(
+                rendered.measurements["tracks"]
+                    .as_array()
+                    .expect("per-track measurements")
+                    .len(),
+                1
+            );
+            assert_eq!(rendered.measurements["tracks"][0]["trackId"], 2);
+            assert!(rendered.measurements["mix"]["peakDbfs"].as_f64().is_some());
+            assert!(rendered.measurements["mix"]["rmsDbfs"].as_f64().is_some());
+            assert_eq!(
+                rendered.measurements["mix"]["oneSecondWindows"]
+                    .as_array()
+                    .expect("time measurements")
+                    .len(),
+                1
+            );
+        }
     }
 
     #[test]

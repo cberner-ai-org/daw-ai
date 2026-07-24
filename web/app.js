@@ -75,6 +75,7 @@
     projectHistory: { current: 0, entries: [] },
     graphNodeSelection: {},
     midiEventSelection: {},
+    instrumentParameters: {},
   };
   let historyLoadQueue = Promise.resolve();
 
@@ -123,8 +124,13 @@
       });
       this.media.addEventListener("error", () => {
         if (this.isActive) {
+          const mediaError = this.media.error;
           this.retryPlayback(
-            new Error("The browser could not continue the backend audio stream."),
+            new Error(
+              `The browser could not continue the backend audio stream ` +
+                `(code=${mediaError?.code ?? "unknown"}, networkState=${this.media.networkState}, ` +
+                `readyState=${this.media.readyState}, attempt=${this.streamAttempt}).`,
+            ),
             this.playbackGeneration,
             this.streamAttempt,
           );
@@ -391,9 +397,39 @@
     showToast(prefix + errorMessage(error), true);
   }
 
+  function adoptProject(project) {
+    const previousProject = state.project;
+    for (const [key, parameters] of Object.entries(state.instrumentParameters)) {
+      const trackId = Number(key.split(":", 1)[0]);
+      const previousTrack = previousProject?.tracks.find((track) => track.id === trackId);
+      const track = project?.tracks.find((candidate) => candidate.id === trackId);
+      if (
+        !previousTrack ||
+        !track ||
+        previousTrack.instrument.id !== track.instrument.id ||
+        previousTrack.instrument.preset !== track.instrument.preset
+      ) {
+        delete state.instrumentParameters[key];
+        continue;
+      }
+      const overrides = track.instrument.nativeOverrides || {};
+      for (const parameter of parameters) {
+        const id = parameter.parameter?.startsWith("native:")
+          ? parameter.parameter.slice("native:".length)
+          : null;
+        if (id == null) continue;
+        const overridden = Object.prototype.hasOwnProperty.call(overrides, id);
+        parameter.value = overridden ? Number(overrides[id]) : parameter.presetValue;
+        parameter.overridden = overridden;
+      }
+    }
+    state.project = project;
+    return project;
+  }
+
   async function loadProject() {
     try {
-      state.project = await api("/api/project");
+      adoptProject(await api("/api/project"));
       const backend = await api("/api/backend");
       elements.audioBackend.value = backend.backend;
       renderProject();
@@ -473,11 +509,11 @@
     if (Number(button.dataset.historyIndex) === state.projectHistory.current) return;
     try {
       await replaceProject(async () => {
-        state.project = await api("/api/history", {
+        adoptProject(await api("/api/history", {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
           body: new URLSearchParams({ index: button.dataset.historyIndex }),
-        });
+        }));
         renderProject();
       });
       showToast("Project history restored");
@@ -661,13 +697,22 @@
                     </select>
                   </label>
                 </div>
+                <h4>Common controls</h4>
                 <div class="tool-controls instrument-envelope-controls">
-                  ${soundRange(track, "instrument", track.instrument.id, "instrument", "attack", track.instrument.parameters.attack, 0, 1, "%", "", "Amp EG attack")}
-                  ${soundRange(track, "instrument", track.instrument.id, "instrument", "release", track.instrument.parameters.release, 0, 1, "%", "", "Amp EG release")}
-                  ${soundRange(track, "instrument", track.instrument.id, "instrument", "cutoff", track.instrument.parameters.cutoff, 0, 1, "%", "", "Filter 1 cutoff")}
-                  ${soundRange(track, "instrument", track.instrument.id, "instrument", "resonance", track.instrument.parameters.resonance, 0, 1, "%", "", "Filter 1 resonance")}
-                  ${soundRange(track, "instrument", track.instrument.id, "instrument", "pitch", track.instrument.parameters.pitch, 0, 1, "%", "", "Scene pitch")}
+                  ${(state.instrumentParameters[`${track.id}:common`] || []).map((parameter) =>
+                    soundRange(track, "instrument", track.instrument.id, "instrument", parameter.parameter, parameter.value, 0, 1, "%", "", `${parameter.name}${parameter.overridden ? " (overridden)" : ` — preset: ${parameter.display}`}`)
+                  ).join("")}
+                  ${state.instrumentParameters[`${track.id}:common`] ? "" : `<button type="button" data-load-instrument-parameters="${track.id}:common">Show common controls</button>`}
                 </div>
+                <details class="instrument-advanced-controls">
+                  <summary>Advanced controls</summary>
+                  <div class="tool-controls">
+                    ${(state.instrumentParameters[`${track.id}:advanced`] || []).map((parameter) =>
+                      soundRange(track, "instrument", track.instrument.id, "instrument", parameter.parameter, parameter.value, 0, 1, "%", "", `${parameter.name}${parameter.overridden ? " (overridden)" : ` — preset: ${parameter.display}`}`)
+                    ).join("")}
+                    ${state.instrumentParameters[`${track.id}:advanced`] ? "" : `<button type="button" data-load-instrument-parameters="${track.id}:advanced">Show advanced controls</button>`}
+                  </div>
+                </details>
               </div>
               <div class="sound-tool effects-tool node-inspector" data-node-pane="effects" ${selectedNode.startsWith("effect:") ? "" : "hidden"}>
                 <div class="tool-heading"><div><span>Effect</span><strong>Audio processor parameters</strong></div></div>
@@ -702,6 +747,20 @@
       button.addEventListener("click", () => {
         if (!window.confirm(`Delete the ${button.dataset.trackName} track and all of its sound tools?`)) return;
         void changeChannel("delete", { track_id: button.dataset.deleteTrack });
+      });
+    });
+    elements.channelList.querySelectorAll("[data-load-instrument-parameters]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const [trackId, group] = button.dataset.loadInstrumentParameters.split(":");
+        button.disabled = true;
+        try {
+          const response = await api(`/api/instrument-parameters/${trackId}/${group}`);
+          state.instrumentParameters[`${trackId}:${group}`] = response.parameters;
+          renderAdvanced();
+        } catch (error) {
+          button.disabled = false;
+          showError(error, `loading ${group} instrument controls`);
+        }
       });
     });
     elements.channelList.querySelectorAll("[data-graph-node]").forEach((button) => {
@@ -892,13 +951,23 @@
   }
 
   function renderModulator(track, modulator) {
-    const targets = track.modulationTargets.map((target) => [target.id, target.label]);
+    const nativeTargets = ["common", "advanced"]
+      .flatMap((group) => state.instrumentParameters[`${track.id}:${group}`] || [])
+      .map((parameter) => [parameter.parameter, `Surge: ${parameter.name}`]);
+    const targets = [...track.modulationTargets.map((target) => [target.id, target.label]), ...nativeTargets];
+    if (!targets.some(([value]) => value === modulator.target)) {
+      targets.push([modulator.target, modulator.target]);
+    }
+    const sourceTrackId = modulator.sourceTrackId ?? track.id;
+    const sourceTracks = state.project.tracks
+      .map((source) => `<option value="${source.id}" ${source.id === sourceTrackId ? "selected" : ""}>${escapeHtml(source.name)} (#${source.id})</option>`)
+      .join("");
     return `<div class="modulator-card ${modulator.enabled ? "" : "is-disabled"}">
       <div class="effect-card-heading"><strong>${escapeHtml(modulator.name)}</strong><code>#${modulator.id}</code></div>
-      ${modulator.enabled && modulator.trigger === "midi" ? '<div class="modulator-route"><b>MIDI Clips</b><i aria-hidden="true">MIDI &rarr;</i><b>Modulator</b></div>' : ""}
+      ${modulator.enabled && modulator.trigger !== "free" ? `<div class="modulator-route"><b>${escapeHtml(state.project.tracks.find((source) => source.id === sourceTrackId)?.name ?? "Unknown source")}</b><i aria-hidden="true">${modulator.trigger.toUpperCase()} &rarr;</i><b>Modulator</b></div>` : ""}
       <div class="tool-controls">
         <label class="tool-control">Shape
-          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="shape" data-control-key="${track.id}-modulator-${modulator.id}-shape" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} shape`)}">${selectOptions(["sine", "triangle", "square", "random", "envelope"], modulator.shape)}</select>
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="shape" data-control-key="${track.id}-modulator-${modulator.id}-shape" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} shape`)}">${selectOptions(["sine", "triangle", "square", "random", "envelope", "formula"], modulator.shape)}</select>
         </label>
         <label class="tool-control">Target
           <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="target" data-control-key="${track.id}-modulator-${modulator.id}-target" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} target`)}">${targets.map(([value, label]) => `<option value="${value}" ${value === modulator.target ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select>
@@ -907,10 +976,20 @@
           <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="rateMode" data-control-key="${track.id}-modulator-${modulator.id}-rateMode" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} rate mode`)}">${selectOptions(["hz", "tempo"], modulator.rateMode)}</select>
         </label>
         <label class="tool-control">Trigger
-          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="trigger" data-control-key="${track.id}-modulator-${modulator.id}-trigger" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} trigger`)}">${selectOptions(["free", "midi"], modulator.trigger)}</select>
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="trigger" data-control-key="${track.id}-modulator-${modulator.id}-trigger" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} trigger`)}">${selectOptions(["free", "midi", "audio"], modulator.trigger)}</select>
         </label>
+        ${modulator.trigger !== "free" ? `<label>Source track
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="sourceTrackId" data-control-key="${track.id}-modulator-${modulator.id}-sourceTrackId" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} source track`)}">${sourceTracks}</select>
+        </label>` : ""}
+        ${modulator.trigger === "audio" ? `<label>Polarity
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="polarity" data-control-key="${track.id}-modulator-${modulator.id}-polarity" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} polarity`)}">${selectOptions(["increase", "decrease"], modulator.polarity)}</select>
+        </label>` : ""}
         ${soundRange(track, "modulator", modulator.id, modulator.name, "rate", modulator.parameters.rate, 0.01, 20, modulator.rateMode === "tempo" ? "x/beat" : "Hz")}
         ${soundRange(track, "modulator", modulator.id, modulator.name, "depth", modulator.parameters.depth, 0, 1, "%")}
+        ${modulator.shape === "formula" ? `<label class="tool-control">Surge Formula (Lua)
+          <textarea data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="formula" data-control-key="${track.id}-modulator-${modulator.id}-formula" aria-label="${escapeHtml(`${track.name} ${modulator.name} formula`)}">${escapeHtml(modulator.formula || "")}</textarea>
+        </label>` : ""}
+        ${modulator.trigger === "audio" ? `${soundRange(track, "modulator", modulator.id, modulator.name, "threshold", modulator.parameters.threshold, 0, 1, "")}${soundRange(track, "modulator", modulator.id, modulator.name, "attackMs", modulator.parameters.attackMs, 0, 1000, "ms")}${soundRange(track, "modulator", modulator.id, modulator.name, "releaseMs", modulator.parameters.releaseMs, 1, 5000, "ms")}` : ""}
       </div>
       <div class="tool-actions">${soundToggle(track, "modulator", modulator.id, modulator.name, modulator.enabled)}</div>
     </div>`;
@@ -1060,6 +1139,36 @@
     return queuedMutation;
   }
 
+  async function applyProjectMutation({
+    path,
+    values,
+    context,
+    successMessage = null,
+    restoreUi = null,
+    commitUi = null,
+    renderOnFailure = false,
+  }) {
+    try {
+      await replaceProject(async () => {
+        adoptProject(await api(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams(values),
+        }));
+        commitUi?.();
+        renderProject();
+        restoreUi?.();
+      });
+      if (successMessage) showToast(successMessage);
+      return true;
+    } catch (error) {
+      if (renderOnFailure) renderProject();
+      restoreUi?.();
+      showError(error, context);
+      return false;
+    }
+  }
+
   function changeMix(trackId, values, focusControl) {
     return enqueueProjectMutation(() => applyMixChange(trackId, values, focusControl));
   }
@@ -1113,7 +1222,7 @@
             values,
           );
           if (!confirmedOperation) throw new Error("The track response did not identify this mutation.");
-          state.project = project;
+          adoptProject(project);
           renderProject();
         });
         showToast(action === "add" ? "Track added" : "Track deleted");
@@ -1121,7 +1230,7 @@
         if (isRetryableApiError(error)) {
           try {
             await replaceProject(async () => {
-              state.project = await api("/api/project", {}, RECONCILED_REQUEST_TIMEOUT_MS);
+              adoptProject(await api("/api/project", {}, RECONCILED_REQUEST_TIMEOUT_MS));
               renderProject();
             });
             confirmedOperation = channelMutationRecord(
@@ -1198,40 +1307,43 @@
   }
 
   async function applySoundToolChange(request, focusKey) {
-    try {
-      await replaceProject(async () => {
-        state.project = await api("/api/sound-tools", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams(request),
-        });
-        renderProject();
-        restoreSoundToolFocus(request, focusKey);
-      });
-      showToast("Sound tool updated");
-    } catch (error) {
-      renderProject();
-      restoreSoundToolFocus(request, focusKey);
-      showError(error, "updating a sound tool");
-    }
+    await applyProjectMutation({
+      path: "/api/sound-tools",
+      values: request,
+      context: "updating a sound tool",
+      successMessage: "Sound tool updated",
+      commitUi: () => {
+        if (request.tool !== "instrument") return;
+        if (request.parameter.startsWith("native:")) {
+          for (const group of ["common", "advanced"]) {
+            const parameter = state.instrumentParameters[`${request.track_id}:${group}`]
+              ?.find((candidate) => candidate.parameter === request.parameter);
+            if (parameter) {
+              parameter.value = Number(request.value);
+              parameter.overridden = true;
+            }
+          }
+        } else if (request.parameter === "preset") {
+          delete state.instrumentParameters[`${request.track_id}:common`];
+          delete state.instrumentParameters[`${request.track_id}:advanced`];
+        }
+      },
+      restoreUi: () => restoreSoundToolFocus(request, focusKey),
+      renderOnFailure: true,
+    });
   }
 
   async function applyMixChange(trackId, values, focusControl) {
-    try {
-      await replaceProject(async () => {
-        state.project = await api("/api/mix", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({ track_id: trackId, ...values }),
-        });
-        renderProject();
+    await applyProjectMutation({
+      path: "/api/mix",
+      values: { track_id: trackId, ...values },
+      context: "updating the mixer",
+      restoreUi: () => {
         const selector =
           focusControl === "volume" ? `[data-volume-track="${trackId}"]` : `[data-mute-track="${trackId}"]`;
         elements.channelList.querySelector(selector)?.focus({ preventScroll: true });
-      });
-    } catch (error) {
-      showError(error, "updating the mixer");
-    }
+      },
+    });
   }
 
   function editAppliesToTrack(edit, track) {
@@ -1616,7 +1728,7 @@
           replaceProject(async () => {
             const timeout = requestTimeout(deadline);
             if (timeout === 0) throw new Error("The project refresh deadline expired.");
-            state.project = await api("/api/project", {}, timeout);
+            adoptProject(await api("/api/project", {}, timeout));
             renderProject();
             return state.project;
           }),
@@ -1635,12 +1747,15 @@
     return {
       id: "recovered",
       operationId: operation.operationId,
-      status: completed ? "completed" : "failed",
+      status: completed ? "completed" : operation.status || "failed_with_changes",
       phase: completed ? "completed" : "failed",
       message: completed ? operation.message : undefined,
-      error: completed ? undefined : "Gemini stopped before completing the edit.",
+      error: completed
+        ? undefined
+        : operation.message || "Gemini stopped before completing the edit.",
       errorStatus: completed ? undefined : 500,
       appliedSteps: Number(operation.appliedSteps) || 0,
+      initialVersion: Number(operation.initialVersion) || null,
       projectVersion: Number(operation.projectVersion) || null,
     };
   }
@@ -1726,7 +1841,11 @@
       };
     }
 
-    if (outcome.status === "failed") {
+    if (
+      outcome.status === "failed" ||
+      outcome.status === "failed_with_changes" ||
+      outcome.status === "interrupted_with_changes"
+    ) {
       if (hasPublishedChanges) {
         let refreshError = null;
         try {
@@ -1883,7 +2002,7 @@
     try {
       await replaceProject(
         async () => {
-          state.project = await api("/api/undo", { method: "POST" });
+          adoptProject(await api("/api/undo", { method: "POST" }));
           renderProject();
           await loadProjectHistory(state.project.version);
         },
@@ -1904,7 +2023,7 @@
     try {
       await replaceProject(
         async () => {
-          state.project = await api("/api/reset", { method: "POST" });
+          adoptProject(await api("/api/reset", { method: "POST" }));
           state.selectionStart = 8;
           state.selectionEnd = 16;
           renderProject();

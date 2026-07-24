@@ -131,8 +131,11 @@ struct AutomationIndex<'a> {
 }
 
 struct TrackRenderState<'a> {
+    track_id: u64,
     occurrences: Vec<ClipOccurrence<'a>>,
-    midi_onsets: Vec<f64>,
+    midi_onsets: HashMap<u64, Vec<f64>>,
+    audio_envelopes: HashMap<u64, Vec<f32>>,
+    render_start_sample: usize,
     modulator_phases: Vec<ModulatorPhaseCurve>,
     automation: AutomationIndex<'a>,
 }
@@ -141,6 +144,11 @@ pub(crate) struct AudioRegion {
     pub samples: Vec<f32>,
     pub event_count: usize,
     event_onsets: Vec<f32>,
+}
+
+pub(crate) struct AudioRegions {
+    pub mix: AudioRegion,
+    pub tracks: Vec<(u64, AudioRegion)>,
 }
 
 impl AudioRegion {
@@ -211,6 +219,31 @@ pub(crate) fn render_region(
     )
 }
 
+pub(crate) fn render_region_with_tracks(
+    project: &Project,
+    track_ids: &[u64],
+    start: f32,
+    end: f32,
+) -> Result<AudioRegions, String> {
+    if !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end <= start
+        || end > project.duration
+        || end - start > MAX_REGION_SECONDS
+    {
+        return Err(format!(
+            "analysis range must be inside the project and no longer than {MAX_REGION_SECONDS} seconds"
+        ));
+    }
+    render_tracks_with_stems_samples(
+        project,
+        track_ids,
+        playback_start_sample(start),
+        playback_end_sample(end),
+    )
+}
+
 pub(crate) fn render_region_builtin(
     project: &Project,
     track_ids: &[u64],
@@ -234,6 +267,23 @@ pub(crate) fn render_region_builtin(
         playback_start_sample(start),
         playback_end_sample(end),
     )
+}
+
+pub(crate) fn render_region_builtin_with_tracks(
+    project: &Project,
+    track_ids: &[u64],
+    start: f32,
+    end: f32,
+) -> Result<AudioRegions, String> {
+    let mix = render_region_builtin(project, track_ids, start, end)?;
+    let tracks = track_ids
+        .iter()
+        .map(|track_id| {
+            render_region_builtin(project, &[*track_id], start, end)
+                .map(|region| (*track_id, region))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AudioRegions { mix, tracks })
 }
 
 pub(crate) fn render_project_sample_range_builtin(
@@ -399,16 +449,32 @@ fn render_tracks_samples(
     start_sample: usize,
     end_sample: usize,
 ) -> Result<AudioRegion, String> {
+    Ok(render_tracks_with_stems_samples(project, track_ids, start_sample, end_sample)?.mix)
+}
+
+fn render_tracks_with_stems_samples(
+    project: &Project,
+    track_ids: &[u64],
+    start_sample: usize,
+    end_sample: usize,
+) -> Result<AudioRegions, String> {
     let start = sample_time(start_sample);
     let preroll_sample = playback_preroll_sample(project, start_sample);
-    let region = render_audio_samples(project, track_ids, preroll_sample, end_sample)?;
+    let regions =
+        render_audio_samples_with_tracks(project, track_ids, preroll_sample, end_sample, true)?;
     let sample_start = start_sample - preroll_sample;
-    Ok(region.slice(
-        sample_start,
-        sample_start + end_sample - start_sample,
-        start,
-        sample_time(end_sample),
-    ))
+    let sample_end = sample_start + end_sample - start_sample;
+    let end = sample_time(end_sample);
+    Ok(AudioRegions {
+        mix: regions.mix.slice(sample_start, sample_end, start, end),
+        tracks: regions
+            .tracks
+            .into_iter()
+            .map(|(track_id, region)| {
+                (track_id, region.slice(sample_start, sample_end, start, end))
+            })
+            .collect(),
+    })
 }
 
 pub(crate) fn playback_sample_count(start: f32, end: f32) -> usize {
@@ -463,6 +529,16 @@ fn render_audio_samples(
     start_sample: usize,
     end_sample: usize,
 ) -> Result<AudioRegion, String> {
+    Ok(render_audio_samples_with_tracks(project, track_ids, start_sample, end_sample, true)?.mix)
+}
+
+fn render_audio_samples_with_tracks(
+    project: &Project,
+    track_ids: &[u64],
+    start_sample: usize,
+    end_sample: usize,
+    resolve_audio_inputs: bool,
+) -> Result<AudioRegions, String> {
     if track_ids.is_empty() {
         return Err("at least one track ID is required".to_owned());
     }
@@ -474,20 +550,62 @@ fn render_audio_samples(
     let sample_count = end_sample - start_sample;
     let mut mix = vec![0.0; sample_count.max(1)];
     let mut event_onsets = Vec::new();
+    let mut tracks = Vec::with_capacity(track_ids.len());
     let mut audio_assets = AudioAssetCache::default();
+    let audio_source_ids = track_ids
+        .iter()
+        .filter_map(|track_id| project.tracks.iter().find(|track| track.id == *track_id))
+        .flat_map(|track| &track.modulators)
+        .filter(|modulator| modulator.enabled && modulator.trigger == "audio")
+        .filter_map(|modulator| modulator.source_track_id)
+        .collect::<std::collections::HashSet<_>>();
+    let audio_sources = if resolve_audio_inputs && !audio_source_ids.is_empty() {
+        let source_ids = audio_source_ids.into_iter().collect::<Vec<_>>();
+        Some(
+            render_audio_samples_with_tracks(
+                project,
+                &source_ids,
+                start_sample,
+                end_sample,
+                false,
+            )?
+            .tracks
+            .into_iter()
+            .map(|(track_id, region)| (track_id, region.samples))
+            .collect::<HashMap<_, _>>(),
+        )
+    } else {
+        None
+    };
     for &track_id in track_ids {
         let track = project
             .tracks
             .iter()
             .find(|track| track.id == track_id)
             .ok_or_else(|| format!("track {track_id} does not exist"))?;
+        let mut rendered = vec![0.0; mix.len()];
+        let mut track_event_onsets = Vec::new();
         if track.muted {
+            tracks.push((
+                track_id,
+                AudioRegion {
+                    samples: rendered,
+                    event_count: 0,
+                    event_onsets: track_event_onsets,
+                },
+            ));
             continue;
         }
-        let mut rendered = vec![0.0; mix.len()];
         let mut audio_input = vec![0.0; mix.len()];
         mix_audio_clips(track, start_sample, &mut audio_input, &mut audio_assets)?;
-        let render_state = TrackRenderState::new(project, track, start, end);
+        let render_state = TrackRenderState::new_with_audio(
+            project,
+            track,
+            start,
+            end,
+            start_sample,
+            audio_sources.as_ref(),
+        );
         render_track(
             project,
             track,
@@ -495,21 +613,36 @@ fn render_audio_samples(
             start_sample,
             &audio_input,
             &mut rendered,
-            &mut event_onsets,
+            &mut track_event_onsets,
         )?;
         apply_track_gain(project, track, &render_state, start_sample, &mut rendered);
-        for (output, sample) in mix.iter_mut().zip(rendered) {
-            *output += sample;
+        event_onsets.extend(track_event_onsets.iter().copied());
+        for (output, sample) in mix.iter_mut().zip(&rendered) {
+            *output += *sample;
         }
+        for sample in &mut rendered {
+            *sample = (*sample * 0.58).tanh();
+        }
+        tracks.push((
+            track_id,
+            AudioRegion {
+                samples: rendered,
+                event_count: track_event_onsets.len(),
+                event_onsets: track_event_onsets,
+            },
+        ));
     }
     for sample in &mut mix {
         *sample = (*sample * 0.58).tanh();
     }
     let event_count = event_onsets.len();
-    Ok(AudioRegion {
-        samples: mix,
-        event_count,
-        event_onsets,
+    Ok(AudioRegions {
+        mix: AudioRegion {
+            samples: mix,
+            event_count,
+            event_onsets,
+        },
+        tracks,
     })
 }
 
@@ -672,15 +805,21 @@ fn render_track(
         &track.instrument,
         &effects,
         &effect_order,
+        &track.modulators,
+        track.id,
         SAMPLE_RATE as f32,
     )?;
+    engine.set_tempo(f64::from(project.bpm));
     let mut event_index = midi.partition_point(|event| event.sample < start_sample);
     let preset_parameters = [
         ("attack", engine.instrument_parameter_value("attack")),
+        ("decay", engine.instrument_parameter_value("decay")),
+        ("sustain", engine.instrument_parameter_value("sustain")),
         ("release", engine.instrument_parameter_value("release")),
         ("cutoff", engine.instrument_parameter_value("cutoff")),
         ("resonance", engine.instrument_parameter_value("resonance")),
         ("pitch", engine.instrument_parameter_value("pitch")),
+        ("output", engine.instrument_parameter_value("output")),
     ];
     let mut output_index = 0;
     while output_index < output.len() {
@@ -697,6 +836,8 @@ fn render_track(
         let time = precise_sample_time(block_start);
         for (name, target, graph_base) in [
             ("attack", "instrument.attack", track.instrument.attack),
+            ("decay", "instrument.decay", track.instrument.decay),
+            ("sustain", "instrument.sustain", track.instrument.sustain),
             ("release", "instrument.release", track.instrument.release),
             ("cutoff", "instrument.cutoff", track.instrument.cutoff),
             (
@@ -705,6 +846,8 @@ fn render_track(
                 track.instrument.resonance,
             ),
             ("pitch", "instrument.pitch", track.instrument.pitch),
+            ("timbre", "instrument.timbre", track.instrument.timbre),
+            ("output", "instrument.output", track.instrument.output),
         ] {
             let base = if track.instrument.overrides(name) {
                 graph_base
@@ -721,6 +864,7 @@ fn render_track(
             }
             engine.set_parameter(name, value)?;
         }
+        set_surge_native_modulator_controls(&mut engine, track, render_state, time)?;
         set_surge_effect_controls(&mut engine, project, track, render_state, time)?;
         let block = if process_audio_through_effects {
             let mut input = [[0.0; crate::surge::BLOCK_SIZE]; 2];
@@ -739,6 +883,36 @@ fn render_track(
             output[output_index + index] = (block[0][index] + block[1][index]) * 0.5 + dry_audio;
         }
         output_index += count;
+    }
+    Ok(())
+}
+
+fn set_surge_native_modulator_controls(
+    engine: &mut crate::surge::Engine,
+    track: &Track,
+    render_state: &TrackRenderState<'_>,
+    time: f64,
+) -> Result<(), String> {
+    for modulator in track
+        .modulators
+        .iter()
+        .filter(|modulator| crate::surge::is_native_modulator(track.id, modulator))
+    {
+        let rate = render_state.automation.value_at(
+            &format!("modulator:{}.rate", modulator.id),
+            modulator.rate,
+            time,
+        );
+        let depth = render_state.automation.value_at(
+            &format!("modulator:{}.depth", modulator.id),
+            modulator.depth,
+            time,
+        );
+        engine.set_native_modulator_controls(
+            modulator.id,
+            rate.clamp(0.01, 20.0),
+            depth.clamp(0.0, 1.0),
+        )?;
     }
     Ok(())
 }
@@ -944,6 +1118,17 @@ fn clip_events_in_window<'a>(
 
 impl<'a> TrackRenderState<'a> {
     fn new(project: &'a Project, track: &'a Track, start: f64, end: f64) -> Self {
+        Self::new_with_audio(project, track, start, end, midi_event_sample(start), None)
+    }
+
+    fn new_with_audio(
+        project: &'a Project,
+        track: &'a Track,
+        start: f64,
+        end: f64,
+        render_start_sample: usize,
+        audio_sources: Option<&HashMap<u64, Vec<f32>>>,
+    ) -> Self {
         let automation = AutomationIndex::new(project, track);
         let beat_duration = 60.0 / f64::from(project.bpm);
         let maximum_voice = f64::from(maximum_voice_lifetime(project, track, &automation));
@@ -965,11 +1150,57 @@ impl<'a> TrackRenderState<'a> {
             ));
         }
         occurrences.sort_by(|left, right| left.time.total_cmp(&right.time));
-        let mut midi_onsets = occurrences
+        let mut midi_onsets = HashMap::new();
+        for source_track_id in track
+            .modulators
             .iter()
-            .map(|occurrence| occurrence.time)
-            .collect::<Vec<_>>();
-        midi_onsets.dedup_by(|left, right| (*left - *right).abs() < 0.000_001);
+            .filter(|modulator| modulator.trigger == "midi")
+            .map(|modulator| modulator.source_track_id.unwrap_or(track.id))
+            .chain(std::iter::once(track.id))
+        {
+            if midi_onsets.contains_key(&source_track_id) {
+                continue;
+            }
+            let Some(source_track) = project
+                .tracks
+                .iter()
+                .find(|candidate| candidate.id == source_track_id)
+            else {
+                continue;
+            };
+            let mut onsets = source_track
+                .clips
+                .iter()
+                .flat_map(|clip| {
+                    clip_events_in_window(project, source_track, clip, 0.0, end + 0.000_002)
+                })
+                .map(|occurrence| occurrence.time)
+                .collect::<Vec<_>>();
+            onsets.sort_by(f64::total_cmp);
+            onsets.dedup_by(|left, right| (*left - *right).abs() < 0.000_001);
+            midi_onsets.insert(source_track_id, onsets);
+        }
+        let mut audio_envelopes = HashMap::new();
+        if let Some(audio_sources) = audio_sources {
+            for modulator in track
+                .modulators
+                .iter()
+                .filter(|modulator| modulator.enabled && modulator.trigger == "audio")
+            {
+                let source_track_id = modulator.source_track_id.unwrap_or(track.id);
+                if let Some(samples) = audio_sources.get(&source_track_id) {
+                    audio_envelopes.insert(
+                        modulator.id,
+                        envelope_follower(
+                            samples,
+                            modulator.threshold,
+                            modulator.attack_ms,
+                            modulator.release_ms,
+                        ),
+                    );
+                }
+            }
+        }
         let modulator_phases = track
             .modulators
             .iter()
@@ -984,16 +1215,20 @@ impl<'a> TrackRenderState<'a> {
             })
             .collect();
         Self {
+            track_id: track.id,
             occurrences,
             midi_onsets,
+            audio_envelopes,
+            render_start_sample,
             modulator_phases,
             automation,
         }
     }
 
-    fn last_midi_onset(&self, time: f64) -> Option<f64> {
-        let index = self.midi_onsets.partition_point(|onset| *onset <= time);
-        index.checked_sub(1).map(|index| self.midi_onsets[index])
+    fn last_midi_onset(&self, track_id: u64, time: f64) -> Option<f64> {
+        let onsets = self.midi_onsets.get(&track_id)?;
+        let index = onsets.partition_point(|onset| *onset <= time);
+        index.checked_sub(1).map(|index| onsets[index])
     }
 
     fn modulator_cycles(&self, modulator_id: u64, time: f64) -> f64 {
@@ -1002,6 +1237,29 @@ impl<'a> TrackRenderState<'a> {
             .find(|phase| phase.id == modulator_id)
             .map_or(0.0, |phase| phase.curve.cycles_at(time))
     }
+}
+
+fn envelope_follower(samples: &[f32], threshold: f32, attack_ms: f32, release_ms: f32) -> Vec<f32> {
+    let coefficient = |milliseconds: f32| {
+        if milliseconds <= 0.0 {
+            0.0
+        } else {
+            (-1.0 / (milliseconds * 0.001 * SAMPLE_RATE as f32)).exp()
+        }
+    };
+    let attack = coefficient(attack_ms);
+    let release = coefficient(release_ms);
+    let scale = (1.0 - threshold).max(f32::EPSILON);
+    let mut envelope = 0.0;
+    samples
+        .iter()
+        .map(|sample| {
+            let input = ((sample.abs() - threshold) / scale).clamp(0.0, 1.0);
+            let smoothing = if input > envelope { attack } else { release };
+            envelope = input + smoothing * (envelope - input);
+            envelope
+        })
+        .collect()
 }
 
 impl<'a> AutomationIndex<'a> {
@@ -1293,7 +1551,11 @@ fn parameter_at(
     let amount = track
         .modulators
         .iter()
-        .filter(|modulator| modulator.enabled && modulator.target == target)
+        .filter(|modulator| {
+            modulator.enabled
+                && modulator.target == target
+                && !crate::surge::is_native_modulator(track.id, modulator)
+        })
         .map(|modulator| modulator_value(project, render_state, modulator, time))
         .sum::<f32>();
     let (minimum, maximum, scale, mode) = match target {
@@ -1330,8 +1592,30 @@ fn modulator_value(
     modulator: &crate::model::Modulator,
     time: f64,
 ) -> f32 {
+    if modulator.trigger == "audio" {
+        let sample = midi_event_sample(time).saturating_sub(render_state.render_start_sample);
+        let value = render_state
+            .audio_envelopes
+            .get(&modulator.id)
+            .and_then(|envelope| envelope.get(sample))
+            .copied()
+            .unwrap_or(0.0);
+        let polarity = if modulator.polarity == "decrease" {
+            -1.0
+        } else {
+            1.0
+        };
+        return value
+            * polarity
+            * render_state.automation.value_at(
+                &format!("modulator:{}.depth", modulator.id),
+                modulator.depth,
+                time,
+            );
+    }
     let phase_origin = if modulator.trigger == "midi" {
-        let Some(onset) = render_state.last_midi_onset(time) else {
+        let source_track_id = modulator.source_track_id.unwrap_or(render_state.track_id);
+        let Some(onset) = render_state.last_midi_onset(source_track_id, time) else {
             return 0.0;
         };
         onset
@@ -2367,7 +2651,7 @@ mod tests {
     fn midi_onset_at(project: &Project, track: &Track, time: f32) -> Option<f32> {
         let time = f64::from(time);
         TrackRenderState::new(project, track, time, time + 0.000_01)
-            .last_midi_onset(time)
+            .last_midi_onset(track.id, time)
             .map(|onset| onset as f32)
     }
 
@@ -2435,8 +2719,9 @@ mod tests {
         let mut instrument = Project::demo().tracks[1].instrument.clone();
         for preset in crate::model::SURGE_PRESETS {
             instrument.preset = (*preset).to_owned();
-            let mut engine = crate::surge::Engine::new(&instrument, &[], &[], SAMPLE_RATE as f32)
-                .expect("Surge XT engine");
+            let mut engine =
+                crate::surge::Engine::new(&instrument, &[], &[], &[], 1, SAMPLE_RATE as f32)
+                    .expect("Surge XT engine");
             engine.play_note(48, 0.9, 1);
             let energy = (0..128)
                 .flat_map(|_| engine.process())
@@ -2446,6 +2731,48 @@ mod tests {
             engine.release_note(48, 1);
             assert!(energy > 0.01, "{preset} rendered silence");
         }
+    }
+
+    #[test]
+    fn dedicated_drum_triggers_use_bright_one_shot_patch_timbres() {
+        let render_voice = |preset: &str, trigger: u8, timbre: f32, duration: f32| {
+            let mut project = Project::demo();
+            project.tracks.truncate(1);
+            let track_id = {
+                let track = &mut project.tracks[0];
+                track.instrument.preset = preset.to_owned();
+                track.instrument.timbre = timbre;
+                track.instrument.parameter_overrides.clear();
+                track.effects.clear();
+                track.routing.effect_order.clear();
+                track.modulators.clear();
+                track.clips[0].loop_beats = 4.0;
+                track.clips[0].events.truncate(1);
+                track.clips[0].events[0].pitch = trigger;
+                track.clips[0].events[0].duration = duration;
+                track.id
+            };
+            analyze(&render_region(&project, &[track_id], 0.0, 1.0).expect("drum render"))
+        };
+
+        let snare = render_voice("Surge Snare", 38, 0.78, 0.0625);
+        let hat = render_voice("Surge Closed Hat", 42, 1.0, 0.0625);
+        assert!(
+            snare.spectral_centroid_hz > 1_000.0,
+            "snare must be broadband, got {} Hz",
+            snare.spectral_centroid_hz
+        );
+        assert!(
+            hat.spectral_centroid_hz > snare.spectral_centroid_hz,
+            "hat should be brighter than snare: {} <= {} Hz",
+            hat.spectral_centroid_hz,
+            snare.spectral_centroid_hz
+        );
+        assert!(snare.peak > 0.02 && hat.peak > 0.02);
+
+        let short = render_voice("Surge Snare", 38, 0.78, 0.0625);
+        let long = render_voice("Surge Snare", 38, 0.78, 1.0);
+        assert!((short.rms - long.rms).abs() < 0.000_001);
     }
 
     #[test]
@@ -2878,6 +3205,82 @@ mod tests {
     }
 
     #[test]
+    fn native_modulator_rate_and_depth_automation_reach_surge() {
+        let mut project = Project::demo();
+        project.tracks.retain(|track| track.role == TrackRole::Bass);
+        let track_id = project.tracks[0].id;
+        let modulator_id = project.tracks[0].modulators[0].id;
+        {
+            let modulator = &mut project.tracks[0].modulators[0];
+            modulator.enabled = true;
+            modulator.target = "instrument.cutoff".to_owned();
+            modulator.shape = "sine".to_owned();
+            modulator.trigger = "free".to_owned();
+            modulator.rate_mode = "hz".to_owned();
+            modulator.rate = 0.2;
+            modulator.depth = 0.8;
+        }
+
+        let mut without_modulation = project.clone();
+        without_modulation.tracks[0].modulators[0].enabled = false;
+        let dry =
+            render_region(&without_modulation, &[track_id], 0.0, 2.0).expect("unmodulated render");
+
+        let mut zero_depth = project.clone();
+        zero_depth.edits.push(Edit {
+            id: 9_009,
+            operation_id: None,
+            start: 0.0,
+            end: 2.0,
+            prompt: "Remove movement".to_owned(),
+            summary: "Automated native modulation depth".to_owned(),
+            action: Action::Automation {
+                track_id,
+                parameter: format!("modulator:{modulator_id}.depth"),
+                curve: "linear",
+                points: vec![AutomationPoint {
+                    time: 0.0,
+                    value: 0.0,
+                }],
+                target: TrackRole::Bass,
+            },
+        });
+        let zero_depth_audio =
+            render_region(&zero_depth, &[track_id], 0.0, 2.0).expect("zero-depth render");
+        assert!(
+            sample_difference(&dry.samples, &zero_depth_audio.samples) < 0.000_001,
+            "native depth automation did not remove the Surge modulation route"
+        );
+
+        let fixed =
+            render_region(&project, &[track_id], 0.0, 2.0).expect("fixed-rate native render");
+        project.edits.push(Edit {
+            id: 9_010,
+            operation_id: None,
+            start: 0.0,
+            end: 2.0,
+            prompt: "Accelerate movement".to_owned(),
+            summary: "Automated native modulation rate".to_owned(),
+            action: Action::Automation {
+                track_id,
+                parameter: format!("modulator:{modulator_id}.rate"),
+                curve: "linear",
+                points: vec![AutomationPoint {
+                    time: 0.0,
+                    value: 8.0,
+                }],
+                target: TrackRole::Bass,
+            },
+        });
+        let fast =
+            render_region(&project, &[track_id], 0.0, 2.0).expect("automated-rate native render");
+        assert!(
+            sample_difference(&fixed.samples, &fast.samples) > 0.000_1,
+            "native rate automation did not change the Surge render"
+        );
+    }
+
+    #[test]
     fn release_automation_extends_the_render_lookback() {
         let mut project = Project::demo();
         let track_index = project
@@ -3164,6 +3567,12 @@ mod tests {
             rate: 2.0,
             rate_mode: "hz".to_owned(),
             trigger: "free".to_owned(),
+            source_track_id: None,
+            attack_ms: 5.0,
+            release_ms: 180.0,
+            threshold: 0.1,
+            polarity: "increase".to_owned(),
+            formula: String::new(),
             depth: 0.6,
             target: format!("effect:{effect_id}.lowGain"),
             enabled: true,
@@ -3250,6 +3659,12 @@ mod tests {
                 rate: 0.25,
                 rate_mode: "hz".to_owned(),
                 trigger: "free".to_owned(),
+                source_track_id: None,
+                attack_ms: 5.0,
+                release_ms: 180.0,
+                threshold: 0.1,
+                polarity: "increase".to_owned(),
+                formula: String::new(),
                 depth: 0.8,
                 target: target.clone(),
                 enabled: true,
@@ -3284,6 +3699,12 @@ mod tests {
             rate: 0.25,
             rate_mode: "hz".to_owned(),
             trigger: "free".to_owned(),
+            source_track_id: None,
+            attack_ms: 5.0,
+            release_ms: 180.0,
+            threshold: 0.1,
+            polarity: "increase".to_owned(),
+            formula: String::new(),
             depth: 0.8,
             target: "instrument.cutoff".to_owned(),
             enabled: true,
@@ -3341,23 +3762,8 @@ mod tests {
                 .abs()
                 < 0.000_01
         );
-        let busy_cutoff = instrument_parameter_at(
-            &busy_project,
-            &busy_project.tracks[track_index],
-            "instrument.cutoff",
-            busy_project.tracks[track_index].instrument.cutoff,
-            half_beat,
-        );
         let mut busy_unmodulated = busy_project.clone();
         busy_unmodulated.tracks[track_index].modulators.clear();
-        let busy_unmodulated_cutoff = instrument_parameter_at(
-            &busy_unmodulated,
-            &busy_unmodulated.tracks[track_index],
-            "instrument.cutoff",
-            busy_unmodulated.tracks[track_index].instrument.cutoff,
-            half_beat,
-        );
-        assert!((busy_cutoff - busy_unmodulated_cutoff).abs() < 0.000_01);
 
         let mut sparse_project = midi_project.clone();
         sparse_project.edits.push(Edit {
@@ -3391,23 +3797,8 @@ mod tests {
                 .abs()
                 < 0.000_01
         );
-        let sparse_cutoff = instrument_parameter_at(
-            &sparse_project,
-            &sparse_project.tracks[track_index],
-            "instrument.cutoff",
-            sparse_project.tracks[track_index].instrument.cutoff,
-            first_beat,
-        );
         let mut sparse_unmodulated = sparse_project.clone();
         sparse_unmodulated.tracks[track_index].modulators.clear();
-        let sparse_unmodulated_cutoff = instrument_parameter_at(
-            &sparse_unmodulated,
-            &sparse_unmodulated.tracks[track_index],
-            "instrument.cutoff",
-            sparse_unmodulated.tracks[track_index].instrument.cutoff,
-            first_beat,
-        );
-        assert!(sparse_cutoff > sparse_unmodulated_cutoff);
 
         let busy_render =
             render_region(&busy_project, &[track_id], 0.0, 2.0).expect("busy MIDI render");
@@ -3423,6 +3814,55 @@ mod tests {
         assert!(
             sample_difference(&sparse_render.samples, &sparse_unmodulated_render.samples)
                 > 0.000_01
+        );
+    }
+
+    #[test]
+    fn cross_track_midi_and_audio_sources_drive_target_modulators() {
+        let mut project = Project::demo();
+        let source_index = project
+            .tracks
+            .iter()
+            .position(|track| track.role == TrackRole::Drums)
+            .expect("drum source");
+        let target_index = project
+            .tracks
+            .iter()
+            .position(|track| track.role == TrackRole::Bass)
+            .expect("bass target");
+        let source_id = project.tracks[source_index].id;
+        let target_id = project.tracks[target_index].id;
+        let baseline_project = {
+            let mut baseline = project.clone();
+            baseline.tracks[target_index].modulators.clear();
+            baseline
+        };
+        let baseline =
+            render_region(&baseline_project, &[target_id], 0.0, 2.0).expect("baseline bass");
+
+        let modulator = &mut project.tracks[target_index].modulators[0];
+        modulator.target = "track.volume".to_owned();
+        modulator.trigger = "midi".to_owned();
+        modulator.source_track_id = Some(source_id);
+        modulator.shape = "envelope".to_owned();
+        modulator.depth = 0.8;
+        let midi = render_region(&project, &[target_id], 0.0, 2.0).expect("MIDI-triggered bass");
+        assert!(
+            sample_difference(&midi.samples, &baseline.samples) > 0.000_01,
+            "cross-track MIDI events must affect the target"
+        );
+
+        let modulator = &mut project.tracks[target_index].modulators[0];
+        modulator.trigger = "audio".to_owned();
+        modulator.polarity = "decrease".to_owned();
+        modulator.threshold = 0.0;
+        modulator.attack_ms = 0.0;
+        modulator.release_ms = 200.0;
+        modulator.depth = 1.0;
+        let ducked = render_region(&project, &[target_id], 0.0, 2.0).expect("audio-ducked bass");
+        assert!(
+            analyze(&ducked).rms < analyze(&baseline).rms,
+            "source audio envelope must reduce target RMS"
         );
     }
 

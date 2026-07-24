@@ -1,9 +1,12 @@
 #[allow(dead_code)]
 mod audio_analysis;
+mod audio_stream;
+mod concurrency;
 pub mod gemini;
 mod gemini_tools;
 pub mod model;
 mod project_file;
+mod project_history;
 pub mod prompt;
 pub mod server;
 mod storage;

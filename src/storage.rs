@@ -10,6 +10,11 @@ pub(crate) const MAX_PROJECT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROJECT_DOCUMENT_BYTES: u64 = 20 * 1024 * 1024;
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+pub(crate) fn unique_test_id() -> u64 {
+    TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Clone)]
 pub(crate) struct ProjectStore {
     path: PathBuf,
@@ -128,6 +133,34 @@ pub(crate) fn replace_text_file(path: &Path, source: &str) -> io::Result<()> {
     result
 }
 
+pub(crate) fn quarantine_invalid_file(path: &Path) -> io::Result<PathBuf> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sound-graph.json");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    for suffix in 0_u16..=u16::MAX {
+        let suffix = if suffix == 0 {
+            String::new()
+        } else {
+            format!("-{suffix}")
+        };
+        let quarantine = parent.join(format!("{file_name}.invalid-{timestamp}{suffix}"));
+        if !quarantine.exists() {
+            fs::rename(path, &quarantine)?;
+            return Ok(quarantine);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate an invalid-project quarantine path",
+    ))
+}
+
 fn replace_destination(temporary: &Path, destination: &Path) -> io::Result<()> {
     match fs::rename(temporary, destination) {
         Ok(()) => Ok(()),
@@ -181,6 +214,27 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read_to_string(&path).unwrap(), "{not json}\n");
         fs::remove_file(path).expect("remove test graph");
+    }
+
+    #[test]
+    fn quarantines_an_invalid_graph_without_overwriting_it() {
+        let path = temporary_project_path("quarantine");
+        fs::write(&path, b"{not json}\n").expect("write invalid graph");
+
+        let quarantine = quarantine_invalid_file(&path).expect("quarantine invalid graph");
+
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_to_string(&quarantine).expect("quarantined source"),
+            "{not json}\n"
+        );
+        assert!(
+            quarantine
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".invalid-"))
+        );
+        fs::remove_file(quarantine).expect("remove quarantined graph");
     }
 
     #[test]

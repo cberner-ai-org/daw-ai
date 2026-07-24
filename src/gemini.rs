@@ -15,9 +15,10 @@ use serde_json::Value as JsonValue;
 #[cfg(test)]
 use crate::gemini_tools::render_audio_request;
 use crate::gemini_tools::{
-    AUDIO_TOOL_NAME, AudioRender, AudioRenderRequest, EditSession, PRESET_TOOL_NAME,
-    READ_TOOL_NAME, apply_agent_mutation, base64_audio, is_mutation_tool, list_surge_presets,
-    prepare_audio_render, read_sound_graph, tool_declarations,
+    AUDIO_TOOL_NAME, AudioRender, AudioRenderRequest, EditSession, INSTRUMENT_PARAMETER_TOOL_NAME,
+    PRESET_TOOL_NAME, READ_TOOL_NAME, apply_agent_mutation, base64_audio, is_mutation_tool,
+    list_instrument_parameters, list_surge_presets, prepare_audio_render, read_sound_graph,
+    tool_declarations,
 };
 use crate::model::Project;
 #[cfg(test)]
@@ -126,6 +127,9 @@ impl GeminiPlanner {
         // Keep the model/API transcript even if this final metadata update cannot be written.
         if let Err(error) = session.update_status(status, &detail, applied_steps, audio_listens) {
             eprintln!("warning: could not finalize Gemini session metadata: {error}");
+        }
+        if let Err(error) = crate::gemini_tools::apply_session_retention(session_root) {
+            eprintln!("warning: could not apply Gemini session retention: {error}");
         }
         result
     }
@@ -355,6 +359,10 @@ fn execute_tool(
             list_surge_presets(&call.arguments)
                 .unwrap_or_else(|error| format!("Tool error: {error}")),
         )),
+        INSTRUMENT_PARAMETER_TOOL_NAME => Ok(ToolOutput::text(
+            list_instrument_parameters(session.path(), &call.arguments)
+                .unwrap_or_else(|error| format!("Tool error: {error}")),
+        )),
         "resample_audio_region" => {
             let object = call
                 .arguments
@@ -410,43 +418,46 @@ fn execute_tool(
             state,
             on_update,
         )?)),
-        AUDIO_TOOL_NAME => match prepare_audio_render(session.path(), &call.arguments)
-            .and_then(render_audio)
-        {
-            Ok(audio) => {
-                state.audio_listens += 1;
-                state.audio_artifacts += 1;
-                let audio_name = session
-                    .record_audio(sequence * 1_000_000 + state.audio_artifacts, &audio.wav)
-                    .map_err(PlannerError::Io)?;
-                let description = format!("{} Session artifact: {audio_name}.", audio.description);
-                let output = ToolOutput {
-                    result: vec![serde_json::json!({
-                        "type": "text",
-                        "text": description.clone()
-                    })],
-                    supplemental_input: vec![serde_json::json!({
-                        "type": "user_input",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": format!(
-                                    "Audio produced by {AUDIO_TOOL_NAME} for function call {}. Listen to this WAV before deciding what to do next.",
-                                    call.id
-                                )
-                            },
-                            {
-                                "type": "audio",
-                                "mime_type": "audio/wav",
-                                "data": base64_audio(&audio.wav)
-                            }
-                        ]
-                    })],
-                };
-                Ok(output)
+        AUDIO_TOOL_NAME => {
+            match prepare_audio_render(session.path(), &call.arguments).and_then(render_audio) {
+                Ok(audio) => {
+                    state.audio_listens += 1;
+                    state.audio_artifacts += 1;
+                    let audio_name = session
+                        .record_audio(sequence * 1_000_000 + state.audio_artifacts, &audio.wav)
+                        .map_err(PlannerError::Io)?;
+                    let description = format!(
+                        "{} Objective measurements: {} Session artifact: {audio_name}.",
+                        audio.description, audio.measurements
+                    );
+                    let output = ToolOutput {
+                        result: vec![serde_json::json!({
+                            "type": "text",
+                            "text": description.clone()
+                        })],
+                        supplemental_input: vec![serde_json::json!({
+                            "type": "user_input",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": format!(
+                                        "Audio produced by {AUDIO_TOOL_NAME} for function call {}. Listen to this WAV before deciding what to do next.",
+                                        call.id
+                                    )
+                                },
+                                {
+                                    "type": "audio",
+                                    "mime_type": "audio/wav",
+                                    "data": base64_audio(&audio.wav)
+                                }
+                            ]
+                        })],
+                    };
+                    Ok(output)
+                }
+                Err(error) => Ok(ToolOutput::text(format!("Tool error: {error}"))),
             }
-            Err(error) => Ok(ToolOutput::text(format!("Tool error: {error}"))),
-        },
+        }
         _ => Ok(ToolOutput::text(format!(
             "Tool error: unknown tool {}",
             call.name
@@ -763,7 +774,7 @@ fn missing_credentials(path: Option<&Path>) -> PlannerError {
 
 fn planner_task(prompt: &str, start: f32, end: f32) -> String {
     format!(
-        "Selected edit region: {start:.3} to {end:.3} seconds. This bounds graph edits, not listening.\nUser request: {prompt}\n\nBegin by reading the current sound graph. For creative work, establish an audible baseline, audition important sound choices on isolated tracks, evaluate each coherent edit batch, and listen to the final full mix. Revise weak results before finishing."
+        "Selected edit region: {start:.3} to {end:.3} seconds. This bounds graph edits, not listening.\nUser request: {prompt}\n\nBegin by reading the current sound graph. For creative work, listen after each change, compare the sound with the user's request, and iterate on composition and sound design until they match. Establish an audible baseline, audition important sound choices on isolated tracks, and evaluate the final full mix."
     )
 }
 
@@ -780,11 +791,11 @@ fn system_instruction() -> String {
             "you cannot alter the graph by merely describing changes. Research unfamiliar musical ",
             "goals when useful. The selected region bounds edits only; every audio-tool call chooses ",
             "its own absolute project start and end, so include surrounding context when useful. Read ",
-            "the graph before editing. Treat listening as a core production tool: for creative or ",
-            "style-based work, listen before editing, audition important preset or effect choices on ",
-            "isolated tracks, listen after each coherent composition or sound-design batch, and always ",
-            "evaluate the final full mix. Skip listening only for a simple literal operation whose ",
-            "audible result is already certain. When you listen, reason from ",
+            "the graph before editing. For creative or style-based work, listen after each change, ",
+            "compare the audible result with the user's request, and iterate on composition and sound ",
+            "design until they match. Listen before editing, audition important preset or effect choices ",
+            "on isolated tracks, and evaluate the final full mix. ",
+            "When you listen, use the WAV and objective measurements and reason from ",
             "the actual audio - not event-count proxies - about groove, beat subdivision, energy contour, ",
             "tension, impact, timbre, and contrast. If a style depends on intensification, express it ",
             "through composition and rhythmic subdivision when appropriate. Default drums, bass grooves, ",
@@ -1480,6 +1491,7 @@ mod tests {
             Ok(AudioRender {
                 wav: crate::audio_analysis::wav_bytes(&vec![0.1; 16_000]),
                 description: "Rendered one second".to_owned(),
+                measurements: serde_json::json!({}),
             })
         };
         for (index, destination) in [0.0, 1.0].into_iter().enumerate() {
@@ -1667,12 +1679,13 @@ mod tests {
     fn gemini_prompt_encourages_iterative_listening_without_a_tempo_assumption() {
         let task = planner_task("make the bass hit harder", 4.0, 8.0);
         let instruction = system_instruction();
-        assert!(task.contains("establish an audible baseline"));
-        assert!(task.contains("listen to the final full mix"));
+        assert!(task.contains("listen after each change"));
+        assert!(task.contains("iterate on composition and sound design"));
         assert!(instruction.contains("selected region bounds edits only"));
         assert!(instruction.contains("chooses its own absolute project start and end"));
-        assert!(instruction.contains("Treat listening as a core production tool"));
-        assert!(instruction.contains("listen after each coherent"));
+        assert!(instruction.contains("listen after each change"));
+        assert!(instruction.contains("iterate on composition and sound design"));
+        assert!(instruction.contains("objective measurements"));
         assert!(instruction.contains("actual audio - not event-count proxies"));
         assert!(instruction.contains("rhythmic subdivision"));
         assert!(instruction.contains("Default drums, bass grooves"));

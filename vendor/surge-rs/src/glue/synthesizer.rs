@@ -2,6 +2,7 @@ use super::hell_ffi;
 use super::parameter::Parameter;
 
 use std::ffi;
+use std::ffi::CString;
 use std::path::Path;
 
 // should this take &self and &mut index instead? for clarity up ahead.
@@ -252,6 +253,94 @@ impl SurgeSynthesizer {
         let force_integer = force_integer.unwrap_or(false);
 
         unsafe { hell_ffi::setParameter01(self.ptr, &mut index.0, value, external, force_integer) }
+    }
+
+    pub fn set_modulation(
+        &mut self,
+        target: i32,
+        source: i32,
+        source_scene: i32,
+        depth: f32,
+    ) -> bool {
+        unsafe {
+            surge_bridge::surge_set_modulation(
+                self.ptr,
+                target,
+                source,
+                source_scene,
+                depth.clamp(-1.0, 1.0),
+            )
+        }
+    }
+
+    pub fn clear_modulation(&mut self, target: i32, source: i32, source_scene: i32) {
+        unsafe {
+            surge_bridge::surge_clear_modulation(self.ptr, target, source, source_scene);
+        }
+    }
+
+    pub fn set_tempo(&mut self, bpm: f64) {
+        unsafe { surge_bridge::surge_set_tempo(self.ptr, bpm) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure_lfo(
+        &mut self,
+        scene: i32,
+        lfo: i32,
+        shape: i32,
+        rate: f32,
+        tempo_sync: bool,
+        delay: f32,
+        hold: f32,
+        attack: f32,
+        decay: f32,
+        sustain: f32,
+        release: f32,
+        trigger_mode: i32,
+        unipolar: bool,
+        formula: &str,
+    ) -> bool {
+        let Ok(formula) = CString::new(formula) else {
+            return false;
+        };
+        unsafe {
+            surge_bridge::surge_configure_lfo(
+                self.ptr,
+                scene,
+                lfo,
+                shape,
+                rate,
+                tempo_sync,
+                delay,
+                hold,
+                attack,
+                decay,
+                sustain,
+                release,
+                trigger_mode,
+                unipolar,
+                formula.as_ptr(),
+            )
+        }
+    }
+
+    pub fn set_lfo_rate(
+        &mut self,
+        scene: i32,
+        lfo: i32,
+        rate: f32,
+        tempo_sync: bool,
+    ) -> bool {
+        unsafe {
+            surge_bridge::surge_set_lfo_rate(
+                self.ptr,
+                scene,
+                lfo,
+                rate.clamp(0.0, 1.0),
+                tempo_sync,
+            )
+        }
     }
 
     pub fn apply_parameter_monophonic_modulation(&mut self, arg1: &Parameter, depth: f32) {

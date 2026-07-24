@@ -61,6 +61,8 @@ Prompted edits run as asynchronous jobs so reverse proxies never need to hold on
 
 Every Gemini session is retained locally with request/response JSON, graph state, metadata, and rendered WAV artifacts. By default sessions live beside `DAW_AI_PROJECT_PATH` in `gemini-sessions/`, or in the working directory's `gemini-sessions/` when no project path is configured. Override this with `DAW_AI_GEMINI_SESSION_DIR`. The Debug tab lists the latest sessions by timestamp.
 
+Completed and failed sessions are retained for 30 days, up to 100 sessions and 512 MiB per session directory root. Under storage pressure, old WAV artifacts are pruned before old session records; running sessions are never removed. Configure the limits with `DAW_AI_GEMINI_SESSION_RETENTION_DAYS`, `DAW_AI_GEMINI_SESSION_RETENTION_COUNT`, and `DAW_AI_GEMINI_SESSION_RETENTION_BYTES`.
+
 ## Development
 
 Development checks additionally require Node.js 22 or newer and Chrome or Chromium. Set `CHROME_PATH` when the browser workflow suite cannot discover the executable. Verify browser discovery with `just qa-browser-setup`.

@@ -2,15 +2,17 @@
 Description=DAW-AI local prompt-driven music studio
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
-User=root
-Group=root
+DynamicUser=yes
 WorkingDirectory=/var/lib/daw-ai
 ExecStart=/usr/local/bin/daw-ai --port 8888
 Restart=on-failure
 RestartSec=5s
+TimeoutStopSec=30s
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=HOME=/var/lib/daw-ai
 Environment=XDG_DATA_HOME=/var/lib/daw-ai/surge-data
@@ -19,8 +21,11 @@ Environment=DAW_AI_SURGE_PRESET_DIR=/usr/local/share/daw-ai/patches_factory
 LoadCredential=gemini-api-key:/etc/daw-ai/gemini-api-key
 StateDirectory=daw-ai
 UMask=0077
+TasksMax=128
+MemoryMax=2G
 
 NoNewPrivileges=true
+PrivateDevices=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
@@ -29,7 +34,9 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectKernelLogs=true
 ProtectClock=true
+ProtectProc=invisible
 RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=

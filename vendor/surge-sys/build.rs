@@ -167,12 +167,25 @@ fn pull_surge_from_clouds(dst: impl AsRef<Path>) {
 }
 
 fn build_surge_from_ground(src: impl AsRef<Path>) -> PathBuf {
+    let src = src.as_ref();
+    let cmake_lists = src.join("CMakeLists.txt");
+    let cmake = std::fs::read_to_string(&cmake_lists).expect("failed to read Surge CMakeLists.txt");
+    let rust_lua_disable = r#"if(SURGE_BUILD_RS)
+    message(STATUS "Lua is being disabled due to temporary incompatibility with Rust bindings.")
+    set(SURGE_SKIP_LUA TRUE)
+endif()
+
+"#;
+    if cmake.contains(rust_lua_disable) {
+        std::fs::write(&cmake_lists, cmake.replace(rust_lua_disable, ""))
+            .expect("failed to enable Surge Formula for Rust bindings");
+    }
     cmake::Config::new(src)
         .define("SURGE_SKIP_JUCE_FOR_RACK", "ON")
         .define("SURGE_SKIP_VST3", "ON")
         .define("SURGE_SKIP_ALSA", "ON")
         .define("SURGE_SKIP_STANDALONE", "ON")
-        .define("SURGE_SKIP_LUA", "ON")
+        .define("SURGE_SKIP_LUA", "OFF")
         .define("CMAKE_EXPORT_COMPILE_COMMANDS", "ON")
         .define("ENABLE_LTO", "OFF")
         .build()
@@ -245,6 +258,7 @@ fn main() {
     linksearchlink!(bpath,
         ("src/common",                              "surge-common"),
         ("src/lua",                                 "surge-lua-src"),
+        ("libs/luajitlib/LuaJIT/src/LuaJIT/src",    "luajit"),
         ("libs/zstd/build/cmake/lib",               "zstd"),
         ("libs/sqlite-3.23.3",                      "sqlite"),
         ("libs/oddsound-mts",                       "oddsound-mts"),
