@@ -700,7 +700,7 @@
                 <h4>Common controls</h4>
                 <div class="tool-controls instrument-envelope-controls">
                   ${(state.instrumentParameters[`${track.id}:common`] || []).map((parameter) =>
-                    soundRange(track, "instrument", track.instrument.id, "instrument", parameter.parameter, parameter.value, 0, 1, "%", "", `${parameter.name}${parameter.overridden ? " (overridden)" : ` — preset: ${parameter.display}`}`)
+                    soundRange(track, "instrument", track.instrument.id, "instrument", parameter.parameter, parameter.value, 0, 1, "%", "", `${parameter.name}${parameter.overridden ? " (overridden)" : ` - preset: ${parameter.display}`}`)
                   ).join("")}
                   ${state.instrumentParameters[`${track.id}:common`] ? "" : `<button type="button" data-load-instrument-parameters="${track.id}:common">Show common controls</button>`}
                 </div>
@@ -708,7 +708,7 @@
                   <summary>Advanced controls</summary>
                   <div class="tool-controls">
                     ${(state.instrumentParameters[`${track.id}:advanced`] || []).map((parameter) =>
-                      soundRange(track, "instrument", track.instrument.id, "instrument", parameter.parameter, parameter.value, 0, 1, "%", "", `${parameter.name}${parameter.overridden ? " (overridden)" : ` — preset: ${parameter.display}`}`)
+                      soundRange(track, "instrument", track.instrument.id, "instrument", parameter.parameter, parameter.value, 0, 1, "%", "", `${parameter.name}${parameter.overridden ? " (overridden)" : ` - preset: ${parameter.display}`}`)
                     ).join("")}
                     ${state.instrumentParameters[`${track.id}:advanced`] ? "" : `<button type="button" data-load-instrument-parameters="${track.id}:advanced">Show advanced controls</button>`}
                   </div>
