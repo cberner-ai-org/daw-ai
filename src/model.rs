@@ -1023,17 +1023,33 @@ impl ChannelOperation {
 }
 
 impl Action {
-    fn retain_after_track_deletion(&mut self, track_id: u64) -> bool {
+    fn retain_after_track_deletion(
+        &mut self,
+        track_id: u64,
+        removed_modulator_ids: &std::collections::HashSet<u64>,
+    ) -> bool {
         match self {
             Self::GraphMutation => true,
             Self::Compound { actions } => {
-                actions.retain_mut(|action| action.retain_after_track_deletion(track_id));
+                actions.retain_mut(|action| {
+                    action.retain_after_track_deletion(track_id, removed_modulator_ids)
+                });
                 !actions.is_empty()
             }
-            Self::Timed { action, .. } => action.retain_after_track_deletion(track_id),
+            Self::Timed { action, .. } => {
+                action.retain_after_track_deletion(track_id, removed_modulator_ids)
+            }
             Self::Automation {
-                track_id: owner_id, ..
-            } => *owner_id != track_id,
+                track_id: owner_id,
+                parameter,
+                ..
+            } => {
+                *owner_id != track_id
+                    && !removed_modulator_ids.iter().any(|id| {
+                        parameter == &format!("modulator:{id}.rate")
+                            || parameter == &format!("modulator:{id}.depth")
+                    })
+            }
             _ => true,
         }
     }
@@ -1747,6 +1763,14 @@ impl Studio {
             return Err(StudioError::InvalidChannel);
         }
 
+        let removed_modulator_ids = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|track| &track.modulators)
+            .filter(|modulator| modulator.source_track_id == Some(track_id))
+            .map(|modulator| modulator.id)
+            .collect::<std::collections::HashSet<_>>();
         self.remember();
         self.project.tracks.remove(index);
         for track in &mut self.project.tracks {
@@ -1754,9 +1778,10 @@ impl Studio {
                 .modulators
                 .retain(|modulator| modulator.source_track_id != Some(track_id));
         }
-        self.project
-            .edits
-            .retain_mut(|edit| edit.action.retain_after_track_deletion(track_id));
+        self.project.edits.retain_mut(|edit| {
+            edit.action
+                .retain_after_track_deletion(track_id, &removed_modulator_ids)
+        });
         self.project.version += 1;
         Ok(())
     }
@@ -2219,9 +2244,8 @@ impl Studio {
         {
             return Err(StudioError::InvalidSoundTool);
         }
-        let id = self.take_id();
-        self.remember();
-        self.project.tracks[track_index].modulators.push(Modulator {
+        let id = self.next_id;
+        let candidate = Modulator {
             id,
             name: "AI modulation".to_owned(),
             shape: spec.shape.to_owned(),
@@ -2238,7 +2262,15 @@ impl Studio {
             depth: spec.depth,
             target: spec.target.to_owned(),
             enabled: true,
-        });
+        };
+        let mut modulators = self.project.tracks[track_index].modulators.clone();
+        modulators.push(candidate.clone());
+        if !native_modulator_slots_fit(track_id, &modulators) {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let id = self.take_id();
+        self.remember();
+        self.project.tracks[track_index].modulators.push(candidate);
         self.project.version += 1;
         Ok(id)
     }
@@ -2305,6 +2337,7 @@ impl Studio {
                 .modulators
                 .iter()
                 .any(|modulator| !valid_modulator_configuration(track.id, modulator, &track_ids))
+                || !native_modulator_slots_fit(track.id, &track.modulators)
         }) {
             return Err(StudioError::InvalidSoundTool);
         }
@@ -2452,8 +2485,8 @@ impl Studio {
         }
         let track_index = role_action_track_index(&self.project, role, Some(parameter))
             .ok_or(StudioError::InvalidSoundTool)?;
-        let id = self.take_id();
-        self.project.tracks[track_index].modulators.push(Modulator {
+        let id = self.next_id;
+        let candidate = Modulator {
             id,
             name: "AI modulation".to_owned(),
             shape: shape.to_owned(),
@@ -2469,7 +2502,14 @@ impl Studio {
             depth,
             target: parameter.to_owned(),
             enabled: true,
-        });
+        };
+        let mut modulators = self.project.tracks[track_index].modulators.clone();
+        modulators.push(candidate.clone());
+        if !native_modulator_slots_fit(self.project.tracks[track_index].id, &modulators) {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        self.take_id();
+        self.project.tracks[track_index].modulators.push(candidate);
         Ok(())
     }
 
@@ -3011,6 +3051,22 @@ fn valid_modulator_configuration(
             && native_source_is_local
             && !modulator.formula.trim().is_empty());
     source_exists && native_source_is_local && audio_target_is_owned_by_daw && formula_is_native
+}
+
+pub(crate) fn native_modulator_slots_fit(track_id: u64, modulators: &[Modulator]) -> bool {
+    let mut midi_slots = 0;
+    let mut scene_slots = 0;
+    for modulator in modulators
+        .iter()
+        .filter(|modulator| crate::surge::is_native_modulator(track_id, modulator))
+    {
+        if modulator.trigger == "midi" {
+            midi_slots += 1;
+        } else {
+            scene_slots += 1;
+        }
+    }
+    midi_slots <= 6 && scene_slots <= 6
 }
 
 fn automation_targets(track: &Track) -> Vec<ModulationTarget> {
@@ -4084,6 +4140,101 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_modulator_source_prunes_its_target_automation() {
+        let mut studio = Studio::new();
+        let source_id = studio.project.tracks[0].id;
+        let target_id = studio.project.tracks[1].id;
+        let modulator_id = studio.project.tracks[1].modulators[0].id;
+        studio
+            .configure_sound_tool(
+                target_id,
+                "modulator",
+                modulator_id,
+                None,
+                "target",
+                "track.volume",
+            )
+            .expect("DAW target");
+        studio
+            .configure_sound_tool(
+                target_id,
+                "modulator",
+                modulator_id,
+                None,
+                "trigger",
+                "audio",
+            )
+            .expect("audio trigger");
+        studio
+            .configure_sound_tool(
+                target_id,
+                "modulator",
+                modulator_id,
+                None,
+                "sourceTrackId",
+                &source_id.to_string(),
+            )
+            .expect("cross-track source");
+        studio.project.edits.push(Edit {
+            id: 9_800,
+            operation_id: None,
+            start: 0.0,
+            end: 4.0,
+            prompt: "Automate ducking".to_owned(),
+            summary: "Automated sidechain depth".to_owned(),
+            action: Action::Automation {
+                track_id: target_id,
+                parameter: format!("modulator:{modulator_id}.depth"),
+                curve: "linear",
+                points: vec![crate::prompt::AutomationPoint {
+                    time: 0.0,
+                    value: 0.8,
+                }],
+                target: TrackRole::Bass,
+            },
+        });
+
+        studio
+            .delete_channel(source_id)
+            .expect("delete modulator source");
+        assert!(studio.project.tracks[0].modulators.is_empty());
+        assert!(
+            !studio
+                .to_json()
+                .contains(&format!("modulator:{modulator_id}.depth"))
+        );
+    }
+
+    #[test]
+    fn native_modulator_slot_limits_are_commit_invariants() {
+        let mut studio = Studio::from_project(Project::initial());
+        let track_id = studio.project.tracks[0].id;
+        let spec = || ModulatorSpec {
+            target: "instrument.cutoff",
+            shape: "sine",
+            formula: "",
+            rate: 1.0,
+            depth: 0.5,
+            trigger: "free",
+            source_track_id: None,
+            attack_ms: 5.0,
+            release_ms: 180.0,
+            threshold: 0.1,
+            polarity: "increase",
+        };
+        for _ in 0..6 {
+            studio
+                .create_modulator(track_id, spec())
+                .expect("available native scene slot");
+        }
+        assert_eq!(
+            studio.create_modulator(track_id, spec()),
+            Err(StudioError::InvalidSoundTool)
+        );
+        assert_eq!(studio.project.tracks[0].modulators.len(), 6);
+    }
+
+    #[test]
     fn disabled_modulators_are_not_active_control_routes() {
         let mut studio = Studio::new();
         let bass = &studio.project().tracks[1];
@@ -4107,7 +4258,7 @@ mod tests {
         let seeded_modulator_id = drums.modulators[0].id;
         let seeded_depth = drums.modulators[0].depth;
 
-        for index in 0..30 {
+        for index in 0..5 {
             let plan = crate::prompt::EditPlan {
                 action: Action::Modulator {
                     parameter: "instrument.cutoff".to_owned(),

@@ -138,6 +138,7 @@ struct TrackRenderState<'a> {
     render_start_sample: usize,
     modulator_phases: Vec<ModulatorPhaseCurve>,
     automation: AutomationIndex<'a>,
+    native_modulators_are_external: bool,
 }
 
 pub(crate) struct AudioRegion {
@@ -319,6 +320,16 @@ fn render_builtin_samples(
     start_sample: usize,
     end_sample: usize,
 ) -> Result<AudioRegion, String> {
+    render_builtin_samples_with_audio_sources(project, track_ids, start_sample, end_sample, true)
+}
+
+fn render_builtin_samples_with_audio_sources(
+    project: &Project,
+    track_ids: &[u64],
+    start_sample: usize,
+    end_sample: usize,
+    resolve_audio_inputs: bool,
+) -> Result<AudioRegion, String> {
     if end_sample <= start_sample {
         return Err("audio range must contain at least one sample".to_owned());
     }
@@ -327,6 +338,32 @@ fn render_builtin_samples(
     let mut mix = vec![0.0_f32; end_sample - start_sample];
     let mut event_onsets = Vec::new();
     let mut audio_assets = AudioAssetCache::default();
+    let audio_source_ids = track_ids
+        .iter()
+        .filter_map(|track_id| project.tracks.iter().find(|track| track.id == *track_id))
+        .flat_map(|track| &track.modulators)
+        .filter(|modulator| modulator.enabled && modulator.trigger == "audio")
+        .filter_map(|modulator| modulator.source_track_id)
+        .collect::<std::collections::HashSet<_>>();
+    let audio_sources = if resolve_audio_inputs {
+        Some(
+            audio_source_ids
+                .into_iter()
+                .map(|track_id| {
+                    render_builtin_samples_with_audio_sources(
+                        project,
+                        &[track_id],
+                        start_sample,
+                        end_sample,
+                        false,
+                    )
+                    .map(|region| (track_id, region.samples))
+                })
+                .collect::<Result<HashMap<_, _>, _>>()?,
+        )
+    } else {
+        None
+    };
     for track_id in track_ids {
         let track = project
             .tracks
@@ -336,7 +373,14 @@ fn render_builtin_samples(
         if track.muted {
             continue;
         }
-        let state = TrackRenderState::new(project, track, start, end);
+        let state = TrackRenderState::new_builtin_with_audio(
+            project,
+            track,
+            start,
+            end,
+            start_sample,
+            audio_sources.as_ref(),
+        );
         let mut rendered = vec![0.0_f32; mix.len()];
         let beat_duration = 60.0 / f64::from(project.bpm);
         for occurrence in &state.occurrences {
@@ -346,14 +390,39 @@ fn render_builtin_samples(
                 event_onsets.push(onset as f32);
             }
             let note_start = midi_event_sample(onset).max(start_sample);
-            let pitch = f32::from(occurrence.event.pitch) + (track.instrument.pitch - 0.5) * 24.0;
-            let frequency = 440.0 * 2.0_f32.powf((pitch - 69.0) / 12.0);
-            let attack = 0.002 + track.instrument.attack * 0.5;
-            let release = 0.02 + track.instrument.release * 1.5;
-            let note_end = midi_event_sample(onset + duration + f64::from(release)).min(end_sample);
+            let note_end = midi_event_sample(onset + duration + 1.52).min(end_sample);
             for sample_index in note_start..note_end {
                 let local = sample_index - start_sample;
-                let time = precise_sample_time(sample_index) - onset;
+                let project_time = precise_sample_time(sample_index);
+                let time = project_time - onset;
+                let pitch_control = parameter_at(
+                    project,
+                    track,
+                    &state,
+                    "instrument.pitch",
+                    track.instrument.pitch,
+                    project_time,
+                );
+                let pitch = f32::from(occurrence.event.pitch) + (pitch_control - 0.5) * 24.0;
+                let frequency = 440.0 * 2.0_f32.powf((pitch - 69.0) / 12.0);
+                let attack = 0.002
+                    + parameter_at(
+                        project,
+                        track,
+                        &state,
+                        "instrument.attack",
+                        track.instrument.attack,
+                        project_time,
+                    ) * 0.5;
+                let release = 0.02
+                    + parameter_at(
+                        project,
+                        track,
+                        &state,
+                        "instrument.release",
+                        track.instrument.release,
+                        project_time,
+                    ) * 1.5;
                 let held = duration;
                 let envelope = if time < f64::from(attack) {
                     (time / f64::from(attack)).clamp(0.0, 1.0) as f32
@@ -365,10 +434,26 @@ fn render_builtin_samples(
                 let phase = std::f64::consts::TAU * f64::from(frequency) * time;
                 let sine = phase.sin() as f32;
                 let saw = ((phase / std::f64::consts::TAU).fract() as f32 * 2.0) - 1.0;
-                let color = track.instrument.cutoff.clamp(0.0, 1.0);
+                let color = parameter_at(
+                    project,
+                    track,
+                    &state,
+                    "instrument.cutoff",
+                    track.instrument.cutoff,
+                    project_time,
+                );
+                let output = parameter_at(
+                    project,
+                    track,
+                    &state,
+                    "instrument.output",
+                    track.instrument.output,
+                    project_time,
+                );
                 rendered[local] += (sine * (1.0 - color * 0.55) + saw * color * 0.35)
                     * envelope
                     * occurrence.velocity
+                    * output
                     * 0.16;
             }
         }
@@ -1118,7 +1203,15 @@ fn clip_events_in_window<'a>(
 
 impl<'a> TrackRenderState<'a> {
     fn new(project: &'a Project, track: &'a Track, start: f64, end: f64) -> Self {
-        Self::new_with_audio(project, track, start, end, midi_event_sample(start), None)
+        Self::new_inner(
+            project,
+            track,
+            start,
+            end,
+            midi_event_sample(start),
+            None,
+            false,
+        )
     }
 
     fn new_with_audio(
@@ -1128,6 +1221,45 @@ impl<'a> TrackRenderState<'a> {
         end: f64,
         render_start_sample: usize,
         audio_sources: Option<&HashMap<u64, Vec<f32>>>,
+    ) -> Self {
+        Self::new_inner(
+            project,
+            track,
+            start,
+            end,
+            render_start_sample,
+            audio_sources,
+            true,
+        )
+    }
+
+    fn new_builtin_with_audio(
+        project: &'a Project,
+        track: &'a Track,
+        start: f64,
+        end: f64,
+        render_start_sample: usize,
+        audio_sources: Option<&HashMap<u64, Vec<f32>>>,
+    ) -> Self {
+        Self::new_inner(
+            project,
+            track,
+            start,
+            end,
+            render_start_sample,
+            audio_sources,
+            false,
+        )
+    }
+
+    fn new_inner(
+        project: &'a Project,
+        track: &'a Track,
+        start: f64,
+        end: f64,
+        render_start_sample: usize,
+        audio_sources: Option<&HashMap<u64, Vec<f32>>>,
+        native_modulators_are_external: bool,
     ) -> Self {
         let automation = AutomationIndex::new(project, track);
         let beat_duration = 60.0 / f64::from(project.bpm);
@@ -1222,6 +1354,7 @@ impl<'a> TrackRenderState<'a> {
             render_start_sample,
             modulator_phases,
             automation,
+            native_modulators_are_external,
         }
     }
 
@@ -1554,7 +1687,8 @@ fn parameter_at(
         .filter(|modulator| {
             modulator.enabled
                 && modulator.target == target
-                && !crate::surge::is_native_modulator(track.id, modulator)
+                && (!render_state.native_modulators_are_external
+                    || !crate::surge::is_native_modulator(track.id, modulator))
         })
         .map(|modulator| modulator_value(project, render_state, modulator, time))
         .sum::<f32>();
@@ -3886,6 +4020,8 @@ mod tests {
         };
         let baseline =
             render_region(&baseline_project, &[target_id], 0.0, 2.0).expect("baseline bass");
+        let builtin_baseline = render_region_builtin(&baseline_project, &[target_id], 0.0, 2.0)
+            .expect("built-in baseline bass");
 
         let modulator = &mut project.tracks[target_index].modulators[0];
         modulator.target = "track.volume".to_owned();
@@ -3897,6 +4033,12 @@ mod tests {
         assert!(
             sample_difference(&midi.samples, &baseline.samples) > 0.000_01,
             "cross-track MIDI events must affect the target"
+        );
+        let builtin_midi =
+            render_region_builtin(&project, &[target_id], 0.0, 2.0).expect("built-in MIDI target");
+        assert!(
+            sample_difference(&builtin_midi.samples, &builtin_baseline.samples) > 0.000_01,
+            "built-in rendering must retain native-style host modulation"
         );
 
         let modulator = &mut project.tracks[target_index].modulators[0];
@@ -3910,6 +4052,12 @@ mod tests {
         assert!(
             analyze(&ducked).rms < analyze(&baseline).rms,
             "source audio envelope must reduce target RMS"
+        );
+        let builtin_ducked = render_region_builtin(&project, &[target_id], 0.0, 2.0)
+            .expect("built-in audio-ducked bass");
+        assert!(
+            analyze(&builtin_ducked).rms < analyze(&builtin_baseline).rms,
+            "built-in rendering must feed source audio to sidechain envelopes"
         );
     }
 

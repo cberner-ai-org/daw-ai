@@ -1916,27 +1916,36 @@ impl Router {
                 body.push(',');
             }
             first = false;
+            let legacy_override =
+                crate::surge::legacy_instrument_parameter_override(&track.instrument, parameter.id);
             let value = track
                 .instrument
                 .native_overrides
                 .get(&parameter.id)
                 .copied()
+                .or(legacy_override)
                 .unwrap_or(parameter.value);
+            let overridden = track
+                .instrument
+                .native_overrides
+                .contains_key(&parameter.id)
+                || legacy_override.is_some();
+            let graph_parameter =
+                crate::surge::instrument_graph_parameter(&track.instrument.preset, parameter.id)
+                    .map_or_else(|| "null".to_owned(), json_string);
             write!(
                 body,
                 concat!(
-                    "{{\"parameter\":{},\"name\":{},\"value\":{},\"presetValue\":{},",
+                    "{{\"parameter\":{},\"graphParameter\":{},\"name\":{},\"value\":{},\"presetValue\":{},",
                     "\"display\":{},\"overridden\":{}}}"
                 ),
                 json_string(&format!("native:{}", parameter.id)),
+                graph_parameter,
                 json_string(&parameter.name),
                 value,
                 parameter.value,
                 json_string(&parameter.display),
-                track
-                    .instrument
-                    .native_overrides
-                    .contains_key(&parameter.id)
+                overridden
             )
             .expect("writing to a string cannot fail");
         }
@@ -2881,6 +2890,32 @@ mod tests {
         assert_eq!(invalid.status, 422);
         let project = router.handle(&request("GET", "/api/project", ""));
         assert!(project.body.contains("\"preset\":\"Surge Lead\""));
+    }
+
+    #[test]
+    fn instrument_parameter_api_reports_legacy_graph_overrides() {
+        let router = Router::demo();
+        {
+            let mut project = Project::demo();
+            let instrument = &mut project.tracks[1].instrument;
+            instrument.native_overrides.clear();
+            instrument.cutoff = 0.123;
+            instrument.parameter_overrides.push("cutoff".to_owned());
+            *router.lock_studio() = Studio::from_project(project);
+        }
+
+        let response = router.handle(&request("GET", "/api/instrument-parameters/2/common", ""));
+        assert_eq!(response.status, 200);
+        let response: serde_json::Value =
+            serde_json::from_str(&response.body).expect("instrument parameters");
+        let cutoff = response["parameters"]
+            .as_array()
+            .expect("parameter list")
+            .iter()
+            .find(|parameter| parameter["graphParameter"] == "cutoff")
+            .expect("cutoff parameter");
+        assert!((cutoff["value"].as_f64().expect("cutoff value") - 0.123).abs() < 0.000_001);
+        assert_eq!(cutoff["overridden"], true);
     }
 
     #[test]

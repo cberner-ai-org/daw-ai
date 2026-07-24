@@ -757,6 +757,10 @@ pub(crate) fn list_instrument_parameters(
                 || legacy_override.is_some();
             serde_json::json!({
                 "parameter": format!("native:{}", parameter.id),
+                "graphParameter": crate::surge::instrument_graph_parameter(
+                    &track.instrument.preset,
+                    parameter.id
+                ),
                 "name": parameter.name,
                 "value": value,
                 "presetValue": parameter.value,

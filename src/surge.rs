@@ -656,13 +656,10 @@ pub(crate) fn legacy_instrument_parameter_override(
     instrument: &Instrument,
     native_id: i32,
 ) -> Option<f32> {
-    let native_name = instrument_parameters(&instrument.preset)
-        .into_iter()
-        .find(|parameter| parameter.id == native_id)?
-        .name;
-    let graph_name = NATIVE_PARAMETERS.iter().find_map(|(graph, native)| {
-        (native_name.ends_with(native) && instrument.overrides(graph)).then_some(*graph)
-    })?;
+    let graph_name = instrument_graph_parameter(&instrument.preset, native_id)?;
+    if !instrument.overrides(graph_name) {
+        return None;
+    }
     match graph_name {
         "attack" => Some(instrument.attack),
         "decay" => Some(instrument.decay),
@@ -674,6 +671,16 @@ pub(crate) fn legacy_instrument_parameter_override(
         "output" => Some(instrument.output),
         _ => None,
     }
+}
+
+pub(crate) fn instrument_graph_parameter(preset: &str, native_id: i32) -> Option<&'static str> {
+    let native_name = instrument_parameters(preset)
+        .into_iter()
+        .find(|parameter| parameter.id == native_id)?
+        .name;
+    NATIVE_PARAMETERS
+        .iter()
+        .find_map(|(graph, native)| native_name.ends_with(native).then_some(*graph))
 }
 
 fn is_common_parameter(name: &str) -> bool {

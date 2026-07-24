@@ -419,8 +419,15 @@
           : null;
         if (id == null) continue;
         const overridden = Object.prototype.hasOwnProperty.call(overrides, id);
-        parameter.value = overridden ? Number(overrides[id]) : parameter.presetValue;
-        parameter.overridden = overridden;
+        const legacyOverridden =
+          parameter.graphParameter &&
+          (track.instrument.parameterOverrides || []).includes(parameter.graphParameter);
+        parameter.value = overridden
+          ? Number(overrides[id])
+          : legacyOverridden
+            ? Number(track.instrument[parameter.graphParameter])
+            : parameter.presetValue;
+        parameter.overridden = overridden || legacyOverridden;
       }
     }
     state.project = project;

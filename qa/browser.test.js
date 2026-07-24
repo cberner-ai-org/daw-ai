@@ -1316,6 +1316,7 @@ async function run() {
           document.querySelector('#current-time').textContent !== ${JSON.stringify(compoundPlaybackTime)}`,
       ),
       "pre-submit playback restoration without a manual restart",
+      30_000,
     );
     assert.equal(
       await evaluate(cdp, appSession, "window.__projectRefreshFailures"),

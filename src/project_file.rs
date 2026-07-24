@@ -253,6 +253,11 @@ fn parse_track(
         .iter()
         .map(|value| parse_modulator(value, ids, id))
         .collect::<Result<Vec<_>, _>>()?;
+    if !crate::model::native_modulator_slots_fit(id, &modulators) {
+        return Err(invalid(format!(
+            "{context} supports at most six MIDI-triggered and six scene native modulators"
+        )));
+    }
 
     let routing_object = object(field(track, "routing")?, "routing")?;
     let output = limited_string(routing_object, "output", 1, 64)?;
@@ -1442,6 +1447,20 @@ mod tests {
         project["tracks"][0]["instrument"]["nativeOverrides"] = serde_json::json!({"999999": 0.5});
         let error = parse_project(&project.to_string()).expect_err("unknown native parameter");
         assert!(error.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn rejects_native_modulators_beyond_surge_slot_capacity() {
+        let mut project = Project::demo();
+        let track = &mut project.tracks[1];
+        let template = track.modulators[0].clone();
+        for index in 0..6 {
+            let mut modulator = template.clone();
+            modulator.id = 9_900 + index;
+            track.modulators.push(modulator);
+        }
+        let error = parse_project(&project.to_json()).expect_err("native slot overflow");
+        assert!(error.to_string().contains("at most six"));
     }
 
     #[test]
