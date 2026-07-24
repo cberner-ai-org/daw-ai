@@ -188,6 +188,13 @@ pub(crate) fn open_project_with_history(
     };
     let history = match loaded_history {
         Ok(history) => history,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData && has_embedded_history => {
+            eprintln!(
+                "warning: discarded invalid embedded project history in {}: {error}",
+                store.path().display()
+            );
+            ProjectHistory::new(studio.project().clone())
+        }
         Err(error) if error.kind() == io::ErrorKind::InvalidData && separate_history.is_file() => {
             let quarantine = quarantine_invalid_file(&separate_history)?;
             eprintln!(
@@ -252,5 +259,29 @@ mod tests {
                 .contains("\"history\"")
         );
         fs::remove_dir_all(root).expect("remove state test directory");
+    }
+
+    #[test]
+    fn invalid_embedded_history_recovers_the_current_project() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-invalid-embedded-history-{}-{}",
+            std::process::id(),
+            crate::storage::unique_test_id()
+        ));
+        fs::create_dir(&root).expect("history test directory");
+        let path = root.join("sound-graph.json");
+        let project = Project::demo();
+        let mut document =
+            serde_json::from_str::<serde_json::Value>(&project.to_json()).expect("project JSON");
+        document["history"] = serde_json::json!({"current":0,"snapshots":[]});
+        fs::write(&path, format!("{document}\n")).expect("invalid embedded history");
+
+        let (store, studio, history) =
+            open_project_with_history(path).expect("recover embedded history");
+        assert_eq!(studio.project().to_json(), project.to_json());
+        assert_eq!(history.snapshots.len(), 1);
+        assert_eq!(history.current, 0);
+        load_project_history(store.path(), studio.project()).expect("repaired embedded history");
+        fs::remove_dir_all(root).expect("remove history test directory");
     }
 }

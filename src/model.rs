@@ -2917,14 +2917,6 @@ fn modulation_targets(track: &Track) -> Vec<ModulationTarget> {
             mode: "add",
         },
         ModulationTarget {
-            id: "instrument.timbre".to_owned(),
-            label: "Dedicated drum timbre".to_owned(),
-            minimum: 0.0,
-            maximum: 1.0,
-            scale: 0.25,
-            mode: "add",
-        },
-        ModulationTarget {
             id: "instrument.output".to_owned(),
             label: "Surge oscillator output".to_owned(),
             minimum: 0.0,
@@ -3904,9 +3896,13 @@ mod tests {
 
         assert!(targets.contains(&"instrument.attack".to_owned()));
         assert!(targets.contains(&"instrument.release".to_owned()));
+        assert!(targets.contains(&"instrument.decay".to_owned()));
+        assert!(targets.contains(&"instrument.sustain".to_owned()));
         assert!(targets.contains(&"instrument.cutoff".to_owned()));
         assert!(targets.contains(&"instrument.pitch".to_owned()));
         assert!(targets.contains(&"instrument.resonance".to_owned()));
+        assert!(targets.contains(&"instrument.output".to_owned()));
+        assert!(!targets.contains(&"instrument.timbre".to_owned()));
         assert!(targets.contains(&"track.volume".to_owned()));
         assert!(targets.contains(&"effect:210.mix".to_owned()));
         assert!(targets.contains(&"effect:210.cutoff".to_owned()));
@@ -3931,6 +3927,30 @@ mod tests {
                 .configure_sound_tool(bass_id, "modulator", modulator_id, None, "target", target)
                 .expect("published target must be accepted by validation");
         }
+
+        studio
+            .configure_sound_tool(
+                bass_id,
+                "modulator",
+                modulator_id,
+                None,
+                "target",
+                "instrument.cutoff",
+            )
+            .expect("native Formula target");
+        studio
+            .configure_sound_tool(
+                bass_id,
+                "modulator",
+                modulator_id,
+                None,
+                "formula",
+                "function process(state) state.output = 1 return state end",
+            )
+            .expect("Formula source can be prepared first");
+        studio
+            .configure_sound_tool(bass_id, "modulator", modulator_id, None, "shape", "formula")
+            .expect("Formula shape can follow its source");
         let json = studio.to_json();
         assert!(json.contains("\"modulationTargets\""));
         for target in targets {

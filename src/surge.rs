@@ -652,6 +652,30 @@ pub(crate) fn instrument_parameters(preset: &str) -> Vec<InstrumentParameter> {
     parameters
 }
 
+pub(crate) fn legacy_instrument_parameter_override(
+    instrument: &Instrument,
+    native_id: i32,
+) -> Option<f32> {
+    let native_name = instrument_parameters(&instrument.preset)
+        .into_iter()
+        .find(|parameter| parameter.id == native_id)?
+        .name;
+    let graph_name = NATIVE_PARAMETERS.iter().find_map(|(graph, native)| {
+        (native_name.ends_with(native) && instrument.overrides(graph)).then_some(*graph)
+    })?;
+    match graph_name {
+        "attack" => Some(instrument.attack),
+        "decay" => Some(instrument.decay),
+        "sustain" => Some(instrument.sustain),
+        "release" => Some(instrument.release),
+        "cutoff" => Some(instrument.cutoff),
+        "resonance" => Some(instrument.resonance),
+        "pitch" => Some(instrument.pitch),
+        "output" => Some(instrument.output),
+        _ => None,
+    }
+}
+
 fn is_common_parameter(name: &str) -> bool {
     [
         "Amp EG Attack",

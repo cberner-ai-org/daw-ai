@@ -568,7 +568,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         function(
             "update_modulator",
             "Update one modulator parameter by stable IDs, including native Surge Formula source with parameter=formula.",
-            parameter_schema("modulatorId"),
+            parameter_schema_with_value_limit("modulatorId", 8_192),
         ),
         function(
             "delete_modulator",
@@ -619,12 +619,16 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
 }
 
 fn parameter_schema(id_name: &str) -> JsonValue {
+    parameter_schema_with_value_limit(id_name, 96)
+}
+
+fn parameter_schema_with_value_limit(id_name: &str, value_max_length: usize) -> JsonValue {
     object_schema(
         serde_json::json!({
             "trackId":{"type":"integer","minimum":1},
             (id_name):{"type":"integer","minimum":1},
             "parameter":{"type":"string","minLength":1,"maxLength":64},
-            "value":{"type":"string","minLength":1,"maxLength":96}
+            "value":{"type":"string","minLength":1,"maxLength":value_max_length}
         }),
         &["trackId", id_name, "parameter", "value"],
     )
@@ -737,19 +741,27 @@ pub(crate) fn list_instrument_parameters(
             query.is_empty() || parameter.name.to_ascii_lowercase().contains(&query)
         })
         .map(|parameter| {
+            let legacy_override =
+                crate::surge::legacy_instrument_parameter_override(&track.instrument, parameter.id);
             let value = track
                 .instrument
                 .native_overrides
                 .get(&parameter.id)
                 .copied()
+                .or(legacy_override)
                 .unwrap_or(parameter.value);
+            let overridden = track
+                .instrument
+                .native_overrides
+                .contains_key(&parameter.id)
+                || legacy_override.is_some();
             serde_json::json!({
                 "parameter": format!("native:{}", parameter.id),
                 "name": parameter.name,
                 "value": value,
                 "presetValue": parameter.value,
                 "display": parameter.display,
-                "overridden": track.instrument.native_overrides.contains_key(&parameter.id)
+                "overridden": overridden
             })
         })
         .collect::<Vec<_>>();
@@ -2169,6 +2181,44 @@ mod tests {
                 .unwrap()
                 .contains("Default to loop for drums")
         );
+        let update_modulator = declarations
+            .iter()
+            .find(|tool| tool["name"] == "update_modulator")
+            .expect("modulator update declaration");
+        assert_eq!(
+            update_modulator["parameters"]["properties"]["value"]["maxLength"],
+            8_192
+        );
+    }
+
+    #[test]
+    fn instrument_parameter_listing_reports_legacy_graph_overrides() {
+        let mut project = Project::demo();
+        let track_id = project.tracks[1].id;
+        {
+            let track = &mut project.tracks[1];
+            track.instrument.native_overrides.clear();
+            track.instrument.cutoff = 0.123;
+            track
+                .instrument
+                .parameter_overrides
+                .push("cutoff".to_owned());
+        }
+        let session =
+            EditSession::create(&project, "inspect migrated controls", 0.0, 1.0).expect("session");
+
+        let response = list_instrument_parameters(
+            session.path(),
+            &serde_json::json!({"trackId":track_id,"group":"common","query":"cutoff"}),
+        )
+        .expect("instrument parameters");
+        let response: JsonValue = serde_json::from_str(&response).expect("parameter JSON");
+        let cutoff = response["parameters"]
+            .as_array()
+            .and_then(|parameters| parameters.first())
+            .expect("cutoff parameter");
+        assert!((cutoff["value"].as_f64().expect("cutoff value") - 0.123).abs() < 0.000_001);
+        assert_eq!(cutoff["overridden"], true);
     }
 
     #[test]

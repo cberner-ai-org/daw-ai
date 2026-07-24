@@ -2330,6 +2330,13 @@ async function run() {
       "document.querySelector('[data-sound-tool=\"instrument\"][data-track-id=\"2\"][data-parameter^=\"native:\"]').dataset.parameter");
     assert.equal(
       await evaluate(cdp, appSession, `Boolean(document.querySelector(
+        '[data-sound-tool="modulator"][data-track-id="2"][data-parameter="formula"]',
+      ))`),
+      true,
+      "Formula source must be reachable before changing a modulator shape",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, `Boolean(document.querySelector(
         '[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"] option[value="${nativeParameter}"]',
       ))`),
       true,

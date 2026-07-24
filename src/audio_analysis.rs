@@ -1560,10 +1560,13 @@ fn parameter_at(
         .sum::<f32>();
     let (minimum, maximum, scale, mode) = match target {
         "instrument.attack"
+        | "instrument.decay"
+        | "instrument.sustain"
         | "instrument.release"
         | "instrument.cutoff"
         | "instrument.resonance" => (0.0, 1.0, 1.0, "add"),
         "instrument.pitch" => (0.0, 1.0, 0.1, "add"),
+        "instrument.output" => (0.0, 1.0, 1.0, "multiply"),
         "track.volume" => (0.0, 1.5, 1.0, "multiply"),
         _ if target.starts_with("effect:") && target.ends_with(".mix") => (0.0, 1.0, 1.0, "add"),
         _ if target.starts_with("effect:") && target.ends_with(".cutoff") => (
@@ -3102,6 +3105,50 @@ mod tests {
         assert!((automation_frame_at(&project, track, 2.0).gain - 0.75).abs() < 0.000_01);
         assert!(automation_frame_at(&project, track, 2.9).gain > 1.3);
         assert!((automation_frame_at(&project, track, 3.0).gain - baseline).abs() < 0.000_01);
+    }
+
+    #[test]
+    fn all_published_instrument_envelope_automation_reaches_render_controls() {
+        let mut project = Project::demo();
+        let track_index = project
+            .tracks
+            .iter()
+            .position(|track| track.role == TrackRole::Bass)
+            .expect("demo bass");
+        let track_id = project.tracks[track_index].id;
+        for (id, parameter, value) in [
+            (9_101, "instrument.decay", 0.21),
+            (9_102, "instrument.sustain", 0.43),
+            (9_103, "instrument.output", 0.65),
+        ] {
+            project.edits.push(Edit {
+                id,
+                operation_id: None,
+                start: 0.0,
+                end: 2.0,
+                prompt: format!("Automate {parameter}"),
+                summary: format!("Automated {parameter}"),
+                action: Action::Automation {
+                    track_id,
+                    parameter: parameter.to_owned(),
+                    curve: "linear",
+                    points: vec![AutomationPoint { time: 0.0, value }],
+                    target: TrackRole::Bass,
+                },
+            });
+        }
+        let track = &project.tracks[track_index];
+        for (parameter, value) in [
+            ("instrument.decay", 0.21),
+            ("instrument.sustain", 0.43),
+            ("instrument.output", 0.65),
+        ] {
+            assert!(
+                (instrument_parameter_at(&project, track, parameter, 0.9, 1.0) - value).abs()
+                    < 0.000_01,
+                "{parameter} automation was not applied"
+            );
+        }
     }
 
     #[test]

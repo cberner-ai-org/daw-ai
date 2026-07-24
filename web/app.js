@@ -986,9 +986,9 @@
         </label>` : ""}
         ${soundRange(track, "modulator", modulator.id, modulator.name, "rate", modulator.parameters.rate, 0.01, 20, modulator.rateMode === "tempo" ? "x/beat" : "Hz")}
         ${soundRange(track, "modulator", modulator.id, modulator.name, "depth", modulator.parameters.depth, 0, 1, "%")}
-        ${modulator.shape === "formula" ? `<label class="tool-control">Surge Formula (Lua)
+        <label class="tool-control">Surge Formula (Lua)
           <textarea data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="formula" data-control-key="${track.id}-modulator-${modulator.id}-formula" aria-label="${escapeHtml(`${track.name} ${modulator.name} formula`)}">${escapeHtml(modulator.formula || "")}</textarea>
-        </label>` : ""}
+        </label>
         ${modulator.trigger === "audio" ? `${soundRange(track, "modulator", modulator.id, modulator.name, "threshold", modulator.parameters.threshold, 0, 1, "")}${soundRange(track, "modulator", modulator.id, modulator.name, "attackMs", modulator.parameters.attackMs, 0, 1000, "ms")}${soundRange(track, "modulator", modulator.id, modulator.name, "releaseMs", modulator.parameters.releaseMs, 1, 5000, "ms")}` : ""}
       </div>
       <div class="tool-actions">${soundToggle(track, "modulator", modulator.id, modulator.name, modulator.enabled)}</div>
