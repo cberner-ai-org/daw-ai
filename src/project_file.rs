@@ -48,17 +48,13 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .map(|(index, value)| parse_track(value, index, duration, &mut ids, &mut event_ids))
         .collect::<Result<Vec<_>, _>>()?;
     let track_ids = tracks.iter().map(|track| track.id).collect::<HashSet<_>>();
+    let track_ids = track_ids.into_iter().collect::<Vec<_>>();
     if tracks.iter().any(|track| {
         track.modulators.iter().any(|modulator| {
-            modulator.trigger != "free"
-                && modulator
-                    .source_track_id
-                    .is_some_and(|source| !track_ids.contains(&source))
+            !crate::model::valid_modulator_configuration(track.id, modulator, &track_ids)
         })
     }) {
-        return Err(invalid(
-            "modulator sourceTrackId references an unknown track",
-        ));
+        return Err(invalid("modulator configuration is unsupported"));
     }
     let edit_values = array(root, "edits")?;
     if edit_values.len() > MAX_EDITS {
@@ -1461,6 +1457,20 @@ mod tests {
         }
         let error = parse_project(&project.to_json()).expect_err("native slot overflow");
         assert!(error.to_string().contains("at most six"));
+    }
+
+    #[test]
+    fn rejects_persisted_native_modulators_with_external_sources() {
+        let mut project = Project::demo();
+        let external_source = project.tracks[0].id;
+        let track = &mut project.tracks[1];
+        let native_target = crate::surge::instrument_parameters(&track.instrument.preset)[0].id;
+        track.modulators[0].target = format!("native:{native_target}");
+        track.modulators[0].trigger = "midi".to_owned();
+        track.modulators[0].source_track_id = Some(external_source);
+
+        let error = parse_project(&project.to_json()).expect_err("cross-track native route");
+        assert!(error.to_string().contains("unsupported"));
     }
 
     #[test]

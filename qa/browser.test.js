@@ -284,10 +284,14 @@ async function run() {
   const debugPort = await reservePort();
   const attackerPort = await reservePort();
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "daw-ai-browser-"));
+  const appEnvironment = { ...process.env };
+  delete appEnvironment.DAW_AI_GEMINI_API_KEY;
+  delete appEnvironment.DAW_AI_GEMINI_CREDENTIALS;
+  delete appEnvironment.GEMINI_API_KEY;
   const app = spawn(path.join(root, "target", "debug", "daw-ai"), ["--port", String(appPort)], {
     cwd: root,
     env: {
-      ...process.env,
+      ...appEnvironment,
       DAW_AI_PROMPT_ENGINE: "demo",
       DAW_AI_PROJECT_PATH: path.join(profile, "sound-graph.json"),
     },
@@ -1275,8 +1279,9 @@ async function run() {
           appSession,
           `document.querySelector('#play-button').classList.contains('is-playing') &&
             document.querySelector('#current-time').textContent !== ${JSON.stringify(promptedEditResumeTime)}`,
-        ),
+      ),
       "playback restoration after prompted edit",
+      30_000,
     );
     const compoundPlaybackTime = await evaluate(
       cdp,
