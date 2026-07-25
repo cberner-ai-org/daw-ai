@@ -9,7 +9,7 @@ pre:
 
 test: pre
   #!/usr/bin/env bash
-  set -u
+  set -eu
   cargo build
   cargo test --all-targets --all-features &
   rust_pid=$!
