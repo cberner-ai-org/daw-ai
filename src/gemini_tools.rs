@@ -830,19 +830,19 @@ pub(crate) fn list_sound_tool_parameters(
                 values.push(serde_json::json!({"parameter":"resonance","name":"Resonance","value":value,"minimum":0.1,"maximum":20,"unit":"Q","common":true}));
             }
             values.extend(
-                effect
-                    .parameters
+                crate::model::effect_parameter_specs(&effect.name)
                     .iter()
                     .enumerate()
-                    .map(|(index, (name, value))| {
-                        serde_json::json!({
-                            "parameter":name,
-                            "name":display_parameter_name(name),
+                    .filter_map(|(index, spec)| {
+                        let value = effect.parameters.get(spec.name)?;
+                        Some(serde_json::json!({
+                            "parameter":spec.name,
+                            "name":display_parameter_name(spec.name),
                             "value":value,
                             "minimum":0,
                             "maximum":1,
                             "common":index < 2
-                        })
+                        }))
                     }),
             );
             values
@@ -2373,6 +2373,40 @@ mod tests {
     }
 
     #[test]
+    fn effect_discovery_preserves_the_declared_musical_order() {
+        let mut project = Project::demo();
+        let track = &mut project.tracks[0];
+        let effect = &mut track.effects[0];
+        effect.name = "Delay".to_owned();
+        effect.parameters = crate::model::effect_parameter_specs("Delay")
+            .iter()
+            .map(|spec| (spec.name.to_owned(), spec.default))
+            .collect();
+        let track_id = track.id;
+        let effect_id = effect.id;
+        let session = EditSession::create(&project, "inspect delay", 0.0, 1.0).expect("session");
+
+        let response = list_sound_tool_parameters(
+            session.path(),
+            &serde_json::json!({
+                "trackId":track_id,
+                "tool":"effect",
+                "toolId":effect_id,
+                "group":"common"
+            }),
+        )
+        .expect("effect parameters");
+        let response: JsonValue = serde_json::from_str(&response).expect("parameter JSON");
+        let names = response["parameters"]
+            .as_array()
+            .expect("parameters")
+            .iter()
+            .filter_map(|parameter| parameter["parameter"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["enabled", "mix", "time", "feedback"]);
+    }
+
+    #[test]
     fn studio_contract_documents_every_registered_tool() {
         let contract = include_str!("../gemini/STUDIO.md");
         for name in [
@@ -2380,6 +2414,7 @@ mod tests {
             AUDIO_TOOL_NAME,
             PRESET_TOOL_NAME,
             INSTRUMENT_PARAMETER_TOOL_NAME,
+            SOUND_TOOL_PARAMETER_TOOL_NAME,
         ]
         .into_iter()
         .chain(MUTATION_TOOL_NAMES.iter().copied())

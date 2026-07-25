@@ -928,7 +928,7 @@ async function run() {
         window.fetch = originalFetch;
       };
       const transfer = new DataTransfer();
-      transfer.items.add(new File(['RIFF'], 'one-shot.wav'));
+      transfer.items.add(new File([new Uint8Array([255, 255, 255])], 'one-shot.wav'));
       const reference = document.querySelector('#reference-audio');
       reference.files = transfer.files;
       reference.dispatchEvent(new Event('change', { bubbles: true }));
@@ -959,10 +959,18 @@ async function run() {
     );
     assert.equal(refusedEditBody.reference_audio_name, "one-shot.wav");
     assert.equal(refusedEditBody.reference_audio_type, "audio/wav");
-    assert.equal(refusedEditBody.reference_audio_data, "UklGRg==");
+    assert.equal(refusedEditBody.reference_audio_data, "____");
+    assert.equal(
+      await evaluate(cdp, appSession, `(() => {
+        const encodedData = window.__refusedEditBody.match(/reference_audio_data=([^&]*)/)[1];
+        return /%2F|%2B/i.test(encodedData);
+      })()`),
+      false,
+      "reference base64 must use URL-safe characters that do not expand during form encoding",
+    );
     assert.deepEqual(
       await evaluate(cdp, appSession, "window.__persistedReferenceAtRequest"),
-      { name: "one-shot.wav", type: "audio/wav", data: "UklGRg==" },
+      { name: "one-shot.wav", type: "audio/wav", data: "____" },
       "an unaccepted edit must retain its reference audio for reload recovery",
     );
     assert.deepEqual(
@@ -2222,12 +2230,12 @@ async function run() {
           "mix",
           "cutoff",
           "resonance",
-          "highFrequency",
+          "lowGain",
+          "midGain",
           "highGain",
           "lowFrequency",
-          "lowGain",
           "midFrequency",
-          "midGain",
+          "highFrequency",
         ],
         midiRoutes: 1,
         rateModes: ["hz", "hz", "hz"],

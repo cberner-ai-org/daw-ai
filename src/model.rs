@@ -698,7 +698,14 @@ impl Track {
                 write!(output, ",{}:{}", json_string(name), decimal(*value))
                     .expect("writing to a string cannot fail");
             }
-            output.push_str("},\"overrides\":[");
+            output.push_str("},\"parameterOrder\":[");
+            for (index, parameter) in effect_parameter_specs(&effect.name).iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&json_string(parameter.name));
+            }
+            output.push_str("],\"overrides\":[");
             for (index, parameter) in effect.parameter_overrides.iter().enumerate() {
                 if index > 0 {
                     output.push(',');
