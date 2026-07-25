@@ -938,8 +938,10 @@
           ),
         ].join("")
       : "";
-    const detailedParameters = Object.entries(effect.parameters)
-      .filter(([parameter, value]) => !["mix", "cutoff", "resonance"].includes(parameter) && Number.isFinite(value));
+    const detailedParameters = (effect.parameterOrder || Object.keys(effect.parameters))
+      .filter((parameter) => !["mix", "cutoff", "resonance"].includes(parameter))
+      .map((parameter) => [parameter, effect.parameters[parameter]])
+      .filter(([, value]) => Number.isFinite(value));
     const renderDetailed = ([parameter, value]) => soundRange(
         track,
         "effect",
@@ -1561,7 +1563,9 @@
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.addEventListener("error", () => reject(new Error("Could not read the reference audio")));
-      reader.addEventListener("load", () => resolve(String(reader.result).split(",", 2)[1] || ""));
+      reader.addEventListener("load", () => resolve(
+        (String(reader.result).split(",", 2)[1] || "").replaceAll("+", "-").replaceAll("/", "_"),
+      ));
       reader.readAsDataURL(file);
     });
   }

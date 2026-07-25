@@ -2530,7 +2530,9 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
             b'a'..=b'z' => Some(byte - b'a' + 26),
             b'0'..=b'9' => Some(byte - b'0' + 52),
             b'+' => Some(62),
+            b'-' => Some(62),
             b'/' => Some(63),
+            b'_' => Some(63),
             _ => None,
         }
     }
@@ -3736,6 +3738,7 @@ mod tests {
                 "accepted malformed base64 {malformed}"
             );
         }
+        assert_eq!(decode_base64("____"), Some(vec![255, 255, 255]));
     }
 
     #[test]
