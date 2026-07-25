@@ -11,7 +11,7 @@ Prerequisites:
 - Rust 1.85 or newer
 - `curl`
 - A [Gemini API key](https://ai.google.dev/gemini-api/docs/api-key)
-- Optionally, an authenticated [Codex CLI](https://developers.openai.com/codex/cli/) for Codex edits
+- Optionally, an authenticated [Codex CLI](https://developers.openai.com/codex/cli/) for Codex edits (`bubblewrap` is also required for packaged Codex)
 - `just` (optional, but recommended)
 
 Set the standard environment variable:
@@ -20,7 +20,7 @@ Set the standard environment variable:
 export GEMINI_API_KEY="your-key"
 ```
 
-For a system service, use systemd's `LoadCredential=` with a credential named `gemini-api-key`; DAW-AI automatically reads it from `CREDENTIALS_DIRECTORY`. Codex remains optional: installations that want it can install `deploy/daw-ai-codex-auth.conf` as a systemd drop-in to expose the local CLI `auth.json` as `codex-auth`. Each Codex edit copies that credential into a private temporary `CODEX_HOME` which is deleted when the CLI exits; credentials are never retained with debugging sessions. The hardened packaged unit replaces Codex's nested Linux sandbox only when the unit environment and systemd credential context are both verified. Interactive launches retain Codex's `workspace-write` sandbox; `~/gemini_creds.txt` and the current user's existing Codex login remain available.
+For a system service, use systemd's `LoadCredential=` with a credential named `gemini-api-key`; DAW-AI automatically reads it from `CREDENTIALS_DIRECTORY`. Codex remains optional: installations that want it can install `deploy/daw-ai-codex-auth.conf` as a systemd drop-in to expose the local CLI `auth.json` as `codex-auth`. Each Codex edit copies that credential into a private temporary `CODEX_HOME` which is deleted when the CLI exits; credentials are never retained with debugging sessions. Packaged Codex runs inside a bubblewrap filesystem containing only system runtime files, its temporary authentication home, and the current edit session; unrelated service credentials and other users' projects are not visible. Interactive launches retain Codex's `workspace-write` sandbox; `~/gemini_creds.txt` and the current user's existing Codex login remain available.
 
 The model can search and load Surge XT's factory `.fxp` library. Development builds discover it in the pinned Surge checkout automatically. Packaged deployments should copy Surge's `resources/data/patches_factory` directory to `/usr/local/share/daw-ai/patches_factory`, or set `DAW_AI_SURGE_PRESET_DIR` to its installed location.
 

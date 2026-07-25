@@ -259,6 +259,17 @@ impl EditSession {
         Ok((applied_steps, audio_listens))
     }
 
+    pub(crate) fn detail(&self) -> io::Result<String> {
+        let source = fs::read_to_string(self.path.join(SESSION_FILE))?;
+        let value = serde_json::from_str::<JsonValue>(&source)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(value
+            .get("detail")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_owned())
+    }
+
     pub(crate) fn finish(&self, plans: Vec<EditPlan>) -> Result<(EditPlan, Project), String> {
         let mut actions = Vec::new();
         let mut summary = None;
@@ -451,6 +462,14 @@ pub fn run_codex_mcp(session_path: &Path) -> io::Result<()> {
                     .unwrap_or_else(|| serde_json::json!({}));
                 let prior_listens = audio_listens;
                 let prior_steps = applied_steps;
+                if name == AUDIO_TOOL_NAME || name == "resample_audio_region" {
+                    session.update_status(
+                        "running",
+                        "Codex is rendering the requested audio section",
+                        applied_steps,
+                        audio_listens,
+                    )?;
+                }
                 let output = codex_tool_call(
                     &session,
                     name,
@@ -576,11 +595,7 @@ fn apply_codex_mutation(
         Err(error) => return Err(format!("could not prepare Codex update handoff: {error}")),
     }
     let message = apply_agent_mutation(session.path(), name, arguments)?;
-    let started = std::time::Instant::now();
     while !acknowledgement.is_file() {
-        if started.elapsed() >= Duration::from_secs(60) {
-            return Err("the DAW server did not acknowledge the Codex graph update".to_owned());
-        }
         thread::sleep(Duration::from_millis(10));
     }
     *applied_steps += 1;
