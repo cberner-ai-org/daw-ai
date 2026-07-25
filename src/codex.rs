@@ -222,6 +222,9 @@ fn configure_exec_command(
         .arg(session_path);
     if workspace_sandbox {
         command.arg("--sandbox").arg("workspace-write");
+    } else {
+        // Packaged execution is already confined to one session by bubblewrap.
+        command.arg("--sandbox").arg("danger-full-access");
     }
     command.arg("-");
 }
@@ -1017,7 +1020,11 @@ mod tests {
                 && arguments[1] == root.to_string_lossy()
                 && arguments[2] == root.to_string_lossy()
         }));
-        assert!(!arguments.iter().any(|argument| argument == "--sandbox"));
+        let sandbox = arguments
+            .windows(2)
+            .find(|arguments| arguments[0] == "--sandbox")
+            .map(|arguments| arguments[1].as_str());
+        assert_eq!(sandbox, Some("danger-full-access"));
         assert!(
             arguments
                 .windows(2)
