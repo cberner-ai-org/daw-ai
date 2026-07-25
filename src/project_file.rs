@@ -816,11 +816,7 @@ fn parse_edit_operation(
     }
     Ok(EditOperation {
         operation_id,
-        source: operation
-            .get("source")
-            .map(|_| limited_string(operation, "source", 1, 32))
-            .transpose()?
-            .unwrap_or_else(|| "Gemini".to_owned()),
+        source: limited_string(operation, "source", 1, 32)?,
         status,
         applied_steps: applied_steps as usize,
         initial_version,

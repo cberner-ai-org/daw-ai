@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -209,6 +209,7 @@ fn packaged_codex_command(
     executable: &std::path::Path,
     session_path: &std::path::Path,
     codex_home: &TemporaryCodexHome,
+    preset_directories: &[std::path::PathBuf],
 ) -> Command {
     let mut command = Command::new("bwrap");
     command.args([
@@ -248,6 +249,29 @@ fn packaged_codex_command(
         "/tmp",
         "--bind",
     ]);
+    let mut created_directories = HashSet::new();
+    for preset_directory in preset_directories {
+        if !preset_directory.is_absolute()
+            || !preset_directory.is_dir()
+            || preset_directory.starts_with("/usr")
+        {
+            continue;
+        }
+        let mut parents = preset_directory.ancestors().skip(1).collect::<Vec<_>>();
+        parents.reverse();
+        for parent in parents {
+            if parent != std::path::Path::new("/")
+                && !parent.starts_with("/usr")
+                && created_directories.insert(parent.to_path_buf())
+            {
+                command.arg("--dir").arg(parent);
+            }
+        }
+        command
+            .arg("--ro-bind")
+            .arg(preset_directory)
+            .arg(preset_directory);
+    }
     command
         .arg(session_path)
         .arg("/workspace")
@@ -275,6 +299,31 @@ fn packaged_codex_command(
         false,
     );
     command
+}
+
+#[cfg(unix)]
+fn configured_preset_directories() -> Vec<std::path::PathBuf> {
+    [
+        "DAW_AI_SURGE_PRESET_DIR",
+        "SURGE_DATA_HOME",
+        "XDG_DATA_HOME",
+    ]
+    .into_iter()
+    .filter_map(std::env::var_os)
+    .map(std::path::PathBuf::from)
+    .collect()
+}
+
+fn codex_spawn_unavailable(packaged: bool) -> String {
+    if packaged {
+        "bubblewrap is required for packaged Codex edits".to_owned()
+    } else {
+        "Codex CLI is required; install it and authenticate with `codex login`".to_owned()
+    }
+}
+
+fn missing_codex_in_sandbox(stderr: &str) -> bool {
+    stderr.contains("execvp codex") && stderr.contains("No such file or directory")
 }
 
 fn prepare_initial_listening(
@@ -492,6 +541,7 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                     &executable,
                     session.path(),
                     codex_home.as_ref().expect("packaged Codex home"),
+                    &configured_preset_directories(),
                 )
             } else {
                 let mut command = Command::new("codex");
@@ -528,10 +578,7 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                 .spawn()
                 .map_err(|error| {
                     if error.kind() == std::io::ErrorKind::NotFound {
-                        PlannerError::Unavailable(
-                            "Codex CLI is required; install it and authenticate with `codex login`"
-                                .to_owned(),
-                        )
+                        PlannerError::Unavailable(codex_spawn_unavailable(packaged))
                     } else {
                         PlannerError::Io(error)
                     }
@@ -597,13 +644,15 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                 thread::sleep(Duration::from_millis(50));
             };
             if !status.success() {
+                let message = fs::read_to_string(stderr_path)
+                    .unwrap_or_else(|error| format!("could not read Codex error output: {error}"))
+                    .trim()
+                    .to_owned();
+                if packaged && missing_codex_in_sandbox(&message) {
+                    return Err(PlannerError::Unavailable(codex_spawn_unavailable(false)));
+                }
                 return Err(PlannerError::Failed {
-                    message: fs::read_to_string(stderr_path)
-                        .unwrap_or_else(|error| {
-                            format!("could not read Codex error output: {error}")
-                        })
-                        .trim()
-                        .to_owned(),
+                    message,
                     code: Some("codex_cli".to_owned()),
                 });
             }
@@ -640,8 +689,9 @@ mod tests {
     #[cfg(unix)]
     use super::packaged_codex_command;
     use super::{
-        ChildGuard, TemporaryCodexHome, configure_exec_command, prepare_initial_listening,
-        stage_sandbox_assets, translate_host_assets_to_sandbox, translate_sandbox_assets_to_host,
+        ChildGuard, TemporaryCodexHome, codex_spawn_unavailable, configure_exec_command,
+        missing_codex_in_sandbox, prepare_initial_listening, stage_sandbox_assets,
+        translate_host_assets_to_sandbox, translate_sandbox_assets_to_host,
     };
     use crate::model::{AudioClip, Project};
     use std::fs;
@@ -708,6 +758,7 @@ mod tests {
             std::path::Path::new("/usr/local/bin/daw-ai"),
             std::path::Path::new("/var/lib/daw-ai/gemini-sessions/current"),
             &home,
+            std::slice::from_ref(&root),
         );
         let arguments = command
             .get_args()
@@ -726,6 +777,11 @@ mod tests {
                 .any(|argument| argument == "/var/lib/daw-ai")
         );
         assert!(arguments.iter().any(|argument| argument == "--clearenv"));
+        assert!(arguments.windows(3).any(|arguments| {
+            arguments[0] == "--ro-bind"
+                && arguments[1] == root.to_string_lossy()
+                && arguments[2] == root.to_string_lossy()
+        }));
         assert!(!arguments.iter().any(|argument| argument == "--sandbox"));
         assert!(
             arguments
@@ -736,6 +792,18 @@ mod tests {
         assert!(config.contains("\"/codex-home\" = \"deny\""));
         drop(home);
         fs::remove_dir_all(root).expect("temporary root cleanup");
+    }
+
+    #[test]
+    fn codex_dependency_errors_identify_the_missing_layer() {
+        assert!(codex_spawn_unavailable(true).contains("bubblewrap"));
+        assert!(codex_spawn_unavailable(false).contains("Codex CLI"));
+        assert!(missing_codex_in_sandbox(
+            "bwrap: execvp codex: No such file or directory"
+        ));
+        assert!(!missing_codex_in_sandbox(
+            "bwrap: execvp something-else: No such file or directory"
+        ));
     }
 
     #[test]
