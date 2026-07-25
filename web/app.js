@@ -49,7 +49,6 @@
     clearDebug: document.querySelector("#clear-debug"),
     refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
     geminiSessionList: document.querySelector("#gemini-session-list"),
-    aiProvider: document.querySelector("#ai-provider"),
     sessionHistoryList: document.querySelector("#session-history-list"),
     toast: document.querySelector("#toast"),
     toastMessage: document.querySelector("#toast-message"),
@@ -58,7 +57,6 @@
 
   const state = {
     project: null,
-    confirmedAiProvider: "Gemini",
     selectionStart: 8,
     selectionEnd: 16,
     dragPointer: null,
@@ -67,7 +65,6 @@
     longPress: null,
     promptPending: false,
     promptSubmissionClaimed: false,
-    providerChangePending: false,
     activeEditJobId: null,
     interruptPending: false,
     editProgressPercent: 0,
@@ -83,8 +80,6 @@
     instrumentParameters: {},
   };
   let historyLoadQueue = Promise.resolve();
-  let providerChangeQueue = Promise.resolve();
-
   let projectMutationQueue = Promise.resolve();
   const RECONCILED_REQUEST_TIMEOUT_MS = 2000;
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
@@ -444,44 +439,11 @@
   async function loadProject() {
     try {
       adoptProject(await api("/api/project"));
-      const provider = await api("/api/provider");
-      elements.aiProvider.value = provider.provider;
-      state.confirmedAiProvider = provider.provider;
       renderProject();
     } catch (error) {
       showError(error, "loading the project");
       elements.savedState.textContent = "Offline";
     }
-  }
-
-  function changeAiProvider() {
-    const requestedProvider = elements.aiProvider.value;
-    elements.aiProvider.disabled = true;
-    state.providerChangePending = true;
-    const change = providerChangeQueue.then(async () => {
-        const previousProvider = state.confirmedAiProvider;
-        try {
-          const response = await api("/api/provider", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({ provider: requestedProvider }),
-          });
-          elements.aiProvider.value = response.provider;
-          state.confirmedAiProvider = response.provider;
-          showToast(`Using ${response.provider} for AI edits`);
-        } catch (error) {
-          elements.aiProvider.value = previousProvider;
-          showError(error, "changing the AI provider");
-        }
-      });
-    const queued = change.finally(() => {
-      if (providerChangeQueue === queued) {
-        state.providerChangePending = false;
-        elements.aiProvider.disabled = false;
-      }
-    });
-    providerChangeQueue = queued;
-    return providerChangeQueue;
   }
 
   function renderProject() {
@@ -1979,7 +1941,6 @@
       start: selectionStart,
       end: selectionEnd,
       submittedText,
-      provider,
     } = pending;
     let clearSubmittedPrompt = false;
     let restorePlayback = false;
@@ -1993,7 +1954,6 @@
           prompt,
           start: String(selectionStart),
           end: String(selectionEnd),
-          provider,
         });
         if (pending.referenceAudio) {
           editBody.set("reference_audio_name", pending.referenceAudio.name);
@@ -2102,7 +2062,6 @@
     elements.composeButton.querySelector("span").textContent = referenceFile ? "Reading audio..." : "Starting...";
     let handedOff = false;
     try {
-      if (state.providerChangePending) await providerChangeQueue;
       if (referenceFile) {
         referenceAudio = {
           name: referenceFile.name,
@@ -2116,7 +2075,6 @@
         submittedText,
         start: state.selectionStart,
         end: state.selectionEnd,
-        provider: state.confirmedAiProvider,
         acceptedJob: null,
         referenceAudio,
       };
@@ -2421,7 +2379,6 @@
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
   elements.refreshGeminiSessions.addEventListener("click", () => void loadGeminiSessions());
-  elements.aiProvider.addEventListener("change", () => void changeAiProvider());
   elements.sessionHistoryList.addEventListener("click", (event) => {
     void enqueueProjectMutation(() => selectProjectHistory(event));
   });

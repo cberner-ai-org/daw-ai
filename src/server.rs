@@ -15,10 +15,9 @@ use crate::audio_analysis;
 use crate::audio_stream::{
     ByteRange, WAV_HEADER_BYTES, bounded_audio_byte_range, wait_for_playback_window,
 };
-use crate::codex::CodexPlanner;
 use crate::concurrency::Limiter;
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
-use crate::gemini_tools::{render_audio_request, render_audio_request_cancellable};
+use crate::gemini_tools::render_audio_request;
 use crate::model::{ChannelOperationAction, Project, Studio, StudioError, json_string};
 #[cfg(test)]
 use crate::project_history::{MAX_HISTORY_BYTES, load_project_history};
@@ -216,7 +215,6 @@ struct Router {
     audio_token: Arc<String>,
     users: Option<Arc<UserRegistry>>,
     history: Arc<Mutex<ProjectHistory>>,
-    codex_selected: Arc<AtomicBool>,
 }
 
 struct UserRegistry {
@@ -286,7 +284,6 @@ fn request_needs_user_scope(request: &Request) -> bool {
         "/api/project"
             | "/api/gemini-sessions"
             | "/api/history"
-            | "/api/provider"
             | "/api/edits"
             | "/api/channels"
             | "/api/mix"
@@ -414,7 +411,6 @@ struct EditRequest {
     end: f32,
     project: crate::model::Project,
     reference_audio: Option<crate::gemini::ReferenceAudio>,
-    codex_selected: bool,
 }
 
 struct EditFailure {
@@ -708,29 +704,6 @@ fn planner_failure(error: PlannerError) -> EditFailure {
     EditFailure::new(status, error.to_string())
 }
 
-fn codex_planner_failure(error: PlannerError) -> EditFailure {
-    let status = match error {
-        PlannerError::ProjectChanged => 409,
-        PlannerError::SaveFailed => 500,
-        _ => 503,
-    };
-    let message = match error {
-        PlannerError::Unavailable(message) => message,
-        PlannerError::TimedOut => "Codex took too long to complete the edit; try again".to_owned(),
-        PlannerError::Failed { message, .. } => {
-            format!("Codex could not complete the edit: {message}")
-        }
-        PlannerError::ProjectChanged => "the project changed; submit the edit again".to_owned(),
-        PlannerError::SaveFailed => "could not save the sound graph".to_owned(),
-        PlannerError::Interrupted => "the edit was interrupted".to_owned(),
-        PlannerError::InvalidOutput(message) => {
-            format!("Codex returned an invalid sound graph edit: {message}")
-        }
-        PlannerError::Io(error) => format!("Codex integration failed: {error}"),
-    };
-    EditFailure::new(status, message)
-}
-
 impl Router {
     fn write_export(
         &self,
@@ -797,7 +770,6 @@ impl Router {
         let (store, studio, mut history) = open_project_with_history(project_path)?;
         trim_project_history(studio.project(), &mut history);
         save_project_state(&store, studio.project(), &history)?;
-        prune_codex_assets_for_store(&store, &history);
         let users = Arc::new(UserRegistry {
             root,
             planner: planner.clone(),
@@ -805,7 +777,6 @@ impl Router {
         });
         Ok(Self {
             history: Arc::new(Mutex::new(history)),
-            codex_selected: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(studio)),
             store: Some(store),
             planner,
@@ -822,7 +793,6 @@ impl Router {
             history: Arc::new(Mutex::new(ProjectHistory::new(
                 Studio::new().project().clone(),
             ))),
-            codex_selected: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(Studio::new())),
             store: None,
             planner: Planner::Demo,
@@ -909,11 +879,9 @@ impl Router {
         let (store, studio, mut history) = open_project_with_history(project_path)?;
         trim_project_history(studio.project(), &mut history);
         save_project_state(&store, studio.project(), &history)?;
-        prune_codex_assets_for_store(&store, &history);
         persist_user_use(&directory)?;
         let router = Self {
             history: Arc::new(Mutex::new(history)),
-            codex_selected: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(studio)),
             store: Some(store),
             planner: registry.planner.clone(),
@@ -1006,7 +974,6 @@ impl Router {
             }
             ("GET", "/api/gemini-sessions") => self.gemini_sessions(),
             ("GET", "/api/history") => self.history_response(),
-            ("GET", "/api/provider") => self.provider_response(),
             ("POST", "/api/edits") => self.start_edit(&request.body),
             ("POST", "/api/channels") => self.change_channel(&request.body),
             ("POST", "/api/mix") => self.change_mix(&request.body),
@@ -1015,7 +982,6 @@ impl Router {
             ("POST", "/api/undo") => self.undo(),
             ("POST", "/api/reset") => self.reset(),
             ("POST", "/api/history") => self.select_history(&request.body),
-            ("POST", "/api/provider") => self.set_provider(&request.body),
             (
                 _,
                 "/api/edits" | "/api/channels" | "/api/mix" | "/api/sound-tools" | "/api/logs"
@@ -1025,8 +991,6 @@ impl Router {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
             }
             (_, "/api/history") => Response::json(405, error_json("method not allowed"))
-                .with_header("Allow", "GET, POST"),
-            (_, "/api/provider") => Response::json(405, error_json("method not allowed"))
                 .with_header("Allow", "GET, POST"),
             _ => Response::json(404, error_json("not found")),
         }
@@ -1045,11 +1009,6 @@ impl Router {
         }
         let Some(prompt) = form.get("prompt") else {
             return Response::json(422, error_json("prompt is required"));
-        };
-        let codex_selected = match form.get("provider").map(String::as_str) {
-            Some("Gemini") => false,
-            Some("Codex") => true,
-            _ => return Response::json(422, error_json("provider is required")),
         };
         let Some(start) = form
             .get("start")
@@ -1104,7 +1063,6 @@ impl Router {
             end,
             project,
             reference_audio,
-            codex_selected,
         };
         let worker = self.clone();
         let spawn = thread::Builder::new()
@@ -1397,9 +1355,6 @@ impl Router {
             "The AI producer is planning, editing, and listening to the sound graph",
         );
         if matches!(&self.planner, Planner::Gemini) {
-            if edit.codex_selected {
-                return self.perform_codex_edit(job_id, edit);
-            }
             return self.perform_gemini_edit(job_id, edit);
         }
         let plan = self
@@ -1482,70 +1437,6 @@ impl Router {
         Ok(completed.plan.summary)
     }
 
-    fn perform_codex_edit(&self, job_id: u64, edit: EditRequest) -> Result<String, EditFailure> {
-        let mut expected_version = edit.project.version;
-        let mut published_update = false;
-        let cancellation = self.edit_jobs.cancellation(job_id);
-        let render_cancellation = cancellation.clone();
-        let completed = CodexPlanner::interpret_with_updates(
-            &self.gemini_session_root(),
-            &edit.prompt,
-            edit.start,
-            edit.end,
-            &edit.project,
-            edit.reference_audio.clone(),
-            cancellation,
-            |request, deadline| {
-                self.edit_jobs.set_running(
-                    job_id,
-                    "rendering",
-                    "Codex is rendering the requested audio section",
-                );
-                let result = render_audio_request_cancellable(request, || {
-                    render_cancellation.load(Ordering::SeqCst) || Instant::now() >= deadline
-                });
-                self.edit_jobs.set_running(
-                    job_id,
-                    "planning",
-                    "Codex is listening to the rendered audio section",
-                );
-                result
-            },
-            |detail| {
-                let phase = if detail.contains(" is rendering ") {
-                    "rendering"
-                } else {
-                    "planning"
-                };
-                self.edit_jobs.set_running(job_id, phase, detail);
-            },
-            |graph_edit| {
-                self.commit_gemini_update(
-                    job_id,
-                    &edit,
-                    &mut expected_version,
-                    &mut published_update,
-                    graph_edit,
-                )
-            },
-        )
-        .map_err(codex_planner_failure)?;
-        if !published_update {
-            return Err(EditFailure::new(
-                503,
-                "Codex completed without publishing a sound graph edit",
-            ));
-        }
-        self.complete_gemini_operation(
-            job_id,
-            &edit,
-            &mut expected_version,
-            &completed.plan.summary,
-        )
-        .map_err(codex_planner_failure)?;
-        Ok(completed.plan.summary)
-    }
-
     fn commit_gemini_update(
         &self,
         job_id: u64,
@@ -1572,12 +1463,7 @@ impl Router {
                 graph_edit.plan,
             )
             .map_err(|error| PlannerError::InvalidOutput(studio_error_message(error).to_owned()))?;
-        let source = if edit.codex_selected {
-            "Codex"
-        } else {
-            "Gemini"
-        };
-        if !candidate.record_operation_step(&edit.operation_id, source, &summary) {
+        if !candidate.record_operation_step(&edit.operation_id, "Gemini", &summary) {
             return Err(PlannerError::InvalidOutput(
                 "could not record the published edit operation".to_owned(),
             ));
@@ -1943,29 +1829,6 @@ impl Router {
         )
     }
 
-    fn provider_response(&self) -> Response {
-        let provider = if self.codex_selected.load(Ordering::SeqCst) {
-            "Codex"
-        } else {
-            "Gemini"
-        };
-        Response::json(200, serde_json::json!({"provider":provider}).to_string())
-    }
-
-    fn set_provider(&self, body: &str) -> Response {
-        let provider = parse_form(body)
-            .get("provider")
-            .cloned()
-            .unwrap_or_default();
-        let codex = match provider.as_str() {
-            "Gemini" => false,
-            "Codex" => true,
-            _ => return Response::json(422, error_json("unknown AI provider")),
-        };
-        self.codex_selected.store(codex, Ordering::SeqCst);
-        self.provider_response()
-    }
-
     fn select_history(&self, body: &str) -> Response {
         let Some(index) = parse_form(body)
             .get("index")
@@ -2129,12 +1992,7 @@ impl Router {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        save_project_state(store, project, history)?;
-        if let Err(error) = crate::codex::prune_project_assets(&self.gemini_session_root(), history)
-        {
-            eprintln!("warning: could not prune unreferenced Codex audio assets: {error}");
-        }
-        Ok(())
+        save_project_state(store, project, history)
     }
 
     fn project_path(&self) -> &std::path::Path {
@@ -2162,17 +2020,6 @@ impl Router {
         self.studio
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-fn prune_codex_assets_for_store(store: &crate::storage::ProjectStore, history: &ProjectHistory) {
-    let session_root = store
-        .path()
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("gemini-sessions");
-    if let Err(error) = crate::codex::prune_project_assets(&session_root, history) {
-        eprintln!("warning: could not prune unreferenced Codex audio assets: {error}");
     }
 }
 
@@ -2935,7 +2782,6 @@ mod tests {
         (
             Router {
                 history: Arc::new(Mutex::new(ProjectHistory::new(studio.project().clone()))),
-                codex_selected: Arc::new(AtomicBool::new(false)),
                 studio: Arc::new(Mutex::new(studio)),
                 store: Some(store),
                 planner: Planner::Demo,
@@ -3071,7 +2917,7 @@ mod tests {
         let response = router.handle(&request(
             "POST",
             "/api/edits",
-            "start=4&end=8&prompt=increase+volume&provider=Gemini",
+            "start=4&end=8&prompt=increase+volume",
         ));
         let completed = wait_for_edit(&router, &response);
         assert_eq!(completed["status"], "completed");
@@ -3225,7 +3071,6 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
-            codex_selected: true,
         };
         let plan = |preset: &str, summary: &str| EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3305,7 +3150,7 @@ mod tests {
         );
         let operation = &studio.project().edit_operations[0];
         assert_eq!(operation.operation_id, operation_id);
-        assert_eq!(operation.source, "Codex");
+        assert_eq!(operation.source, "Gemini");
         assert_eq!(
             operation.status,
             crate::model::EditOperationStatus::Completed
@@ -3317,8 +3162,8 @@ mod tests {
         drop(studio);
         let history: serde_json::Value =
             serde_json::from_str(&router.history_response().body).expect("history JSON");
-        assert_eq!(history["entries"][1]["source"], "Codex");
-        assert_eq!(history["entries"][2]["source"], "Codex");
+        assert_eq!(history["entries"][1]["source"], "Gemini");
+        assert_eq!(history["entries"][2]["source"], "Gemini");
 
         let status: serde_json::Value = serde_json::from_str(
             &router
@@ -3337,7 +3182,7 @@ mod tests {
             "POST",
             "/api/edits",
             &format!(
-                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps&provider=Gemini"
+                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps"
             ),
         ));
         assert_eq!(recovered.status, 200);
@@ -3360,7 +3205,6 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
-            codex_selected: false,
         };
         let first_plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3422,7 +3266,6 @@ mod tests {
             .expect("persisted partial operation");
         let restarted = Router {
             history: Arc::new(Mutex::new(ProjectHistory::new(persisted.clone()))),
-            codex_selected: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(Studio::from_project(persisted))),
             store: None,
             planner: Planner::Demo,
@@ -3435,7 +3278,7 @@ mod tests {
             "POST",
             "/api/edits",
             &format!(
-                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps&provider=Gemini"
+                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps"
             ),
         ));
         assert_eq!(retried.status, 200);
@@ -3494,7 +3337,6 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
-            codex_selected: false,
         };
         let plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3677,7 +3519,7 @@ mod tests {
         let accepted = router.handle(&request(
             "POST",
             "/api/edits",
-            "operation_id=persisted-operation&start=4&end=8&prompt=increase+volume&provider=Gemini",
+            "operation_id=persisted-operation&start=4&end=8&prompt=increase+volume",
         ));
         let operation_id = serde_json::from_str::<serde_json::Value>(&accepted.body)
             .expect("accepted edit JSON")["operationId"]
@@ -3690,7 +3532,7 @@ mod tests {
         let recovered = router.handle(&request(
             "POST",
             "/api/edits",
-            "operation_id=persisted-operation&start=4&end=8&prompt=increase+volume&provider=Gemini",
+            "operation_id=persisted-operation&start=4&end=8&prompt=increase+volume",
         ));
         assert_eq!(recovered.status, 200);
         let recovered: serde_json::Value =
@@ -3713,8 +3555,7 @@ mod tests {
         let gate = Arc::new(PlannerGate::new());
         let mut router = Router::demo();
         router.planner = Planner::GatedDemo(gate.clone());
-        let body =
-            "operation_id=client-operation&start=4&end=8&prompt=increase+volume&provider=Gemini";
+        let body = "operation_id=client-operation&start=4&end=8&prompt=increase+volume";
         let accepted = router.handle(&request("POST", "/api/edits", body));
         gate.wait_until_started();
 
@@ -3746,7 +3587,7 @@ mod tests {
         let accepted = router.handle(&request(
             "POST",
             "/api/edits",
-            "start=4&end=8&prompt=increase+volume&provider=Gemini",
+            "start=4&end=8&prompt=increase+volume",
         ));
         gate.wait_until_started();
 
@@ -3783,7 +3624,7 @@ mod tests {
                 .handle(&request(
                     "POST",
                     "/api/edits",
-                    "operation_id=not%20valid&start=4&end=8&prompt=increase+volume&provider=Gemini",
+                    "operation_id=not%20valid&start=4&end=8&prompt=increase+volume",
                 ))
                 .status,
             422
@@ -3792,7 +3633,7 @@ mod tests {
         let accepted = router.handle(&request(
             "POST",
             "/api/edits",
-            "start=4&end=8&prompt=make+the+lead+louder&provider=Gemini",
+            "start=4&end=8&prompt=make+the+lead+louder",
         ));
         let failed = wait_for_edit(&router, &accepted);
         assert_eq!(failed["status"], "failed");
@@ -4248,24 +4089,6 @@ mod tests {
         let rendered = String::from_utf8(bytes).expect("UTF-8 response");
         assert!(rendered.contains("Content-Length: 11"));
         assert!(rendered.contains("X-Content-Type-Options: nosniff"));
-    }
-
-    #[test]
-    fn ai_provider_selection_is_explicit_and_per_router() {
-        let router = Router::demo();
-        let initial = router.handle(&request("GET", "/api/provider", ""));
-        assert_eq!(initial.status, 200);
-        assert!(initial.body.contains("Gemini"));
-
-        let selected = router.handle(&request("POST", "/api/provider", "provider=Codex"));
-        assert_eq!(selected.status, 200);
-        assert!(router.codex_selected.load(Ordering::Relaxed));
-        assert_eq!(
-            router
-                .handle(&request("POST", "/api/provider", "provider=unknown"))
-                .status,
-            422
-        );
     }
 
     #[test]

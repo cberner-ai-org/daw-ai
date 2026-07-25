@@ -1,7 +1,6 @@
 #[allow(dead_code)]
 mod audio_analysis;
 mod audio_stream;
-mod codex;
 mod concurrency;
 pub mod gemini;
 pub mod gemini_tools;
