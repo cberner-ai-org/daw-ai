@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use crate::gemini::{GeminiEdit, PlannerError, ReferenceAudio};
 use crate::gemini_tools::{AudioRenderRequest, EditSession, prepare_audio_render};
 use crate::model::Project;
+use crate::project_history::ProjectHistory;
 use crate::prompt::{Action, EditPlan};
 
 const CODEX_TIMEOUT: Duration = Duration::from_secs(crate::gemini::EDIT_TIMEOUT_SECONDS);
@@ -25,6 +26,35 @@ const PROJECT_ASSETS_DIRECTORY: &str = "project-assets";
 const MAX_ACCEPTED_AUDIO_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CODEX_ERROR_BYTES: u64 = 64 * 1024;
 const MAX_CODEX_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CODEX_WORKSPACE_ENTRIES: u64 = 4096;
+
+pub(crate) fn prune_project_assets(
+    session_root: &std::path::Path,
+    history: &ProjectHistory,
+) -> std::io::Result<()> {
+    let assets_path = session_root.join(PROJECT_ASSETS_DIRECTORY);
+    let entries = match fs::read_dir(&assets_path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let referenced = history
+        .snapshots
+        .iter()
+        .flat_map(|project| &project.tracks)
+        .flat_map(|track| &track.audio_clips)
+        .map(|clip| std::path::PathBuf::from(&clip.asset))
+        .collect::<HashSet<_>>();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if (file_type.is_file() || file_type.is_symlink()) && !referenced.contains(&path) {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
 
 struct TemporaryCodexHome {
     path: std::path::PathBuf,
@@ -244,6 +274,8 @@ fn packaged_codex_command(
         "/proc",
         "--dev",
         "/dev",
+        "--size",
+        "67108864",
         "--tmpfs",
         "/tmp",
     ]);
@@ -469,32 +501,51 @@ fn copy_accepted_audio(
         .create_new(true)
         .open(accepted_path)
         .map_err(|error| format!("could not reserve accepted Codex audio asset: {error}"))?;
-    std::io::copy(
+    let copied = std::io::copy(
         &mut source.take(MAX_ACCEPTED_AUDIO_BYTES + 1),
         &mut accepted,
-    )
-    .map_err(|error| format!("could not preserve Codex audio asset: {error}"))?;
+    );
+    if let Err(error) = copied {
+        drop(accepted);
+        let _ = fs::remove_file(accepted_path);
+        return Err(format!("could not preserve Codex audio asset: {error}"));
+    }
     Ok(())
 }
 
-fn bounded_workspace_bytes(path: &std::path::Path, limit: u64) -> std::io::Result<u64> {
+fn bounded_workspace_usage(
+    path: &std::path::Path,
+    byte_limit: u64,
+    entry_limit: u64,
+) -> std::io::Result<(u64, u64)> {
     let mut bytes = 0_u64;
+    let mut entries = 0_u64;
     for entry in fs::read_dir(path)? {
         let entry = entry?;
+        entries = entries.saturating_add(1);
+        if entries > entry_limit {
+            break;
+        }
         let metadata = entry.path().symlink_metadata()?;
         if metadata.file_type().is_symlink() {
             continue;
         }
-        bytes = bytes.saturating_add(if metadata.is_dir() {
-            bounded_workspace_bytes(&entry.path(), limit.saturating_sub(bytes))?
+        if metadata.is_dir() {
+            let (nested_bytes, nested_entries) = bounded_workspace_usage(
+                &entry.path(),
+                byte_limit.saturating_sub(bytes),
+                entry_limit.saturating_sub(entries),
+            )?;
+            bytes = bytes.saturating_add(nested_bytes);
+            entries = entries.saturating_add(nested_entries);
         } else {
-            metadata.len()
-        });
-        if bytes > limit {
+            bytes = bytes.saturating_add(metadata.len());
+        }
+        if bytes > byte_limit || entries > entry_limit {
             break;
         }
     }
-    Ok(bytes)
+    Ok((bytes, entries))
 }
 
 fn translate_host_assets_to_sandbox(
@@ -723,9 +774,26 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                     child.terminate();
                     return Err(PlannerError::TimedOut);
                 }
-                if bounded_workspace_bytes(session.path(), MAX_CODEX_WORKSPACE_BYTES)
+                let (workspace_bytes, workspace_entries) = bounded_workspace_usage(
+                    session.path(),
+                    MAX_CODEX_WORKSPACE_BYTES,
+                    MAX_CODEX_WORKSPACE_ENTRIES,
+                )
+                .map_err(PlannerError::Io)?;
+                let (home_bytes, home_entries) = codex_home
+                    .as_ref()
+                    .map(|home| {
+                        bounded_workspace_usage(
+                            &home.path,
+                            MAX_CODEX_WORKSPACE_BYTES.saturating_sub(workspace_bytes),
+                            MAX_CODEX_WORKSPACE_ENTRIES.saturating_sub(workspace_entries),
+                        )
+                    })
+                    .transpose()
                     .map_err(PlannerError::Io)?
-                    > MAX_CODEX_WORKSPACE_BYTES
+                    .unwrap_or_default();
+                if workspace_bytes.saturating_add(home_bytes) > MAX_CODEX_WORKSPACE_BYTES
+                    || workspace_entries.saturating_add(home_entries) > MAX_CODEX_WORKSPACE_ENTRIES
                 {
                     child.terminate();
                     return Err(PlannerError::Failed {
@@ -834,11 +902,13 @@ mod tests {
     use super::packaged_codex_command;
     use super::{
         ChildGuard, PROJECT_ASSETS_DIRECTORY, SANDBOX_SESSION_PATH, TemporaryCodexHome,
-        bounded_workspace_bytes, codex_spawn_unavailable, configure_exec_command,
+        bounded_workspace_usage, codex_spawn_unavailable, configure_exec_command,
         copy_accepted_audio, missing_codex_in_sandbox, prepare_initial_listening,
-        stage_sandbox_assets, translate_host_assets_to_sandbox, translate_sandbox_assets_to_host,
+        prune_project_assets, stage_sandbox_assets, translate_host_assets_to_sandbox,
+        translate_sandbox_assets_to_host,
     };
     use crate::model::{AudioClip, Project};
+    use crate::project_history::ProjectHistory;
     use std::fs;
     use std::process::Command;
     use std::sync::Arc;
@@ -1092,6 +1162,36 @@ mod tests {
     }
 
     #[test]
+    fn project_asset_pruning_preserves_every_history_reference() {
+        let root =
+            std::env::temp_dir().join(format!("daw-ai-codex-pruning-test-{}", std::process::id()));
+        let assets = root.join(PROJECT_ASSETS_DIRECTORY);
+        fs::create_dir_all(&assets).expect("project assets");
+        let retained = assets.join("retained.wav");
+        let orphaned = assets.join("orphaned.wav");
+        fs::write(&retained, b"retained").expect("retained asset");
+        fs::write(&orphaned, b"orphaned").expect("orphaned asset");
+        let mut project = Project::initial();
+        project.tracks[0].audio_clips.push(AudioClip {
+            id: 901,
+            label: "Retained".to_owned(),
+            start: 0.0,
+            end: 1.0,
+            asset: retained.to_string_lossy().into_owned(),
+            source_offset: 0.0,
+            source_duration: 1.0,
+            gain: 1.0,
+            reversed: false,
+        });
+
+        prune_project_assets(&root, &ProjectHistory::new(project)).expect("prune assets");
+
+        assert!(retained.is_file());
+        assert!(!orphaned.exists());
+        fs::remove_dir_all(root).expect("temporary root cleanup");
+    }
+
+    #[test]
     fn workspace_accounting_stops_after_its_limit() {
         let root =
             std::env::temp_dir().join(format!("daw-ai-workspace-limit-{}", std::process::id()));
@@ -1100,7 +1200,12 @@ mod tests {
             .expect("large workspace file")
             .set_len(1024)
             .expect("sparse file");
-        assert!(bounded_workspace_bytes(&root, 512).expect("workspace bytes") > 512);
+        assert!(
+            bounded_workspace_usage(&root, 512, 100)
+                .expect("workspace usage")
+                .0
+                > 512
+        );
         fs::remove_dir_all(root).expect("temporary root cleanup");
     }
 
