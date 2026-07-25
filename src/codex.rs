@@ -738,7 +738,13 @@ Analyze local WAV files when useful. Finish only after the registered tools have
             }
             let stdout_path = session.path().join("codex-stdout.log");
             let stderr_path = session.path().join("codex-stderr.log");
-            let stderr_file = fs::File::create(&stderr_path).map_err(PlannerError::Io)?;
+            let stderr_file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&stderr_path)
+                .map_err(PlannerError::Io)?;
             let child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::from(
