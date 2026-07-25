@@ -412,6 +412,7 @@ struct EditRequest {
     start: f32,
     end: f32,
     project: crate::model::Project,
+    reference_audio: Option<crate::gemini::ReferenceAudio>,
 }
 
 struct EditFailure {
@@ -1037,6 +1038,10 @@ impl Router {
         let Some(end) = form.get("end").and_then(|value| value.parse::<f32>().ok()) else {
             return Response::json(422, error_json("selection end is required"));
         };
+        let reference_audio = match parse_reference_audio(&form) {
+            Ok(audio) => audio,
+            Err(message) => return Response::json(422, error_json(message)),
+        };
         let project = {
             let studio = self.lock_studio();
             if let Err(error) = studio.validate_edit(start, end, prompt) {
@@ -1076,6 +1081,7 @@ impl Router {
             start,
             end,
             project,
+            reference_audio,
         };
         let worker = self.clone();
         let spawn = thread::Builder::new()
@@ -1403,12 +1409,13 @@ impl Router {
         let mut expected_version = edit.project.version;
         let mut published_update = false;
         let cancellation = self.edit_jobs.cancellation(job_id);
-        let completed = GeminiPlanner::interpret_with_audio_renderer_updates(
+        let completed = GeminiPlanner::interpret_with_reference_audio_updates(
             &self.gemini_session_root(),
             &edit.prompt,
             edit.start,
             edit.end,
             &edit.project,
+            edit.reference_audio.clone(),
             cancellation,
             |request| {
                 self.edit_jobs.set_running(
@@ -2483,6 +2490,93 @@ fn parse_form(body: &str) -> HashMap<String, String> {
         .collect()
 }
 
+fn parse_reference_audio(
+    form: &HashMap<String, String>,
+) -> Result<Option<crate::gemini::ReferenceAudio>, &'static str> {
+    let Some(data) = form.get("reference_audio_data") else {
+        return Ok(None);
+    };
+    let mime_type = form
+        .get("reference_audio_type")
+        .map(String::as_str)
+        .unwrap_or("audio/wav");
+    if !matches!(
+        mime_type,
+        "audio/wav" | "audio/x-wav" | "audio/mpeg" | "audio/mp4" | "audio/ogg" | "audio/flac"
+    ) {
+        return Err("reference audio type is not supported");
+    }
+    let bytes = decode_base64(data).ok_or("reference audio is invalid")?;
+    if bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 {
+        return Err("reference audio must be between 1 byte and 2 MB");
+    }
+    let name = form
+        .get("reference_audio_name")
+        .map_or("reference audio", String::as_str)
+        .chars()
+        .take(160)
+        .collect();
+    Ok(Some(crate::gemini::ReferenceAudio {
+        name,
+        mime_type: mime_type.to_owned(),
+        bytes,
+    }))
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    if value.len() % 4 != 0 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(value.len() / 4 * 3);
+    let chunks = value.as_bytes().chunks_exact(4);
+    let chunk_count = chunks.len();
+    for (index, chunk) in chunks.enumerate() {
+        let final_chunk = index + 1 == chunk_count;
+        if !final_chunk && (chunk[2] == b'=' || chunk[3] == b'=') {
+            return None;
+        }
+        let a = digit(chunk[0])?;
+        let b = digit(chunk[1])?;
+        let c = if chunk[2] == b'=' {
+            0
+        } else {
+            digit(chunk[2])?
+        };
+        let d = if chunk[3] == b'=' {
+            0
+        } else {
+            digit(chunk[3])?
+        };
+        if chunk[2] == b'=' && chunk[3] != b'=' {
+            return None;
+        }
+        if chunk[2] == b'=' && b & 0x0f != 0 {
+            return None;
+        }
+        if chunk[3] == b'=' && chunk[2] != b'=' && c & 0x03 != 0 {
+            return None;
+        }
+        output.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            output.push((b << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            output.push((c << 6) | d);
+        }
+    }
+    Some(output)
+}
+
 fn forwarded_host(value: &str) -> Option<&str> {
     let host = value.split(',').next()?.trim();
     parse_authority(host).map(|_| host)
@@ -3003,6 +3097,7 @@ mod tests {
             start: 4.0,
             end: 8.0,
             project: project.clone(),
+            reference_audio: None,
         };
         let plan = |preset: &str, summary: &str| EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3131,6 +3226,7 @@ mod tests {
             start: 4.0,
             end: 8.0,
             project: project.clone(),
+            reference_audio: None,
         };
         let first_plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3263,6 +3359,7 @@ mod tests {
             start: 4.0,
             end: 8.0,
             project: project.clone(),
+            reference_audio: None,
         };
         let plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3612,6 +3709,33 @@ mod tests {
         assert_eq!(parsed.path, "/api/edits");
         assert_eq!(parsed.headers["host"], "localhost");
         assert_eq!(parse_form(&parsed.body)["prompt"], "warm & wide");
+    }
+
+    #[test]
+    fn validates_reference_audio_without_external_credentials() {
+        let valid = parse_form(
+            "reference_audio_name=kick.wav&reference_audio_type=audio%2Fwav&reference_audio_data=UklGRg%3D%3D",
+        );
+        let audio = parse_reference_audio(&valid)
+            .expect("valid reference")
+            .expect("attached reference");
+        assert_eq!(audio.name, "kick.wav");
+        assert_eq!(audio.mime_type, "audio/wav");
+        assert_eq!(audio.bytes, b"RIFF");
+
+        let invalid = parse_form(
+            "reference_audio_type=application%2Foctet-stream&reference_audio_data=UklGRg%3D%3D",
+        );
+        assert_eq!(
+            parse_reference_audio(&invalid).unwrap_err(),
+            "reference audio type is not supported"
+        );
+        for malformed in ["RA==UklG", "Ukl=Rg==", "UklGR==="] {
+            assert!(
+                decode_base64(malformed).is_none(),
+                "accepted malformed base64 {malformed}"
+            );
+        }
     }
 
     #[test]

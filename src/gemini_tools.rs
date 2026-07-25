@@ -19,6 +19,7 @@ pub(crate) const READ_TOOL_NAME: &str = "read_sound_graph";
 pub(crate) const AUDIO_TOOL_NAME: &str = "render_audio_region";
 pub(crate) const PRESET_TOOL_NAME: &str = "list_surge_presets";
 pub(crate) const INSTRUMENT_PARAMETER_TOOL_NAME: &str = "list_instrument_parameters";
+pub(crate) const SOUND_TOOL_PARAMETER_TOOL_NAME: &str = "list_sound_tool_parameters";
 const GRAPH_FILE: &str = "sound-graph.json";
 const REQUEST_FILE: &str = "request.json";
 const SESSION_FILE: &str = "session.json";
@@ -359,6 +360,19 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
                 &["trackId", "group"],
             ),
         ),
+        function(
+            SOUND_TOOL_PARAMETER_TOOL_NAME,
+            "Discover the editable controls for one effect or modulator. Use common for the primary musical controls and advanced for routing, envelope, formula, and secondary controls. Apply a returned parameter with set_parameter.",
+            object_schema(
+                serde_json::json!({
+                    "trackId":{"type":"integer","minimum":1},
+                    "tool":{"type":"string","enum":["effect","modulator"]},
+                    "toolId":{"type":"integer","minimum":1},
+                    "group":{"type":"string","enum":["common","advanced"]}
+                }),
+                &["trackId", "tool", "toolId", "group"],
+            ),
+        ),
     ];
     tools.extend(mutation_tool_declarations());
     tools
@@ -580,7 +594,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "set_parameter",
-            "Set one instrument, effect, modulator, MIDI event, or routing parameter using stable IDs. For instruments, first call list_instrument_parameters and pass its exact native:<id> parameter. Surge preset defaults remain unchanged until this explicit override.",
+            "Set one instrument, effect, modulator, MIDI event, or routing parameter using stable IDs. Discover instrument controls with list_instrument_parameters and effect/modulator controls with list_sound_tool_parameters before changing unfamiliar controls. Surge preset defaults remain unchanged until an explicit override.",
             object_schema(
                 serde_json::json!({"trackId":id(),"tool":{"type":"string","enum":["instrument","effect","modulator","event","routing"]},"toolId":id(),"clipId":{"type":"integer","minimum":0},"parameter":{"type":"string","minLength":1,"maxLength":64},"value":{"type":"string","minLength":1,"maxLength":96}}),
                 &["trackId", "tool", "toolId", "clipId", "parameter", "value"],
@@ -776,6 +790,110 @@ pub(crate) fn list_instrument_parameters(
         "parameters": parameters
     })
     .to_string())
+}
+
+pub(crate) fn list_sound_tool_parameters(
+    session_path: &Path,
+    arguments: &JsonValue,
+) -> Result<String, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "tool arguments must be an object".to_owned())?;
+    let track_id = required_id(object, "trackId")?;
+    let tool_id = required_id(object, "toolId")?;
+    let tool = required_string(object, "tool")?;
+    let group = required_string(object, "group")?;
+    if !matches!(group, "common" | "advanced") {
+        return Err("group must be common or advanced".to_owned());
+    }
+    let project = current_project(session_path)?;
+    let track = project
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .ok_or_else(|| format!("track {track_id} does not exist"))?;
+    let parameters = match tool {
+        "effect" => {
+            let effect = track
+                .effects
+                .iter()
+                .find(|effect| effect.id == tool_id)
+                .ok_or_else(|| format!("effect {tool_id} does not exist"))?;
+            let mut values = vec![
+                serde_json::json!({"parameter":"enabled","name":"Enabled","value":effect.enabled,"type":"boolean","common":true}),
+                serde_json::json!({"parameter":"mix","name":"Mix","value":effect.mix,"minimum":0,"maximum":1,"common":true}),
+            ];
+            if let Some(value) = effect.cutoff_hz {
+                values.push(serde_json::json!({"parameter":"cutoff","name":"Cutoff","value":value,"minimum":80,"maximum":16000,"unit":"Hz","common":true}));
+            }
+            if let Some(value) = effect.resonance {
+                values.push(serde_json::json!({"parameter":"resonance","name":"Resonance","value":value,"minimum":0.1,"maximum":20,"unit":"Q","common":true}));
+            }
+            values.extend(
+                effect
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (name, value))| {
+                        serde_json::json!({
+                            "parameter":name,
+                            "name":display_parameter_name(name),
+                            "value":value,
+                            "minimum":0,
+                            "maximum":1,
+                            "common":index < 2
+                        })
+                    }),
+            );
+            values
+        }
+        "modulator" => {
+            let modulator = track
+                .modulators
+                .iter()
+                .find(|modulator| modulator.id == tool_id)
+                .ok_or_else(|| format!("modulator {tool_id} does not exist"))?;
+            vec![
+                serde_json::json!({"parameter":"enabled","name":"Enabled","value":modulator.enabled,"type":"boolean","common":true}),
+                serde_json::json!({"parameter":"shape","name":"Shape","value":modulator.shape,"choices":["sine","triangle","square","random","envelope","formula"],"common":true}),
+                serde_json::json!({"parameter":"target","name":"Target","value":modulator.target,"common":true}),
+                serde_json::json!({"parameter":"rate","name":"Rate","value":modulator.rate,"minimum":0.01,"maximum":20,"common":true}),
+                serde_json::json!({"parameter":"depth","name":"Depth","value":modulator.depth,"minimum":0,"maximum":1,"common":true}),
+                serde_json::json!({"parameter":"rateMode","name":"Rate mode","value":modulator.rate_mode,"choices":["hz","tempo"],"common":false}),
+                serde_json::json!({"parameter":"trigger","name":"Trigger","value":modulator.trigger,"choices":["free","midi","audio"],"common":false}),
+                serde_json::json!({"parameter":"sourceTrackId","name":"Source track ID","value":modulator.source_track_id,"common":false}),
+                serde_json::json!({"parameter":"polarity","name":"Polarity","value":modulator.polarity,"choices":["increase","decrease"],"common":false}),
+                serde_json::json!({"parameter":"threshold","name":"Threshold","value":modulator.threshold,"minimum":0,"maximum":1,"common":false}),
+                serde_json::json!({"parameter":"attackMs","name":"Attack","value":modulator.attack_ms,"minimum":0,"maximum":1000,"unit":"ms","common":false}),
+                serde_json::json!({"parameter":"releaseMs","name":"Release","value":modulator.release_ms,"minimum":1,"maximum":5000,"unit":"ms","common":false}),
+                serde_json::json!({"parameter":"formula","name":"Surge Formula (Lua)","value":modulator.formula,"maximumLength":8192,"common":false}),
+            ]
+        }
+        _ => return Err("tool must be effect or modulator".to_owned()),
+    };
+    let common = group == "common";
+    Ok(serde_json::json!({
+        "trackId":track_id,
+        "tool":tool,
+        "toolId":tool_id,
+        "group":group,
+        "parameters":parameters.into_iter().filter(|parameter| parameter["common"] == common).collect::<Vec<_>>()
+    })
+    .to_string())
+}
+
+fn display_parameter_name(name: &str) -> String {
+    let mut display = String::new();
+    for character in name.chars() {
+        if character.is_ascii_uppercase() {
+            display.push(' ');
+        }
+        display.push(character);
+    }
+    if let Some(first) = display.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    display
 }
 
 fn preset_folder_metadata(path: &str) -> (&'static str, &'static [&'static str]) {
@@ -2154,15 +2272,16 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str))
             .collect::<Vec<_>>();
         assert_eq!(
-            names[0..4],
+            names[0..5],
             [
                 READ_TOOL_NAME,
                 AUDIO_TOOL_NAME,
                 PRESET_TOOL_NAME,
                 INSTRUMENT_PARAMETER_TOOL_NAME,
+                SOUND_TOOL_PARAMETER_TOOL_NAME,
             ]
         );
-        assert_eq!(&names[4..], MUTATION_TOOL_NAMES);
+        assert_eq!(&names[5..], MUTATION_TOOL_NAMES);
         assert!(
             declarations[1]["description"]
                 .as_str()

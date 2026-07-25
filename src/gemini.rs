@@ -16,9 +16,9 @@ use serde_json::Value as JsonValue;
 use crate::gemini_tools::render_audio_request;
 use crate::gemini_tools::{
     AUDIO_TOOL_NAME, AudioRender, AudioRenderRequest, EditSession, INSTRUMENT_PARAMETER_TOOL_NAME,
-    PRESET_TOOL_NAME, READ_TOOL_NAME, apply_agent_mutation, base64_audio, is_mutation_tool,
-    list_instrument_parameters, list_surge_presets, prepare_audio_render, read_sound_graph,
-    tool_declarations,
+    PRESET_TOOL_NAME, READ_TOOL_NAME, SOUND_TOOL_PARAMETER_TOOL_NAME, apply_agent_mutation,
+    base64_audio, is_mutation_tool, list_instrument_parameters, list_sound_tool_parameters,
+    list_surge_presets, prepare_audio_render, read_sound_graph, tool_declarations,
 };
 use crate::model::Project;
 #[cfg(test)]
@@ -96,25 +96,34 @@ struct LoopState {
     audio_artifacts: usize,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ReferenceAudio {
+    pub(crate) name: String,
+    pub(crate) mime_type: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
 impl GeminiPlanner {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn interpret_with_audio_renderer_updates(
+    pub(crate) fn interpret_with_reference_audio_updates(
         session_root: &std::path::Path,
         prompt: &str,
         start: f32,
         end: f32,
         project: &Project,
+        reference_audio: Option<ReferenceAudio>,
         cancellation: Arc<AtomicBool>,
         mut render_audio: impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
         mut on_update: impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     ) -> Result<GeminiEdit, PlannerError> {
         let session = EditSession::create_in(session_root, project, prompt, start, end)
             .map_err(PlannerError::Io)?;
-        let result = run_session(
+        let result = run_session_with_reference(
             &session,
             prompt,
             start,
             end,
+            reference_audio.as_ref(),
             cancellation,
             &mut render_audio,
             &mut on_update,
@@ -135,11 +144,13 @@ impl GeminiPlanner {
     }
 }
 
-fn run_session(
+#[allow(clippy::too_many_arguments)]
+fn run_session_with_reference(
     session: &EditSession,
     prompt: &str,
     start: f32,
     end: f32,
+    reference_audio: Option<&ReferenceAudio>,
     cancellation: Arc<AtomicBool>,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -147,11 +158,12 @@ fn run_session(
     let api_key = load_api_key()?;
     let endpoint = std::env::var("DAW_AI_GEMINI_ENDPOINT")
         .unwrap_or_else(|_| DEFAULT_INTERACTIONS_ENDPOINT.to_owned());
-    run_session_with_transport(
+    run_session_with_transport_reference(
         session,
         prompt,
         start,
         end,
+        reference_audio,
         render_audio,
         on_update,
         &|| cancellation.load(Ordering::SeqCst),
@@ -170,12 +182,38 @@ fn run_session(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_session_with_transport(
     session: &EditSession,
     prompt: &str,
     start: f32,
     end: f32,
+    render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
+    on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
+    is_cancelled: &impl Fn() -> bool,
+    transport: &mut impl FnMut(usize, &JsonValue, Duration) -> Result<String, PlannerError>,
+) -> Result<GeminiEdit, PlannerError> {
+    run_session_with_transport_reference(
+        session,
+        prompt,
+        start,
+        end,
+        None,
+        render_audio,
+        on_update,
+        is_cancelled,
+        transport,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_session_with_transport_reference(
+    session: &EditSession,
+    prompt: &str,
+    start: f32,
+    end: f32,
+    reference_audio: Option<&ReferenceAudio>,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     is_cancelled: &impl Fn() -> bool,
@@ -228,7 +266,22 @@ fn run_session_with_transport(
         let calls = function_calls(&response)?;
         if !research_complete {
             research_complete = true;
-            input = JsonValue::String(planner_task(prompt, start, end));
+            input = reference_audio.map_or_else(
+                || JsonValue::String(planner_task(prompt, start, end)),
+                |audio| {
+                    serde_json::json!([{
+                        "type": "user_input",
+                        "content": [
+                            {"type": "text", "text": format!(
+                                "{}\n\nThe user attached reference audio named {:?}. Listen to it and use it as the audible reference for the requested match or comparison.",
+                                planner_task(prompt, start, end),
+                                audio.name
+                            )},
+                            {"type": "audio", "mime_type": audio.mime_type, "data": base64_audio(&audio.bytes)}
+                        ]
+                    }])
+                },
+            );
             continue;
         }
         if calls.is_empty() {
@@ -361,6 +414,10 @@ fn execute_tool(
         )),
         INSTRUMENT_PARAMETER_TOOL_NAME => Ok(ToolOutput::text(
             list_instrument_parameters(session.path(), &call.arguments)
+                .unwrap_or_else(|error| format!("Tool error: {error}")),
+        )),
+        SOUND_TOOL_PARAMETER_TOOL_NAME => Ok(ToolOutput::text(
+            list_sound_tool_parameters(session.path(), &call.arguments)
                 .unwrap_or_else(|error| format!("Tool error: {error}")),
         )),
         "resample_audio_region" => {
@@ -1598,6 +1655,59 @@ mod tests {
         assert_eq!(updates, 1);
         assert_eq!(result.project.tracks[1].instrument.preset, "Surge Lead");
         assert_eq!(session.stats().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn attached_reference_audio_reaches_the_editing_interaction() {
+        let session =
+            EditSession::create(&Project::demo(), "match this bass", 0.0, 4.0).expect("session");
+        let reference = ReferenceAudio {
+            name: "reference.wav".to_owned(),
+            mime_type: "audio/wav".to_owned(),
+            bytes: b"RIFF".to_vec(),
+        };
+        let responses = [
+            serde_json::json!({"id":"research","status":"completed","steps":[]}),
+            serde_json::json!({
+                "id":"edit","status":"requires_action","steps":[{
+                    "type":"function_call","id":"edit-bass","name":"set_parameter",
+                    "arguments":preset_edit("Surge Lead")
+                }]
+            }),
+            serde_json::json!({"id":"done","status":"completed","steps":[]}),
+        ];
+        let mut response_index = 0;
+        let mut editing_input = None;
+        run_session_with_transport_reference(
+            &session,
+            "match this bass",
+            0.0,
+            4.0,
+            Some(&reference),
+            &mut render_audio_request,
+            &mut |edit| Ok(edit.project),
+            &|| false,
+            &mut |sequence, request, _| {
+                if sequence == 2 {
+                    editing_input = Some(request["input"].clone());
+                }
+                let response = responses[response_index].to_string();
+                response_index += 1;
+                Ok(response)
+            },
+        )
+        .expect("producer session with reference audio");
+
+        let input = editing_input.expect("editing request");
+        assert!(
+            input[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("reference.wav")
+        );
+        assert_eq!(input[0]["content"][1]["type"], "audio");
+        assert_eq!(input[0]["content"][1]["mime_type"], "audio/wav");
+        assert_eq!(input[0]["content"][1]["data"], "UklGRg==");
     }
 
     #[test]
