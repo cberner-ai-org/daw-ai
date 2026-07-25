@@ -49,7 +49,7 @@
     clearDebug: document.querySelector("#clear-debug"),
     refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
     geminiSessionList: document.querySelector("#gemini-session-list"),
-    audioBackend: document.querySelector("#audio-backend"),
+    aiProvider: document.querySelector("#ai-provider"),
     sessionHistoryList: document.querySelector("#session-history-list"),
     toast: document.querySelector("#toast"),
     toastMessage: document.querySelector("#toast-message"),
@@ -440,8 +440,8 @@
   async function loadProject() {
     try {
       adoptProject(await api("/api/project"));
-      const backend = await api("/api/backend");
-      elements.audioBackend.value = backend.backend;
+      const provider = await api("/api/provider");
+      elements.aiProvider.value = provider.provider;
       renderProject();
     } catch (error) {
       showError(error, "loading the project");
@@ -449,18 +449,17 @@
     }
   }
 
-  async function changeAudioBackend() {
+  async function changeAiProvider() {
     try {
-      const response = await api("/api/backend", {
+      const response = await api("/api/provider", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ backend: elements.audioBackend.value }),
+        body: new URLSearchParams({ provider: elements.aiProvider.value }),
       });
-      elements.audioBackend.value = response.backend;
-      audio.stop(true);
-      showToast(`Using ${response.backend} instrument backend`);
+      elements.aiProvider.value = response.provider;
+      showToast(`Using ${response.provider} for AI edits`);
     } catch (error) {
-      showError(error, "changing the instrument backend");
+      showError(error, "changing the AI provider");
     }
   }
 
@@ -1509,7 +1508,7 @@
   function showEditProgress(job) {
     const elapsed = Math.max(0, Number(job.elapsedSeconds) || 0);
     const timeout = Math.max(1, Number(job.timeoutSeconds) || 20 * 60);
-    const detail = job.detail || "Gemini is working on the edit";
+    const detail = job.detail || "The AI producer is working on the edit";
     const appliedSteps = Math.max(0, Number(job.appliedSteps) || 0);
     let nextActivityPercent = 5;
     if (job.status === "completed") {
@@ -1823,7 +1822,7 @@
       message: completed ? operation.message : undefined,
       error: completed
         ? undefined
-        : operation.message || "Gemini stopped before completing the edit.",
+        : operation.message || "The AI producer stopped before completing the edit.",
       errorStatus: completed ? undefined : 500,
       appliedSteps: Number(operation.appliedSteps) || 0,
       initialVersion: Number(operation.initialVersion) || null,
@@ -1920,7 +1919,7 @@
       if (hasPublishedChanges) {
         let refreshError = null;
         try {
-          await refreshAuthoritativeProject("Gemini stopped; refreshing its partial changes");
+          await refreshAuthoritativeProject("The AI producer stopped; refreshing its partial changes");
         } catch (error) {
           refreshError = error;
         }
@@ -2393,7 +2392,7 @@
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
   elements.refreshGeminiSessions.addEventListener("click", () => void loadGeminiSessions());
-  elements.audioBackend.addEventListener("change", () => void changeAudioBackend());
+  elements.aiProvider.addEventListener("change", () => void changeAiProvider());
   elements.sessionHistoryList.addEventListener("click", (event) => {
     void enqueueProjectMutation(() => selectProjectHistory(event));
   });

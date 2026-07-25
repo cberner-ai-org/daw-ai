@@ -2,7 +2,7 @@
 
 DAW-AI is a local, prompt-driven music studio for making music without learning a traditional DAW. Select a region of the timeline, describe the change in everyday language, and hear the arrangement update immediately.
 
-The project is a small Rust server with a responsive browser client. Surge XT renders instruments and effects, with a dry built-in Rust instrument backend available only for debugging, and the browser only plays the resulting WAV. Prompted edits are produced by Gemini 3.6 Flash, which can hear renders made by the selected backend.
+The project is a small Rust server with a responsive browser client. Surge XT renders instruments, effects, modulation, and routing, and the browser only plays the resulting WAV. Prompted edits use Gemini 3.6 Flash by default, with locally authenticated Codex available as an alternative.
 
 ## Run it
 
@@ -11,6 +11,7 @@ Prerequisites:
 - Rust 1.85 or newer
 - `curl`
 - A [Gemini API key](https://ai.google.dev/gemini-api/docs/api-key)
+- Optionally, an authenticated [Codex CLI](https://developers.openai.com/codex/cli/) for Codex edits
 - `just` (optional, but recommended)
 
 Set the standard environment variable:
@@ -19,7 +20,7 @@ Set the standard environment variable:
 export GEMINI_API_KEY="your-key"
 ```
 
-For a system service, use systemd's `LoadCredential=` with a credential named `gemini-api-key`; DAW-AI automatically reads it from `CREDENTIALS_DIRECTORY`. This keeps the key out of the unit environment, process arguments, and home directories. For interactive use, `~/gemini_creds.txt` remains a fallback. A raw key, `GEMINI_API_KEY=...`, `Gemini API key: ...`, and `export GEMINI_API_KEY=...` are accepted. `DAW_AI_GEMINI_API_KEY` and `DAW_AI_GEMINI_CREDENTIALS` provide explicit overrides.
+For a system service, use systemd's `LoadCredential=` with a credential named `gemini-api-key`; DAW-AI automatically reads it from `CREDENTIALS_DIRECTORY`. Codex remains optional: installations that want it can install `deploy/daw-ai-codex-auth.conf` as a systemd drop-in to expose the local CLI `auth.json` as `codex-auth`. Each Codex edit copies that credential into a private temporary `CODEX_HOME` which is deleted when the CLI exits; credentials are never retained with debugging sessions. The hardened packaged unit replaces Codex's nested Linux sandbox only when the unit environment and systemd credential context are both verified. Interactive launches retain Codex's `workspace-write` sandbox; `~/gemini_creds.txt` and the current user's existing Codex login remain available.
 
 The model can search and load Surge XT's factory `.fxp` library. Development builds discover it in the pinned Surge checkout automatically. Packaged deployments should copy Surge's `resources/data/patches_factory` directory to `/usr/local/share/daw-ai/patches_factory`, or set `DAW_AI_SURGE_PRESET_DIR` to its installed location.
 
@@ -47,15 +48,15 @@ cargo run -- --port 8888
 
 1. Drag over any part of the arrangement to set the edit region. On touch devices, swipe to pan normally or tap **Select region** before dragging a selection.
 2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `turn this section into a dubstep drop`.
-3. Press **Make change**, then use the transport to hear the result. The button becomes **Interrupt** while Gemini is working.
+3. Press **Make change**, then use the transport to hear the result. The button becomes **Interrupt** while the selected AI is working.
 4. Use session history to inspect earlier states and move forward again, or download the complete arrangement with **Export WAV**.
-5. Switch to **Advanced** to edit MIDI notes in the piano roll and select instrument, effect, and modulator nodes in the sound graph to edit their parameters. Tracks can also be created and deleted there. The **Debug** tab selects the Surge XT or built-in sound engine for instruments and effects, lists retained Gemini sessions, and provides a copyable environment and browser-error report.
+5. Switch to **Advanced** to edit MIDI notes in the piano roll and select instrument, effect, and modulator nodes in the sound graph to edit their parameters. Tracks can also be created and deleted there. The **Debug** tab selects Gemini or Codex for AI edits, lists retained AI sessions, and provides a copyable environment and browser-error report.
 
 No login is required. DAW-AI assigns each browser a private random cookie and stores its project under `users/<cookie>/sound-graph.json` beside `DAW_AI_PROJECT_PATH` (or beside the working-directory default). Each user has independent edit jobs, history, playback, backend selection, and project state. DAW-AI creates the demo graph for a new user and safely saves every accepted prompt, mixer change, Advanced edit, undo, reset, and history selection.
 
-For each prompt, Gemini receives the selected edit range and the checked-in synth contract under `gemini/`. It can read the latest graph; create, update, and delete tracks and their MIDI clips, effects, and modulators through narrow stable-ID functions; set instrument and routing parameters, track mute, and tempo; undo its latest mutation; search for musical context; and choose channels plus absolute project start/end times to render as WAV audio directly into its next multimodal turn. Listening is independent of edit scope and entirely model-directed: the integration encourages it when useful but never requires it. The Rust backend renders the project without depending on the user's tab.
+For each prompt, the selected AI receives the edit range and checked-in studio contract under `gemini/`. Gemini and Codex receive the same registered stable-ID graph tools for reads, mutations, control discovery, undo, and Surge XT rendering. Gemini receives listening renders as audio input; Codex receives durable local WAV paths that it can analyze through the CLI. Listening is independent of edit scope and model-directed.
 
-Gemini may render before or after edits whenever listening would help, but no separate model reviews or rejects its completion decision. It may also complete based on graph inspection alone. There is no predetermined iteration or tool-call limit; the overall 20-minute request timeout is the loop boundary. The server publishes each successful atomic mutation as an undoable edit while Gemini is still working. Direct Advanced edits and channel creation or deletion use the same persisted graph.
+The selected AI may render before or after edits whenever listening would help, but no separate model reviews or rejects its completion decision. It may also complete based on graph inspection alone. There is no predetermined iteration or tool-call limit; the overall 20-minute request timeout is the loop boundary. The server publishes each successful atomic mutation as an undoable edit while the AI is still working. Direct Advanced edits and channel creation or deletion use the same persisted graph.
 
 Prompted edits run as asynchronous jobs so reverse proxies never need to hold one request open while Gemini works. The browser polls short status requests, fetches each published intermediate project and the completed project, and shows the current phase, applied steps, and elapsed time. Gemini may spend up to 20 minutes on an edit; if the project changes before that edit finishes, the result is rejected instead of overwriting newer work.
 

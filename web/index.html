@@ -52,7 +52,7 @@
       <section class="view-panel" id="ai-mode-panel" role="tabpanel" aria-labelledby="ai-mode-button">
         <section class="project-heading" aria-labelledby="project-name">
           <div>
-            <div class="eyebrow"><span class="live-dot"></span> Local Gemini studio</div>
+            <div class="eyebrow"><span class="live-dot"></span> Local AI studio</div>
             <h1 id="project-name">Loading studio...</h1>
           </div>
           <div class="heading-actions">
@@ -182,13 +182,13 @@
           </div>
         </div>
         <p class="debug-intro">Copy this report into a coding assistant when you need help. Backend warnings and errors are also written to the server's stderr.</p>
-        <section class="debug-settings" aria-labelledby="audio-backend-heading">
-          <div><strong id="audio-backend-heading">Sound engine</strong><span>Surge XT renders instruments and effects; built-in provides dry instrument diagnosis only.</span></div>
-          <select id="audio-backend"><option>Surge XT</option><option>built-in</option></select>
+        <section class="debug-settings" aria-labelledby="ai-provider-heading">
+          <div><strong id="ai-provider-heading">AI provider</strong><span>Gemini is optimized for audio input; Codex uses local CLI authentication and filesystem renders.</span></div>
+          <select id="ai-provider"><option>Gemini</option><option>Codex</option></select>
         </section>
         <section class="debug-settings" aria-labelledby="gemini-session-heading">
           <div>
-            <strong id="gemini-session-heading">Gemini sessions</strong>
+            <strong id="gemini-session-heading">AI sessions</strong>
             <span>Every edit transcript, tool call, graph snapshot, and rendered WAV is retained locally.</span>
           </div>
           <button class="text-button" id="refresh-gemini-sessions" type="button">Refresh</button>

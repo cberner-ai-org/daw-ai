@@ -15,9 +15,10 @@ use crate::audio_analysis;
 use crate::audio_stream::{
     ByteRange, WAV_HEADER_BYTES, bounded_audio_byte_range, wait_for_playback_window,
 };
+use crate::codex::CodexPlanner;
 use crate::concurrency::Limiter;
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
-use crate::gemini_tools::render_audio_request_with_backend;
+use crate::gemini_tools::render_audio_request;
 use crate::model::{ChannelOperationAction, Project, Studio, StudioError, json_string};
 #[cfg(test)]
 use crate::project_history::{MAX_HISTORY_BYTES, load_project_history};
@@ -215,7 +216,7 @@ struct Router {
     audio_token: Arc<String>,
     users: Option<Arc<UserRegistry>>,
     history: Arc<Mutex<ProjectHistory>>,
-    builtin_backend: Arc<AtomicBool>,
+    codex_selected: Arc<AtomicBool>,
 }
 
 struct UserRegistry {
@@ -285,7 +286,7 @@ fn request_needs_user_scope(request: &Request) -> bool {
         "/api/project"
             | "/api/gemini-sessions"
             | "/api/history"
-            | "/api/backend"
+            | "/api/provider"
             | "/api/edits"
             | "/api/channels"
             | "/api/mix"
@@ -443,7 +444,6 @@ impl AudioRenderer {
         project: &crate::model::Project,
         start_sample: usize,
         end_sample: usize,
-        builtin: bool,
         is_cancelled: &impl Fn() -> bool,
     ) -> Result<audio_analysis::AudioRegion, AudioRenderError> {
         self.stream_region_with(
@@ -451,13 +451,7 @@ impl AudioRenderer {
             start_sample,
             end_sample,
             is_cancelled,
-            |project, start, end| {
-                if builtin {
-                    audio_analysis::render_project_sample_range_builtin(project, start, end)
-                } else {
-                    audio_analysis::render_project_sample_range(project, start, end)
-                }
-            },
+            audio_analysis::render_project_sample_range,
         )
     }
 
@@ -713,6 +707,29 @@ fn planner_failure(error: PlannerError) -> EditFailure {
     EditFailure::new(status, error.to_string())
 }
 
+fn codex_planner_failure(error: PlannerError) -> EditFailure {
+    let status = match error {
+        PlannerError::ProjectChanged => 409,
+        PlannerError::SaveFailed => 500,
+        _ => 503,
+    };
+    let message = match error {
+        PlannerError::Unavailable(message) => message,
+        PlannerError::TimedOut => "Codex took too long to complete the edit; try again".to_owned(),
+        PlannerError::Failed { message, .. } => {
+            format!("Codex could not complete the edit: {message}")
+        }
+        PlannerError::ProjectChanged => "the project changed; submit the edit again".to_owned(),
+        PlannerError::SaveFailed => "could not save the sound graph".to_owned(),
+        PlannerError::Interrupted => "the edit was interrupted".to_owned(),
+        PlannerError::InvalidOutput(message) => {
+            format!("Codex returned an invalid sound graph edit: {message}")
+        }
+        PlannerError::Io(error) => format!("Codex integration failed: {error}"),
+    };
+    EditFailure::new(status, message)
+}
+
 impl Router {
     fn write_export(
         &self,
@@ -727,7 +744,6 @@ impl Router {
             return Response::json(405, error_json("method not allowed")).write(output);
         }
         let project = self.lock_studio().project().clone();
-        let builtin_backend = self.builtin_backend.load(Ordering::SeqCst);
         let sample_count = audio_analysis::playback_sample_count(0.0, project.duration);
         let total_length = WAV_HEADER_BYTES.saturating_add(sample_count.saturating_mul(2));
         write_response_head(
@@ -745,20 +761,18 @@ impl Router {
         let mut cursor = 0;
         while cursor < sample_count {
             let end = (cursor + AUDIO_RANGE_SAMPLES).min(sample_count);
-            let region = match self.audio_renderer.stream_sample_range(
-                &project,
-                cursor,
-                end,
-                builtin_backend,
-                &|| false,
-            ) {
-                Ok(region) => region,
-                Err(AudioRenderError::Render(error)) => {
-                    eprintln!("error: could not render export: {error}");
-                    return Err(io::Error::other("could not render export"));
-                }
-                Err(AudioRenderError::Cancelled) => return Ok(()),
-            };
+            let region =
+                match self
+                    .audio_renderer
+                    .stream_sample_range(&project, cursor, end, &|| false)
+                {
+                    Ok(region) => region,
+                    Err(AudioRenderError::Render(error)) => {
+                        eprintln!("error: could not render export: {error}");
+                        return Err(io::Error::other("could not render export"));
+                    }
+                    Err(AudioRenderError::Cancelled) => return Ok(()),
+                };
             output.write_all(&audio_analysis::pcm_bytes(&region.samples))?;
             cursor = end;
         }
@@ -789,7 +803,7 @@ impl Router {
         });
         Ok(Self {
             history: Arc::new(Mutex::new(history)),
-            builtin_backend: Arc::new(AtomicBool::new(false)),
+            codex_selected: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(studio)),
             store: Some(store),
             planner,
@@ -806,7 +820,7 @@ impl Router {
             history: Arc::new(Mutex::new(ProjectHistory::new(
                 Studio::new().project().clone(),
             ))),
-            builtin_backend: Arc::new(AtomicBool::new(false)),
+            codex_selected: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(Studio::new())),
             store: None,
             planner: Planner::Demo,
@@ -896,7 +910,7 @@ impl Router {
         persist_user_use(&directory)?;
         let router = Self {
             history: Arc::new(Mutex::new(history)),
-            builtin_backend: Arc::new(AtomicBool::new(false)),
+            codex_selected: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(studio)),
             store: Some(store),
             planner: registry.planner.clone(),
@@ -989,7 +1003,7 @@ impl Router {
             }
             ("GET", "/api/gemini-sessions") => self.gemini_sessions(),
             ("GET", "/api/history") => self.history_response(),
-            ("GET", "/api/backend") => self.backend_response(),
+            ("GET", "/api/provider") => self.provider_response(),
             ("POST", "/api/edits") => self.start_edit(&request.body),
             ("POST", "/api/channels") => self.change_channel(&request.body),
             ("POST", "/api/mix") => self.change_mix(&request.body),
@@ -998,7 +1012,7 @@ impl Router {
             ("POST", "/api/undo") => self.undo(),
             ("POST", "/api/reset") => self.reset(),
             ("POST", "/api/history") => self.select_history(&request.body),
-            ("POST", "/api/backend") => self.set_backend(&request.body),
+            ("POST", "/api/provider") => self.set_provider(&request.body),
             (
                 _,
                 "/api/edits" | "/api/channels" | "/api/mix" | "/api/sound-tools" | "/api/logs"
@@ -1009,7 +1023,7 @@ impl Router {
             }
             (_, "/api/history") => Response::json(405, error_json("method not allowed"))
                 .with_header("Allow", "GET, POST"),
-            (_, "/api/backend") => Response::json(405, error_json("method not allowed"))
+            (_, "/api/provider") => Response::json(405, error_json("method not allowed"))
                 .with_header("Allow", "GET, POST"),
             _ => Response::json(404, error_json("not found")),
         }
@@ -1222,7 +1236,6 @@ impl Router {
                 &project,
                 cursor,
                 end,
-                self.builtin_backend.load(Ordering::SeqCst),
                 &is_cancelled,
             ) {
                 Ok(rendered) => rendered,
@@ -1279,7 +1292,6 @@ impl Router {
             project,
             stream_start_sample + first_sample,
             stream_start_sample + end_sample,
-            self.builtin_backend.load(Ordering::SeqCst),
             is_cancelled,
         ) {
             Ok(region) => region,
@@ -1373,9 +1385,12 @@ impl Router {
         self.edit_jobs.set_running(
             job_id,
             "planning",
-            "Gemini is planning, editing, and listening to the sound graph",
+            "The AI producer is planning, editing, and listening to the sound graph",
         );
         if matches!(&self.planner, Planner::Gemini) {
+            if self.codex_selected.load(Ordering::SeqCst) {
+                return self.perform_codex_edit(job_id, edit);
+            }
             return self.perform_gemini_edit(job_id, edit);
         }
         let plan = self
@@ -1423,10 +1438,7 @@ impl Router {
                     "rendering",
                     "Rendering the current sound graph with the Rust audio engine",
                 );
-                let result = render_audio_request_with_backend(
-                    request,
-                    self.builtin_backend.load(Ordering::SeqCst),
-                );
+                let result = render_audio_request(request);
                 self.edit_jobs.set_running(
                     job_id,
                     "planning",
@@ -1458,6 +1470,46 @@ impl Router {
             &completed.plan.summary,
         )
         .map_err(planner_failure)?;
+        Ok(completed.plan.summary)
+    }
+
+    fn perform_codex_edit(&self, job_id: u64, edit: EditRequest) -> Result<String, EditFailure> {
+        let mut expected_version = edit.project.version;
+        let mut published_update = false;
+        let cancellation = self.edit_jobs.cancellation(job_id);
+        let completed = CodexPlanner::interpret_with_updates(
+            &self.gemini_session_root(),
+            &edit.prompt,
+            edit.start,
+            edit.end,
+            &edit.project,
+            edit.reference_audio.clone(),
+            cancellation,
+            render_audio_request,
+            |graph_edit| {
+                self.commit_gemini_update(
+                    job_id,
+                    &edit,
+                    &mut expected_version,
+                    &mut published_update,
+                    graph_edit,
+                )
+            },
+        )
+        .map_err(codex_planner_failure)?;
+        if !published_update {
+            return Err(EditFailure::new(
+                503,
+                "Codex completed without publishing a sound graph edit",
+            ));
+        }
+        self.complete_gemini_operation(
+            job_id,
+            &edit,
+            &mut expected_version,
+            &completed.plan.summary,
+        )
+        .map_err(codex_planner_failure)?;
         Ok(completed.plan.summary)
     }
 
@@ -1837,24 +1889,27 @@ impl Router {
         )
     }
 
-    fn backend_response(&self) -> Response {
-        let backend = if self.builtin_backend.load(Ordering::SeqCst) {
-            "built-in"
+    fn provider_response(&self) -> Response {
+        let provider = if self.codex_selected.load(Ordering::SeqCst) {
+            "Codex"
         } else {
-            "Surge XT"
+            "Gemini"
         };
-        Response::json(200, serde_json::json!({"backend":backend}).to_string())
+        Response::json(200, serde_json::json!({"provider":provider}).to_string())
     }
 
-    fn set_backend(&self, body: &str) -> Response {
-        let backend = parse_form(body).get("backend").cloned().unwrap_or_default();
-        let builtin = match backend.as_str() {
-            "Surge XT" => false,
-            "built-in" => true,
-            _ => return Response::json(422, error_json("unknown sound engine")),
+    fn set_provider(&self, body: &str) -> Response {
+        let provider = parse_form(body)
+            .get("provider")
+            .cloned()
+            .unwrap_or_default();
+        let codex = match provider.as_str() {
+            "Gemini" => false,
+            "Codex" => true,
+            _ => return Response::json(422, error_json("unknown AI provider")),
         };
-        self.builtin_backend.store(builtin, Ordering::SeqCst);
-        self.backend_response()
+        self.codex_selected.store(codex, Ordering::SeqCst);
+        self.provider_response()
     }
 
     fn select_history(&self, body: &str) -> Response {
@@ -2810,7 +2865,7 @@ mod tests {
         (
             Router {
                 history: Arc::new(Mutex::new(ProjectHistory::new(studio.project().clone()))),
-                builtin_backend: Arc::new(AtomicBool::new(false)),
+                codex_selected: Arc::new(AtomicBool::new(false)),
                 studio: Arc::new(Mutex::new(studio)),
                 store: Some(store),
                 planner: Planner::Demo,
@@ -3290,7 +3345,7 @@ mod tests {
             .expect("persisted partial operation");
         let restarted = Router {
             history: Arc::new(Mutex::new(ProjectHistory::new(persisted.clone()))),
-            builtin_backend: Arc::new(AtomicBool::new(false)),
+            codex_selected: Arc::new(AtomicBool::new(false)),
             studio: Arc::new(Mutex::new(Studio::from_project(persisted))),
             store: None,
             planner: Planner::Demo,
@@ -3850,7 +3905,6 @@ mod tests {
     #[test]
     fn export_streams_wav_bytes_and_sets_a_new_user_cookie() {
         let router = Router::demo();
-        router.builtin_backend.store(true, Ordering::SeqCst);
         let mut project = router.lock_studio().project().clone();
         project.duration = 0.5;
         *router.lock_studio() = Studio::from_project(project);
@@ -3875,42 +3929,6 @@ mod tests {
             WAV_HEADER_BYTES + expected_samples * 2
         );
         assert_eq!(&response[body_start..body_start + 4], b"RIFF");
-
-        struct BackendFlippingWriter {
-            bytes: Vec<u8>,
-            backend: Arc<AtomicBool>,
-            flipped: bool,
-        }
-
-        impl Write for BackendFlippingWriter {
-            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-                if !self.flipped {
-                    self.backend.store(false, Ordering::SeqCst);
-                    self.flipped = true;
-                }
-                self.bytes.extend_from_slice(buffer);
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        router.builtin_backend.store(true, Ordering::SeqCst);
-        let mut flipping_response = BackendFlippingWriter {
-            bytes: Vec::new(),
-            backend: Arc::clone(&router.builtin_backend),
-            flipped: false,
-        };
-        router
-            .write_export(
-                &request("GET", "/api/export.wav", ""),
-                &mut flipping_response,
-                Some("daw_ai_user=0123456789abcdef0123456789abcdef; Path=/"),
-            )
-            .expect("export with backend changed after response starts");
-        assert_eq!(flipping_response.bytes, response);
     }
 
     #[test]
@@ -4154,18 +4172,18 @@ mod tests {
     }
 
     #[test]
-    fn backend_selection_is_explicit_and_per_router() {
+    fn ai_provider_selection_is_explicit_and_per_router() {
         let router = Router::demo();
-        let initial = router.handle(&request("GET", "/api/backend", ""));
+        let initial = router.handle(&request("GET", "/api/provider", ""));
         assert_eq!(initial.status, 200);
-        assert!(initial.body.contains("Surge XT"));
+        assert!(initial.body.contains("Gemini"));
 
-        let selected = router.handle(&request("POST", "/api/backend", "backend=built-in"));
+        let selected = router.handle(&request("POST", "/api/provider", "provider=Codex"));
         assert_eq!(selected.status, 200);
-        assert!(router.builtin_backend.load(Ordering::Relaxed));
+        assert!(router.codex_selected.load(Ordering::Relaxed));
         assert_eq!(
             router
-                .handle(&request("POST", "/api/backend", "backend=unknown"))
+                .handle(&request("POST", "/api/provider", "provider=unknown"))
                 .status,
             422
         );

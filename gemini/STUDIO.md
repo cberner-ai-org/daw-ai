@@ -33,11 +33,9 @@ For creative work, use `render_audio_region` after each change. Compare the WAV 
 
 Use `all` when an edit should affect the complete mix. Use a role name for a targeted edit.
 
-## Research, then plan
+## Plan the arrangement
 
-Before the first musical plan, use web search to research how producers create the requested musical effect or style and what listeners perceive as its signature. Look for arrangement, tension/release, rhythm, orchestration, and sound-design context—not merely a preset or isolated timbre. Use the findings as creative guidance and adapt them to the selected region and current composition. When that signature depends on a transition or contrast over time, make the contrast audible inside the selected region instead of substituting a uniform final-state texture. Do not copy a fixed recipe, and do not replace graph inspection or listening with research. Basic literal operations such as a direct mute or level adjustment do not need an extended lookup.
-
-Form a concise internal musical plan for the rhythm, harmony, orchestration, and sound design that will fulfill the request. Inspect the existing composition before deciding whether to update an existing graph object or create one. Make as many focused mutations as the plan needs; every successful call remains its own undo boundary.
+Form a concise internal musical plan from the user's request, requested genre, selected region, and existing composition before editing. Plan the section roles, rhythm, harmony, orchestration, energy contour, transitions, and sound design that make the request and genre recognizable. When that signature depends on a transition or contrast over time, make the contrast audible inside the selected region instead of substituting a uniform final-state texture. Inspect the existing composition before deciding whether to update an existing graph object or create one. Make as many focused mutations as the plan needs; every successful call remains its own undo boundary.
 
 Do not invent a niche arrangement action. Terms such as drop, chorus, build, breakdown, and fill are musical goals that must be composed from MIDI clips, instruments, effects, modulators, routing, and level changes.
 

@@ -615,6 +615,7 @@ async function run() {
         })),
         debugVisible: !document.querySelector('#debug-panel').hidden && !document.querySelector('#debug-panel').inert,
         aiHidden: document.querySelector('#ai-mode-panel').hidden && document.querySelector('#ai-mode-panel').inert,
+        providers: [...document.querySelector('#ai-provider').options].map((option) => option.value),
         report: document.querySelector('#debug-report').value,
       };
     })()`);
@@ -628,6 +629,13 @@ async function run() {
       "the three chartered studio views must be exposed as tabs",
     );
     assert.equal(debugView.debugVisible && debugView.aiHidden, true, "Debug must replace the AI Mode panel");
+    assert.deepEqual(debugView.providers, ["Gemini", "Codex"], "Debug must select the AI provider");
+    const codexProvider = await evaluate(
+      cdp,
+      appSession,
+      "fetch('/api/provider', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'provider=Codex'}).then((response) => response.json())",
+    );
+    assert.deepEqual(codexProvider, { provider: "Codex" });
     assert.match(debugView.report, /Synthetic browser failure/);
     assert.match(debugView.report, /Backend warnings and errors are written/);
     assert.match(debugView.report, /Gemini sessions: 0 retained locally/);

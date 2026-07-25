@@ -103,6 +103,28 @@ pub(crate) struct ReferenceAudio {
     pub(crate) bytes: Vec<u8>,
 }
 
+impl ReferenceAudio {
+    pub(crate) fn materialize_in(&self, session_path: &Path) -> std::io::Result<PathBuf> {
+        let original_extension = Path::new(&self.name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        let extension = match (self.mime_type.as_str(), original_extension.as_deref()) {
+            ("audio/wav" | "audio/x-wav", _) => "wav",
+            ("audio/mpeg", _) => "mp3",
+            ("audio/mp4", Some("mp4")) => "mp4",
+            ("audio/mp4", _) => "m4a",
+            ("audio/ogg", Some("oga")) => "oga",
+            ("audio/ogg", _) => "ogg",
+            ("audio/flac", _) => "flac",
+            _ => "audio",
+        };
+        let path = session_path.join(format!("user-reference.{extension}"));
+        fs::write(&path, &self.bytes)?;
+        Ok(path)
+    }
+}
+
 impl GeminiPlanner {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn interpret_with_reference_audio_updates(
@@ -221,11 +243,24 @@ fn run_session_with_transport_reference(
 ) -> Result<GeminiEdit, PlannerError> {
     let started = Instant::now();
     let tools = tool_declarations();
-    let research_tools = [serde_json::json!({"type": "google_search"})];
-    let mut input = JsonValue::String(research_task(prompt));
+    let mut input = reference_audio.map_or_else(
+        || JsonValue::String(planner_task(prompt, start, end)),
+        |audio| {
+            serde_json::json!([{
+                "type": "user_input",
+                "content": [
+                    {"type": "text", "text": format!(
+                        "{}\n\nThe user attached reference audio named {:?}. Listen to it and use it as the audible reference for the requested match or comparison.",
+                        planner_task(prompt, start, end),
+                        audio.name
+                    )},
+                    {"type": "audio", "mime_type": audio.mime_type, "data": base64_audio(&audio.bytes)}
+                ]
+            }])
+        },
+    );
     let mut previous_interaction_id: Option<String> = None;
     let mut sequence = 0_usize;
-    let mut research_complete = false;
     let mut state = LoopState::default();
 
     loop {
@@ -239,7 +274,7 @@ fn run_session_with_transport_reference(
         let mut request = serde_json::json!({
             "model": GEMINI_MODEL,
             "input": input,
-            "tools": if research_complete { &tools[..] } else { &research_tools[..] },
+            "tools": &tools,
             "system_instruction": system_instruction(),
             "generation_config": {"thinking_level": "high"},
             "store": true
@@ -264,26 +299,6 @@ fn run_session_with_transport_reference(
                 .to_owned(),
         );
         let calls = function_calls(&response)?;
-        if !research_complete {
-            research_complete = true;
-            input = reference_audio.map_or_else(
-                || JsonValue::String(planner_task(prompt, start, end)),
-                |audio| {
-                    serde_json::json!([{
-                        "type": "user_input",
-                        "content": [
-                            {"type": "text", "text": format!(
-                                "{}\n\nThe user attached reference audio named {:?}. Listen to it and use it as the audible reference for the requested match or comparison.",
-                                planner_task(prompt, start, end),
-                                audio.name
-                            )},
-                            {"type": "audio", "mime_type": audio.mime_type, "data": base64_audio(&audio.bytes)}
-                        ]
-                    }])
-                },
-            );
-            continue;
-        }
         if calls.is_empty() {
             if state.plans.is_empty() {
                 input = JsonValue::String(format!(
@@ -831,13 +846,7 @@ fn missing_credentials(path: Option<&Path>) -> PlannerError {
 
 fn planner_task(prompt: &str, start: f32, end: f32) -> String {
     format!(
-        "Selected edit region: {start:.3} to {end:.3} seconds. This bounds graph edits, not listening.\nUser request: {prompt}\n\nBegin by reading the current sound graph. For creative work, listen after each change, compare the sound with the user's request, and iterate on composition and sound design until they match. Establish an audible baseline, audition important sound choices on isolated tracks, and evaluate the final full mix."
-    )
-}
-
-fn research_task(prompt: &str) -> String {
-    format!(
-        "Use Google Search to research how producers create the requested musical effect or style and what listeners perceive as its signature. Focus on arrangement, tension and release, rhythm, orchestration, and sound design. Return concise findings for a subsequent DAW editing turn; do not attempt to edit the graph yet. User request: {prompt}"
+        "Selected edit region: {start:.3} to {end:.3} seconds. This bounds graph edits, not listening.\nUser request: {prompt}\n\nBegin by reading the current sound graph. Before editing, form a concise musical plan for the selected region's arrangement based on the user's request, requested genre, and existing composition. Plan the section roles, rhythm, harmony, orchestration, energy contour, transitions, and sound design needed to make the genre and request recognizable. For creative work, listen after each change, compare the sound with the user's request, and iterate on composition and sound design until they match. Establish an audible baseline, audition important sound choices on isolated tracks, and evaluate the final full mix."
     )
 }
 
@@ -845,8 +854,9 @@ fn system_instruction() -> String {
     format!(
         concat!(
             "You are the autonomous sound-graph producer inside DAW-AI. Use the registered tools; ",
-            "you cannot alter the graph by merely describing changes. Research unfamiliar musical ",
-            "goals when useful. The selected region bounds edits only; every audio-tool call chooses ",
+            "you cannot alter the graph by merely describing changes. First inspect the graph and form ",
+            "a concise musical plan for the arrangement based on the user's request, requested genre, ",
+            "selected region, and existing composition. The selected region bounds edits only; every audio-tool call chooses ",
             "its own absolute project start and end, so include surrounding context when useful. Read ",
             "the graph before editing. For creative or style-based work, listen after each change, ",
             "compare the audible result with the user's request, and iterate on composition and sound ",
@@ -1607,12 +1617,6 @@ mod tests {
             EditSession::create(&Project::demo(), "shape the bass", 0.0, 4.0).expect("session");
         let responses = [
             serde_json::json!({
-                "id": "research", "status": "completed", "steps": [
-                    {"type": "google_search_result"},
-                    {"type": "model_output", "content": [{"type": "text", "text": "Use a brighter bass."}]}
-                ]
-            }),
-            serde_json::json!({
                 "id": "edit", "status": "requires_action", "steps": [{
                     "type": "function_call", "id": "edit-bass", "name": "set_parameter",
                     "arguments": preset_edit("Surge Lead")
@@ -1651,7 +1655,7 @@ mod tests {
         )
         .expect("producer session");
 
-        assert_eq!(response_index, 4);
+        assert_eq!(response_index, 3);
         assert_eq!(updates, 1);
         assert_eq!(result.project.tracks[1].instrument.preset, "Surge Lead");
         assert_eq!(session.stats().unwrap(), (1, 1));
@@ -1667,7 +1671,6 @@ mod tests {
             bytes: b"RIFF".to_vec(),
         };
         let responses = [
-            serde_json::json!({"id":"research","status":"completed","steps":[]}),
             serde_json::json!({
                 "id":"edit","status":"requires_action","steps":[{
                     "type":"function_call","id":"edit-bass","name":"set_parameter",
@@ -1688,7 +1691,7 @@ mod tests {
             &mut |edit| Ok(edit.project),
             &|| false,
             &mut |sequence, request, _| {
-                if sequence == 2 {
+                if sequence == 1 {
                     editing_input = Some(request["input"].clone());
                 }
                 let response = responses[response_index].to_string();
@@ -1708,6 +1711,27 @@ mod tests {
         assert_eq!(input[0]["content"][1]["type"], "audio");
         assert_eq!(input[0]["content"][1]["mime_type"], "audio/wav");
         assert_eq!(input[0]["content"][1]["data"], "UklGRg==");
+    }
+
+    #[test]
+    fn reference_audio_materialization_preserves_non_wav_format_safely() {
+        let session =
+            EditSession::create(&Project::demo(), "match this song", 0.0, 4.0).expect("session");
+        let reference = ReferenceAudio {
+            name: "../../Club Reference.M4A".to_owned(),
+            mime_type: "audio/mp4".to_owned(),
+            bytes: b"non-wav-audio".to_vec(),
+        };
+
+        let path = reference
+            .materialize_in(session.path())
+            .expect("materialized reference");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("user-reference.m4a")
+        );
+        assert_eq!(fs::read(path).expect("reference bytes"), reference.bytes);
     }
 
     #[test]
@@ -1791,6 +1815,10 @@ mod tests {
         let instruction = system_instruction();
         assert!(task.contains("listen after each change"));
         assert!(task.contains("iterate on composition and sound design"));
+        assert!(task.contains("requested genre"));
+        assert!(task.contains("section roles, rhythm, harmony, orchestration"));
+        assert!(instruction.contains("requested genre"));
+        assert!(instruction.contains("concise musical plan for the arrangement"));
         assert!(instruction.contains("selected region bounds edits only"));
         assert!(instruction.contains("chooses its own absolute project start and end"));
         assert!(instruction.contains("listen after each change"));
