@@ -1958,6 +1958,7 @@
       start: selectionStart,
       end: selectionEnd,
       submittedText,
+      provider,
     } = pending;
     let clearSubmittedPrompt = false;
     let restorePlayback = false;
@@ -1971,6 +1972,7 @@
           prompt,
           start: String(selectionStart),
           end: String(selectionEnd),
+          provider,
         });
         if (pending.referenceAudio) {
           editBody.set("reference_audio_name", pending.referenceAudio.name);
@@ -2090,6 +2092,7 @@
         submittedText,
         start: state.selectionStart,
         end: state.selectionEnd,
+        provider: elements.aiProvider.value,
         acceptedJob: null,
         referenceAudio,
       };

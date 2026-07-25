@@ -1044,6 +1044,11 @@ impl Router {
         let Some(prompt) = form.get("prompt") else {
             return Response::json(422, error_json("prompt is required"));
         };
+        let codex_selected = match form.get("provider").map(String::as_str) {
+            Some("Gemini") => false,
+            Some("Codex") => true,
+            _ => return Response::json(422, error_json("provider is required")),
+        };
         let Some(start) = form
             .get("start")
             .and_then(|value| value.parse::<f32>().ok())
@@ -1097,7 +1102,7 @@ impl Router {
             end,
             project,
             reference_audio,
-            codex_selected: self.codex_selected.load(Ordering::SeqCst),
+            codex_selected,
         };
         let worker = self.clone();
         let spawn = thread::Builder::new()
@@ -3045,7 +3050,7 @@ mod tests {
         let response = router.handle(&request(
             "POST",
             "/api/edits",
-            "start=4&end=8&prompt=increase+volume",
+            "start=4&end=8&prompt=increase+volume&provider=Gemini",
         ));
         let completed = wait_for_edit(&router, &response);
         assert_eq!(completed["status"], "completed");
@@ -3311,7 +3316,7 @@ mod tests {
             "POST",
             "/api/edits",
             &format!(
-                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps"
+                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps&provider=Gemini"
             ),
         ));
         assert_eq!(recovered.status, 200);
@@ -3409,7 +3414,7 @@ mod tests {
             "POST",
             "/api/edits",
             &format!(
-                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps"
+                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps&provider=Gemini"
             ),
         ));
         assert_eq!(retried.status, 200);
@@ -3651,7 +3656,7 @@ mod tests {
         let accepted = router.handle(&request(
             "POST",
             "/api/edits",
-            "operation_id=persisted-operation&start=4&end=8&prompt=increase+volume",
+            "operation_id=persisted-operation&start=4&end=8&prompt=increase+volume&provider=Gemini",
         ));
         let operation_id = serde_json::from_str::<serde_json::Value>(&accepted.body)
             .expect("accepted edit JSON")["operationId"]
@@ -3664,7 +3669,7 @@ mod tests {
         let recovered = router.handle(&request(
             "POST",
             "/api/edits",
-            "operation_id=persisted-operation&start=4&end=8&prompt=increase+volume",
+            "operation_id=persisted-operation&start=4&end=8&prompt=increase+volume&provider=Gemini",
         ));
         assert_eq!(recovered.status, 200);
         let recovered: serde_json::Value =
@@ -3687,7 +3692,8 @@ mod tests {
         let gate = Arc::new(PlannerGate::new());
         let mut router = Router::demo();
         router.planner = Planner::GatedDemo(gate.clone());
-        let body = "operation_id=client-operation&start=4&end=8&prompt=increase+volume";
+        let body =
+            "operation_id=client-operation&start=4&end=8&prompt=increase+volume&provider=Gemini";
         let accepted = router.handle(&request("POST", "/api/edits", body));
         gate.wait_until_started();
 
@@ -3719,7 +3725,7 @@ mod tests {
         let accepted = router.handle(&request(
             "POST",
             "/api/edits",
-            "start=4&end=8&prompt=increase+volume",
+            "start=4&end=8&prompt=increase+volume&provider=Gemini",
         ));
         gate.wait_until_started();
 
@@ -3756,7 +3762,7 @@ mod tests {
                 .handle(&request(
                     "POST",
                     "/api/edits",
-                    "operation_id=not%20valid&start=4&end=8&prompt=increase+volume",
+                    "operation_id=not%20valid&start=4&end=8&prompt=increase+volume&provider=Gemini",
                 ))
                 .status,
             422
@@ -3765,7 +3771,7 @@ mod tests {
         let accepted = router.handle(&request(
             "POST",
             "/api/edits",
-            "start=4&end=8&prompt=make+the+lead+louder",
+            "start=4&end=8&prompt=make+the+lead+louder&provider=Gemini",
         ));
         let failed = wait_for_edit(&router, &accepted);
         assert_eq!(failed["status"], "failed");

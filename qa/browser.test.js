@@ -1594,7 +1594,12 @@ async function run() {
             const accepted = await originalFetch('/api/edits', {
               method: 'POST',
               headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-              body: new URLSearchParams({ prompt: 'increase volume', start: '4', end: '8' }),
+              body: new URLSearchParams({
+                prompt: 'increase volume',
+                start: '4',
+                end: '8',
+                provider: 'Gemini',
+              }),
             }).then((response) => response.json());
             window.__competingOperationId = accepted.operationId;
             for (;;) {
