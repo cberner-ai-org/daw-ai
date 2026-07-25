@@ -1,5 +1,7 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -85,6 +87,29 @@ static SESSION_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_SESSION_RETENTION_DAYS: u64 = 30;
 const DEFAULT_SESSION_RETENTION_COUNT: usize = 100;
 const DEFAULT_SESSION_RETENTION_BYTES: u64 = 512 * 1024 * 1024;
+
+fn read_text_nofollow(path: &Path, maximum_bytes: u64) -> io::Result<String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata is not a regular file",
+        ));
+    }
+    let mut source = String::new();
+    file.take(maximum_bytes + 1).read_to_string(&mut source)?;
+    if source.len() as u64 > maximum_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata exceeds its size limit",
+        ));
+    }
+    Ok(source)
+}
 
 #[derive(Clone, Copy)]
 struct SessionRetention {
@@ -216,9 +241,20 @@ impl EditSession {
         applied_steps: usize,
         audio_listens: usize,
     ) -> io::Result<()> {
+        let source = self.metadata_source()?;
+        self.update_status_from(&source, status, detail, applied_steps, audio_listens)
+    }
+
+    pub(crate) fn update_status_from(
+        &self,
+        source: &str,
+        status: &str,
+        detail: &str,
+        applied_steps: usize,
+        audio_listens: usize,
+    ) -> io::Result<()> {
         let path = self.path.join(SESSION_FILE);
-        let source = fs::read_to_string(&path)?;
-        let mut value = serde_json::from_str::<JsonValue>(&source)
+        let mut value = serde_json::from_str::<JsonValue>(source)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let object = value
             .as_object_mut()
@@ -231,9 +267,13 @@ impl EditSession {
         write_replace(&path, &value.to_string())
     }
 
+    pub(crate) fn metadata_source(&self) -> io::Result<String> {
+        read_text_nofollow(&self.path.join(SESSION_FILE), 64 * 1024)
+    }
+
     pub(crate) fn identify_provider(&self, provider: &str, detail: &str) -> io::Result<()> {
         let path = self.path.join(SESSION_FILE);
-        let source = fs::read_to_string(&path)?;
+        let source = read_text_nofollow(&path, 64 * 1024)?;
         let mut value = serde_json::from_str::<JsonValue>(&source)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let object = value
@@ -245,7 +285,7 @@ impl EditSession {
     }
 
     pub(crate) fn stats(&self) -> io::Result<(usize, usize)> {
-        let source = fs::read_to_string(self.path.join(SESSION_FILE))?;
+        let source = self.metadata_source()?;
         let value = serde_json::from_str::<JsonValue>(&source)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let applied_steps = value
@@ -260,7 +300,7 @@ impl EditSession {
     }
 
     pub(crate) fn detail(&self) -> io::Result<String> {
-        let source = fs::read_to_string(self.path.join(SESSION_FILE))?;
+        let source = self.metadata_source()?;
         let value = serde_json::from_str::<JsonValue>(&source)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         Ok(value
@@ -2673,6 +2713,34 @@ mod tests {
         assert_eq!(summary["status"], "completed");
         assert_eq!(summary["appliedSteps"], 2);
         assert_eq!(summary["audioListens"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_session_metadata_replaces_a_workspace_symlink() {
+        let session =
+            EditSession::create(&Project::demo(), "secure metadata", 0.0, 2.0).expect("session");
+        let trusted = session.metadata_source().expect("trusted metadata");
+        let target = session.path().join("unrelated.json");
+        fs::write(&target, r#"{"secret":"keep"}"#).expect("symlink target");
+        fs::remove_file(session.path().join(SESSION_FILE)).expect("remove metadata path");
+        std::os::unix::fs::symlink(&target, session.path().join(SESSION_FILE))
+            .expect("metadata symlink");
+
+        session
+            .update_status_from(&trusted, "failed", "safe", 0, 0)
+            .expect("safe finalization");
+        assert_eq!(
+            fs::read_to_string(target).expect("target unchanged"),
+            r#"{"secret":"keep"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(
+                &session.metadata_source().expect("restored metadata")
+            )
+            .expect("metadata JSON")["status"],
+            "failed"
+        );
     }
 
     #[test]

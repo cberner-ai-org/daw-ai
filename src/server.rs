@@ -1493,14 +1493,14 @@ impl Router {
             &edit.project,
             edit.reference_audio.clone(),
             cancellation,
-            |request| {
+            |request, deadline| {
                 self.edit_jobs.set_running(
                     job_id,
                     "rendering",
                     "Codex is rendering the requested audio section",
                 );
                 let result = render_audio_request_cancellable(request, || {
-                    render_cancellation.load(Ordering::SeqCst)
+                    render_cancellation.load(Ordering::SeqCst) || Instant::now() >= deadline
                 });
                 self.edit_jobs.set_running(
                     job_id,
