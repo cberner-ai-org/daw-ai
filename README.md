@@ -30,6 +30,12 @@ On hosts that restrict unprivileged user namespaces with AppArmor, install
 only to the installed DAW-AI executable so its per-session Codex bubblewrap
 sandbox can start without weakening the host-wide policy.
 
+The packaged unit intentionally leaves the capability bounding set at systemd's
+default while granting no ambient capabilities. DAW-AI clears its own permitted,
+effective, and inheritable capability sets before serving requests, while
+bubblewrap can obtain capabilities only inside its newly created user namespace
+to construct and then lock down the per-session filesystem.
+
 Start the studio on the charter's default port:
 
 ```sh
