@@ -200,191 +200,6 @@ pub(crate) fn render_region_with_tracks(
     )
 }
 
-pub(crate) fn render_region_builtin(
-    project: &Project,
-    track_ids: &[u64],
-    start: f32,
-    end: f32,
-) -> Result<AudioRegion, String> {
-    if !start.is_finite()
-        || !end.is_finite()
-        || start < 0.0
-        || end <= start
-        || end > project.duration
-        || end - start > MAX_REGION_SECONDS
-    {
-        return Err(format!(
-            "analysis range must be inside the project and no longer than {MAX_REGION_SECONDS} seconds"
-        ));
-    }
-    render_builtin_samples(
-        project,
-        track_ids,
-        playback_start_sample(start),
-        playback_end_sample(end),
-    )
-}
-
-pub(crate) fn render_region_builtin_with_tracks(
-    project: &Project,
-    track_ids: &[u64],
-    start: f32,
-    end: f32,
-) -> Result<AudioRegions, String> {
-    let mix = render_region_builtin(project, track_ids, start, end)?;
-    let tracks = track_ids
-        .iter()
-        .map(|track_id| {
-            render_region_builtin(project, &[*track_id], start, end)
-                .map(|region| (*track_id, region))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(AudioRegions { mix, tracks })
-}
-
-pub(crate) fn render_project_sample_range_builtin(
-    project: &Project,
-    start_sample: usize,
-    end_sample: usize,
-) -> Result<AudioRegion, String> {
-    let track_ids = project
-        .tracks
-        .iter()
-        .map(|track| track.id)
-        .collect::<Vec<_>>();
-    render_builtin_samples(project, &track_ids, start_sample, end_sample)
-}
-
-pub(crate) fn render_full_project(project: &Project, builtin: bool) -> Result<AudioRegion, String> {
-    let end = playback_end_sample(project.duration);
-    let track_ids = project
-        .tracks
-        .iter()
-        .map(|track| track.id)
-        .collect::<Vec<_>>();
-    if builtin {
-        render_builtin_samples(project, &track_ids, 0, end)
-    } else {
-        render_audio_samples(project, &track_ids, 0, end)
-    }
-}
-
-fn render_builtin_samples(
-    project: &Project,
-    track_ids: &[u64],
-    start_sample: usize,
-    end_sample: usize,
-) -> Result<AudioRegion, String> {
-    if end_sample <= start_sample {
-        return Err("audio range must contain at least one sample".to_owned());
-    }
-    let start = precise_sample_time(start_sample);
-    let end = precise_sample_time(end_sample);
-    let mut mix = vec![0.0_f32; end_sample - start_sample];
-    let mut event_onsets = Vec::new();
-    let mut audio_assets = AudioAssetCache::default();
-    for track_id in track_ids {
-        let track = project
-            .tracks
-            .iter()
-            .find(|track| track.id == *track_id)
-            .ok_or_else(|| format!("track {track_id} does not exist"))?;
-        if track.muted {
-            continue;
-        }
-        let state = TrackRenderState::new(project, track, start, end);
-        let mut rendered = vec![0.0_f32; mix.len()];
-        let beat_duration = 60.0 / f64::from(project.bpm);
-        for occurrence in &state.occurrences {
-            let onset = occurrence.time;
-            let duration = (f64::from(occurrence.duration) * beat_duration).max(0.01);
-            if onset >= start && onset < end {
-                event_onsets.push(onset as f32);
-            }
-            let note_start = midi_event_sample(onset).max(start_sample);
-            let note_end = midi_event_sample(onset + duration + 1.52).min(end_sample);
-            for sample_index in note_start..note_end {
-                let local = sample_index - start_sample;
-                let project_time = precise_sample_time(sample_index);
-                let time = project_time - onset;
-                let pitch_control = parameter_at(
-                    project,
-                    track,
-                    &state,
-                    "instrument.pitch",
-                    track.instrument.pitch,
-                    project_time,
-                );
-                let pitch = f32::from(occurrence.event.pitch) + (pitch_control - 0.5) * 24.0;
-                let frequency = 440.0 * 2.0_f32.powf((pitch - 69.0) / 12.0);
-                let attack = 0.002
-                    + parameter_at(
-                        project,
-                        track,
-                        &state,
-                        "instrument.attack",
-                        track.instrument.attack,
-                        project_time,
-                    ) * 0.5;
-                let release = 0.02
-                    + parameter_at(
-                        project,
-                        track,
-                        &state,
-                        "instrument.release",
-                        track.instrument.release,
-                        project_time,
-                    ) * 1.5;
-                let held = duration;
-                let envelope = if time < f64::from(attack) {
-                    (time / f64::from(attack)).clamp(0.0, 1.0) as f32
-                } else if time <= held {
-                    1.0
-                } else {
-                    (1.0 - ((time - held) / f64::from(release))).clamp(0.0, 1.0) as f32
-                };
-                let phase = std::f64::consts::TAU * f64::from(frequency) * time;
-                let sine = phase.sin() as f32;
-                let saw = ((phase / std::f64::consts::TAU).fract() as f32 * 2.0) - 1.0;
-                let color = parameter_at(
-                    project,
-                    track,
-                    &state,
-                    "instrument.cutoff",
-                    track.instrument.cutoff,
-                    project_time,
-                );
-                let output = parameter_at(
-                    project,
-                    track,
-                    &state,
-                    "instrument.output",
-                    track.instrument.output,
-                    project_time,
-                );
-                rendered[local] += (sine * (1.0 - color * 0.55) + saw * color * 0.35)
-                    * envelope
-                    * occurrence.velocity
-                    * output
-                    * 0.16;
-            }
-        }
-        mix_audio_clips(track, start_sample, &mut rendered, &mut audio_assets)?;
-        apply_track_gain(project, track, &state, start_sample, &mut rendered);
-        for (mixed, sample) in mix.iter_mut().zip(rendered) {
-            *mixed += sample;
-        }
-    }
-    for sample in &mut mix {
-        *sample = (*sample * 0.8).tanh();
-    }
-    Ok(AudioRegion {
-        samples: mix,
-        event_count: event_onsets.len(),
-        event_onsets,
-    })
-}
-
 pub(crate) fn render_project_region(
     project: &Project,
     start: f32,
@@ -2206,7 +2021,7 @@ mod tests {
             gain: 1.0,
             reversed: false,
         });
-        let region = render_region_builtin(&project, &[project.tracks[0].id], 0.0, 1.0)
+        let region = render_region(&project, &[project.tracks[0].id], 0.0, 1.0)
             .expect("offscreen clip render");
         assert_eq!(region.samples.len(), SAMPLE_RATE as usize);
     }
@@ -2246,51 +2061,6 @@ mod tests {
 
         assert_eq!(looped, 2);
         assert_eq!(once, 1);
-    }
-
-    #[test]
-    fn builtin_note_tail_uses_the_instrument_release_duration() {
-        let mut project = Project::demo();
-        project.bpm = 60;
-        project.duration = 2.0;
-        project.tracks.truncate(1);
-        let track = &mut project.tracks[0];
-        track.effects.clear();
-        track.modulators.clear();
-        track.routing.effect_order.clear();
-        track.instrument.release = 1.0;
-        track.clips = vec![Clip {
-            id: 9_500,
-            label: "Release test".to_owned(),
-            start: 0.0,
-            end: 2.0,
-            source_start: 0.0,
-            style: "test".to_owned(),
-            playback_mode: "loop".to_owned(),
-            loop_beats: 2.0,
-            events: vec![ClipEvent {
-                id: 9_501,
-                kind: "note".to_owned(),
-                time: 0.0,
-                duration: 0.1,
-                pitch: 60,
-                velocity: 1.0,
-            }],
-        }];
-
-        let rendered = render_project_sample_range_builtin(
-            &project,
-            0,
-            playback_sample_count(0.0, project.duration),
-        )
-        .expect("built-in release render");
-        let tail_start = playback_sample_count(0.0, 0.6);
-        let tail_end = playback_sample_count(0.0, 0.7);
-        assert!(
-            rendered.samples[tail_start..tail_end]
-                .iter()
-                .any(|sample| sample.abs() > 0.001)
-        );
     }
 
     fn instrument_parameter_at(
@@ -3054,7 +2824,7 @@ mod tests {
     }
 
     #[test]
-    fn native_effect_graph_is_rendered_only_by_surge() {
+    fn native_effect_graph_is_rendered_by_surge() {
         let mut project = Project::demo();
         let track_id = project
             .tracks
@@ -3064,8 +2834,6 @@ mod tests {
             .id;
         let surge_baseline =
             render_region(&project, &[track_id], 0.0, 2.0).expect("Surge baseline");
-        let builtin_baseline =
-            render_region_builtin(&project, &[track_id], 0.0, 2.0).expect("built-in baseline");
 
         project.tracks[1].effects.push(crate::model::Effect {
             id: 9_002,
@@ -3083,10 +2851,7 @@ mod tests {
         project.tracks[1].routing.effect_order.push(9_002);
         let surge_driven =
             render_region(&project, &[track_id], 0.0, 2.0).expect("Surge distortion");
-        let builtin_driven =
-            render_region_builtin(&project, &[track_id], 0.0, 2.0).expect("built-in distortion");
         assert!(sample_difference(&surge_driven.samples, &surge_baseline.samples) > 0.01);
-        assert_eq!(builtin_driven.samples, builtin_baseline.samples);
 
         project.tracks[1]
             .effects
@@ -3096,87 +2861,73 @@ mod tests {
             .enabled = false;
         let surge_bypassed =
             render_region(&project, &[track_id], 0.0, 2.0).expect("bypassed Surge render");
-        let builtin_bypassed = render_region_builtin(&project, &[track_id], 0.0, 2.0)
-            .expect("bypassed built-in render");
         assert_eq!(surge_bypassed.samples, surge_baseline.samples);
-        assert_eq!(builtin_bypassed.samples, builtin_baseline.samples);
     }
 
     #[test]
-    fn audio_clips_follow_track_volume_but_only_surge_effects() {
+    fn audio_clips_follow_track_volume_and_surge_effects() {
         let (mut project, path) = audio_clip_project();
         let track_id = project.tracks[0].id;
-        let render = |project: &Project, builtin| {
-            if builtin {
-                render_region_builtin(project, &[track_id], 0.0, 1.0)
-            } else {
-                render_region(project, &[track_id], 0.0, 1.0)
-            }
-            .expect("audio clip render")
+        let render = |project: &Project| {
+            render_region(project, &[track_id], 0.0, 1.0).expect("audio clip render")
         };
 
-        for builtin in [false, true] {
-            project.tracks[0].volume = 1.0;
-            project.tracks[0].effects.clear();
-            project.tracks[0].routing.effect_order.clear();
-            let full = render(&project, builtin);
-            project.tracks[0].volume = 0.25;
-            let quiet = render(&project, builtin);
-            assert!(
-                analyze(&quiet).rms < analyze(&full).rms * 0.4,
-                "track volume must attenuate audio clips in both engines"
-            );
+        project.tracks[0].volume = 1.0;
+        project.tracks[0].effects.clear();
+        project.tracks[0].routing.effect_order.clear();
+        let full = render(&project);
+        project.tracks[0].volume = 0.25;
+        let quiet = render(&project);
+        assert!(
+            analyze(&quiet).rms < analyze(&full).rms * 0.4,
+            "track volume must attenuate audio clips"
+        );
 
-            project.tracks[0].volume = 1.0;
-            project.edits.push(Edit {
-                id: 9_102,
-                operation_id: None,
-                start: 0.0,
-                end: 1.0,
-                prompt: "Fade the resample".to_owned(),
-                summary: "Automated the resample level".to_owned(),
-                action: Action::Automation {
-                    track_id,
-                    parameter: "track.volume".to_owned(),
-                    curve: "hold",
-                    points: vec![AutomationPoint {
-                        time: 0.0,
-                        value: 0.1,
-                    }],
-                    target: project.tracks[0].role,
-                },
-            });
-            let automated = render(&project, builtin);
-            assert!(
-                analyze(&automated).rms < analyze(&full).rms * 0.2,
-                "track volume automation must attenuate audio clips in both engines"
-            );
-            project.edits.clear();
+        project.tracks[0].volume = 1.0;
+        project.edits.push(Edit {
+            id: 9_102,
+            operation_id: None,
+            start: 0.0,
+            end: 1.0,
+            prompt: "Fade the resample".to_owned(),
+            summary: "Automated the resample level".to_owned(),
+            action: Action::Automation {
+                track_id,
+                parameter: "track.volume".to_owned(),
+                curve: "hold",
+                points: vec![AutomationPoint {
+                    time: 0.0,
+                    value: 0.1,
+                }],
+                target: project.tracks[0].role,
+            },
+        });
+        let automated = render(&project);
+        assert!(
+            analyze(&automated).rms < analyze(&full).rms * 0.2,
+            "track volume automation must attenuate audio clips"
+        );
+        project.edits.clear();
 
-            project.tracks[0].effects.push(crate::model::Effect {
-                id: 9_101,
-                name: "Distortion".to_owned(),
-                mix: 1.0,
-                cutoff_hz: None,
-                resonance: None,
-                enabled: true,
-                parameters: crate::model::effect_parameter_specs("Distortion")
-                    .iter()
-                    .map(|spec| (spec.name.to_owned(), spec.default))
-                    .collect(),
-                parameter_overrides: Vec::new(),
-            });
-            project.tracks[0].routing.effect_order.push(9_101);
-            let effected = render(&project, builtin);
-            if builtin {
-                assert_eq!(effected.samples, full.samples);
-            } else {
-                assert!(
-                    sample_difference(&effected.samples, &full.samples) > 0.001,
-                    "Surge effects must process audio clips"
-                );
-            }
-        }
+        project.tracks[0].effects.push(crate::model::Effect {
+            id: 9_101,
+            name: "Distortion".to_owned(),
+            mix: 1.0,
+            cutoff_hz: None,
+            resonance: None,
+            enabled: true,
+            parameters: crate::model::effect_parameter_specs("Distortion")
+                .iter()
+                .map(|spec| (spec.name.to_owned(), spec.default))
+                .collect(),
+            parameter_overrides: Vec::new(),
+        });
+        project.tracks[0].routing.effect_order.push(9_101);
+        let effected = render(&project);
+        assert!(
+            sample_difference(&effected.samples, &full.samples) > 0.001,
+            "Surge effects must process audio clips"
+        );
         std::fs::remove_file(path).expect("remove audio clip fixture");
     }
 
@@ -3571,19 +3322,5 @@ mod tests {
             .map(|(left, right)| (left - right).abs())
             .sum::<f32>()
             / left.len().max(1) as f32
-    }
-
-    #[test]
-    fn builtin_backend_renders_notes_without_custom_effects() {
-        let project = Project::demo();
-        let track_id = project.tracks[1].id;
-        let dry = render_region_builtin(&project, &[track_id], 0.0, 2.0).expect("built-in render");
-        assert!(dry.samples.iter().any(|sample| sample.abs() > 0.000_1));
-
-        let mut wet_project = project.clone();
-        wet_project.tracks[1].effects[0].mix = 1.0;
-        let wet = render_region_builtin(&wet_project, &[track_id], 0.0, 2.0)
-            .expect("built-in render with ignored effects");
-        assert_eq!(dry.samples, wet.samples);
     }
 }
