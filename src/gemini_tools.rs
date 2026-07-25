@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -27,7 +27,6 @@ const REQUEST_FILE: &str = "request.json";
 const SESSION_FILE: &str = "session.json";
 const PROGRESS_DIRECTORY: &str = "edit-progress";
 const PENDING_PROGRESS_DIRECTORY: &str = ".edit-progress.pending";
-const CODEX_PROGRESS_ACK_FILE: &str = "codex-progress-ack";
 const PROGRESS_PLAN_FILE: &str = "plan.json";
 const PROGRESS_GRAPH_FILE: &str = "project.json";
 const UNDO_GRAPH_FILE: &str = "undo-sound-graph.json";
@@ -274,19 +273,6 @@ impl EditSession {
         read_text_nofollow(&self.path.join(SESSION_FILE), 64 * 1024)
     }
 
-    pub(crate) fn identify_provider(&self, provider: &str, detail: &str) -> io::Result<()> {
-        let path = self.path.join(SESSION_FILE);
-        let source = read_text_nofollow(&path, 64 * 1024)?;
-        let mut value = serde_json::from_str::<JsonValue>(&source)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let object = value
-            .as_object_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid session record"))?;
-        object.insert("model".to_owned(), JsonValue::String(provider.to_owned()));
-        object.insert("detail".to_owned(), JsonValue::String(detail.to_owned()));
-        write_replace(&path, &value.to_string())
-    }
-
     pub(crate) fn stats(&self) -> io::Result<(usize, usize)> {
         let source = self.metadata_source()?;
         let value = serde_json::from_str::<JsonValue>(&source)
@@ -300,17 +286,6 @@ impl EditSession {
             .and_then(JsonValue::as_u64)
             .unwrap_or(0) as usize;
         Ok((applied_steps, audio_listens))
-    }
-
-    pub(crate) fn detail(&self) -> io::Result<String> {
-        let source = self.metadata_source()?;
-        let value = serde_json::from_str::<JsonValue>(&source)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        Ok(value
-            .get("detail")
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .to_owned())
     }
 
     pub(crate) fn finish(&self, plans: Vec<EditPlan>) -> Result<(EditPlan, Project), String> {
@@ -376,11 +351,6 @@ impl EditSession {
         fs::remove_dir_all(&path)
             .map_err(|error| format!("could not consume Gemini edit progress: {error}"))?;
         Ok(Some((plan, project)))
-    }
-
-    pub(crate) fn acknowledge_codex_update(&self) -> Result<(), String> {
-        write_replace(&self.path.join(CODEX_PROGRESS_ACK_FILE), "committed\n")
-            .map_err(|error| format!("could not acknowledge committed Codex update: {error}"))
     }
 }
 
@@ -455,200 +425,6 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
     ];
     tools.extend(mutation_tool_declarations());
     tools
-}
-
-pub fn run_codex_mcp(session_path: &Path) -> io::Result<()> {
-    let session = EditSession {
-        path: session_path.to_path_buf(),
-        persistent: true,
-    };
-    let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-    let mut audio_sequence = 0_usize;
-    let mut audio_listens = 0_usize;
-    let mut applied_steps = 0_usize;
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let request = match serde_json::from_str::<JsonValue>(&line) {
-            Ok(request) => request,
-            Err(_) => continue,
-        };
-        let Some(id) = request.get("id").cloned() else {
-            continue;
-        };
-        let method = request
-            .get("method")
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default();
-        let result = match method {
-            "initialize" => serde_json::json!({
-                "protocolVersion":"2025-06-18",
-                "capabilities":{"tools":{"listChanged":false}},
-                "serverInfo":{"name":"daw-ai","version":env!("CARGO_PKG_VERSION")}
-            }),
-            "tools/list" => {
-                let tools = tool_declarations()
-                    .into_iter()
-                    .map(|tool| {
-                        serde_json::json!({
-                            "name":tool["name"],
-                            "description":tool["description"],
-                            "inputSchema":tool["parameters"]
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                serde_json::json!({"tools":tools})
-            }
-            "tools/call" => {
-                let params = request.get("params").cloned().unwrap_or_default();
-                let name = params
-                    .get("name")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or_default();
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let prior_listens = audio_listens;
-                let prior_steps = applied_steps;
-                if name == AUDIO_TOOL_NAME || name == "resample_audio_region" {
-                    session.update_status(
-                        "running",
-                        "Codex is rendering the requested audio section",
-                        applied_steps,
-                        audio_listens,
-                    )?;
-                }
-                let output = codex_tool_call(
-                    &session,
-                    name,
-                    &arguments,
-                    &mut audio_sequence,
-                    &mut audio_listens,
-                    &mut applied_steps,
-                );
-                if audio_listens != prior_listens || applied_steps != prior_steps {
-                    session.update_status(
-                        "running",
-                        if audio_listens != prior_listens {
-                            "Codex rendered and received the requested audio section"
-                        } else {
-                            "Codex published a sound graph update"
-                        },
-                        applied_steps,
-                        audio_listens,
-                    )?;
-                }
-                let is_error = output.starts_with("Tool error:");
-                serde_json::json!({
-                    "content":[{"type":"text","text":output}],
-                    "isError":is_error
-                })
-            }
-            _ => serde_json::json!({}),
-        };
-        writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-        )?;
-        stdout.flush()?;
-    }
-    Ok(())
-}
-
-fn codex_tool_call(
-    session: &EditSession,
-    name: &str,
-    arguments: &JsonValue,
-    audio_sequence: &mut usize,
-    audio_listens: &mut usize,
-    applied_steps: &mut usize,
-) -> String {
-    let result = match name {
-        READ_TOOL_NAME => read_sound_graph(session.path()),
-        PRESET_TOOL_NAME => list_surge_presets(arguments),
-        INSTRUMENT_PARAMETER_TOOL_NAME => list_instrument_parameters(session.path(), arguments),
-        SOUND_TOOL_PARAMETER_TOOL_NAME => list_sound_tool_parameters(session.path(), arguments),
-        AUDIO_TOOL_NAME => prepare_audio_render(session.path(), arguments)
-            .and_then(render_audio_request)
-            .and_then(|audio| {
-                *audio_sequence += 1;
-                *audio_listens += 1;
-                let name = session
-                    .record_audio(*audio_sequence, &audio.wav)
-                    .map_err(|error| error.to_string())?;
-                Ok(format!(
-                    "This WAV contains exactly the section requested by this render_audio_region \
-call. {} Objective measurements: {} The complete WAV is directly accessible to you at this \
-absolute local path: {}. Read or analyze that file when audio evidence is useful.",
-                    audio.description,
-                    audio.measurements,
-                    session.path().join(name).display()
-                ))
-            }),
-        "resample_audio_region" => {
-            let object = arguments
-                .as_object()
-                .ok_or_else(|| "resample arguments must be an object".to_owned());
-            object.and_then(|object| {
-                let render_arguments = serde_json::json!({
-                    "tracks":object.get("sourceTracks").cloned().unwrap_or(JsonValue::String("all".to_owned())),
-                    "start":object.get("sourceStart").cloned().unwrap_or(JsonValue::Null),
-                    "end":object.get("sourceEnd").cloned().unwrap_or(JsonValue::Null)
-                });
-                let audio = prepare_audio_render(session.path(), &render_arguments)
-                    .and_then(render_audio_request)?;
-                *audio_sequence += 1;
-                let file = session
-                    .record_audio(*audio_sequence, &audio.wav)
-                    .map_err(|error| error.to_string())?;
-                let mut augmented = arguments.clone();
-                let augmented_object = augmented
-                    .as_object_mut()
-                    .expect("validated resample object");
-                augmented_object.insert(
-                    "asset".to_owned(),
-                    JsonValue::String(
-                        session.path().join(file).to_string_lossy().into_owned(),
-                    ),
-                );
-                let duration = object
-                    .get("sourceEnd")
-                    .and_then(JsonValue::as_f64)
-                    .zip(object.get("sourceStart").and_then(JsonValue::as_f64))
-                    .map(|(end, start)| end - start)
-                    .ok_or_else(|| "resample source times must be numbers".to_owned())?;
-                augmented_object.insert("sourceDuration".to_owned(), duration.into());
-                apply_codex_mutation(session, name, &augmented, applied_steps)
-            })
-        }
-        name if is_mutation_tool(name) => {
-            apply_codex_mutation(session, name, arguments, applied_steps)
-        }
-        _ => Err(format!("unknown tool {name}")),
-    };
-    result.unwrap_or_else(|error| format!("Tool error: {error}"))
-}
-
-fn apply_codex_mutation(
-    session: &EditSession,
-    name: &str,
-    arguments: &JsonValue,
-    applied_steps: &mut usize,
-) -> Result<String, String> {
-    let acknowledgement = session.path().join(CODEX_PROGRESS_ACK_FILE);
-    match fs::remove_file(&acknowledgement) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("could not prepare Codex update handoff: {error}")),
-    }
-    let message = apply_agent_mutation(session.path(), name, arguments)?;
-    while !acknowledgement.is_file() {
-        thread::sleep(Duration::from_millis(10));
-    }
-    *applied_steps += 1;
-    Ok(message)
 }
 
 fn object_schema(properties: JsonValue, required: &[&str]) -> JsonValue {
@@ -3284,75 +3060,6 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn codex_tools_share_mutations_and_return_local_audio_paths() {
-        let session =
-            EditSession::create(&Project::demo(), "Codex edit", 0.0, 2.0).expect("edit session");
-        let mut sequence = 0;
-        let mut audio_listens = 0;
-        let mut applied_steps = 0;
-        let graph = codex_tool_call(
-            &session,
-            READ_TOOL_NAME,
-            &serde_json::json!({}),
-            &mut sequence,
-            &mut audio_listens,
-            &mut applied_steps,
-        );
-        assert!(graph.contains("\"tracks\""));
-
-        let changed = thread::scope(|scope| {
-            let handoff = EditSession {
-                path: session.path().to_path_buf(),
-                persistent: true,
-            };
-            let commit = scope.spawn(move || {
-                loop {
-                    if let Some((_, project)) = handoff.take_update().expect("valid Codex update") {
-                        handoff
-                            .synchronize_project(&project)
-                            .expect("synchronize committed project");
-                        handoff
-                            .acknowledge_codex_update()
-                            .expect("acknowledge Codex update");
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-            });
-            let changed = codex_tool_call(
-                &session,
-                "set_tempo",
-                &serde_json::json!({"bpm":126}),
-                &mut sequence,
-                &mut audio_listens,
-                &mut applied_steps,
-            );
-            commit.join().expect("Codex commit handoff");
-            changed
-        });
-        assert!(changed.contains("126"));
-        assert_eq!(applied_steps, 1);
-        assert!(
-            read_sound_graph(session.path())
-                .unwrap()
-                .contains("\"bpm\":126")
-        );
-
-        let listened = codex_tool_call(
-            &session,
-            AUDIO_TOOL_NAME,
-            &serde_json::json!({"tracks":[2],"start":0,"end":0.1}),
-            &mut sequence,
-            &mut audio_listens,
-            &mut applied_steps,
-        );
-        assert!(listened.contains("exactly the section requested"));
-        assert!(listened.contains("absolute local path"));
-        assert_eq!(audio_listens, 1);
-        assert!(session.path().join("audio-001.wav").is_file());
     }
 
     #[test]

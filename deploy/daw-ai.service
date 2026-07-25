@@ -31,12 +31,15 @@ ProtectSystem=strict
 ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
 ProtectClock=true
 ProtectProc=invisible
 RestrictSUIDSGID=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 AmbientCapabilities=
+CapabilityBoundingSet=
 SystemCallArchitectures=native
 
 [Install]

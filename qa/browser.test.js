@@ -615,7 +615,6 @@ async function run() {
         })),
         debugVisible: !document.querySelector('#debug-panel').hidden && !document.querySelector('#debug-panel').inert,
         aiHidden: document.querySelector('#ai-mode-panel').hidden && document.querySelector('#ai-mode-panel').inert,
-        providers: [...document.querySelector('#ai-provider').options].map((option) => option.value),
         report: document.querySelector('#debug-report').value,
       };
     })()`);
@@ -629,36 +628,6 @@ async function run() {
       "the three chartered studio views must be exposed as tabs",
     );
     assert.equal(debugView.debugVisible && debugView.aiHidden, true, "Debug must replace the AI Mode panel");
-    assert.deepEqual(debugView.providers, ["Gemini", "Codex"], "Debug must select the AI provider");
-    await evaluate(cdp, appSession, `(() => {
-      const originalFetch = window.fetch;
-      window.fetch = (resource, options) => resource === '/api/provider' && options?.method === 'POST'
-        ? Promise.resolve(new Response(JSON.stringify({ error: 'provider unavailable' }), {
-            status: 503,
-            headers: { 'Content-Type': 'application/json' },
-          }))
-        : originalFetch(resource, options);
-      const provider = document.querySelector('#ai-provider');
-      provider.value = 'Codex';
-      provider.dispatchEvent(new Event('change'));
-      window.__restoreProviderFetch = () => { window.fetch = originalFetch; };
-    })()`);
-    await waitFor(
-      async () => evaluate(
-        cdp,
-        appSession,
-        `document.querySelector('#ai-provider').value === 'Gemini' &&
-        !document.querySelector('#ai-provider').disabled`,
-      ),
-      "failed provider selection rollback",
-    );
-    await evaluate(cdp, appSession, "window.__restoreProviderFetch()");
-    const codexProvider = await evaluate(
-      cdp,
-      appSession,
-      "fetch('/api/provider', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'provider=Codex'}).then((response) => response.json())",
-    );
-    assert.deepEqual(codexProvider, { provider: "Codex" });
     assert.match(debugView.report, /Synthetic browser failure/);
     assert.match(debugView.report, /Backend warnings and errors are written/);
     assert.match(debugView.report, /AI sessions: 0 retained locally/);
@@ -1622,7 +1591,6 @@ async function run() {
                 prompt: 'increase volume',
                 start: '4',
                 end: '8',
-                provider: 'Gemini',
               }),
             }).then((response) => response.json());
             window.__competingOperationId = accepted.operationId;

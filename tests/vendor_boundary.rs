@@ -31,9 +31,6 @@ fn vendored_surge_boundary_keeps_pins_and_patched_api() {
     assert!(service.contains("DynamicUser=yes"));
     assert!(!service.contains("User=daw-ai"));
     assert!(!service.contains("Group=daw-ai"));
-    assert!(!service.contains("LoadCredential=codex-auth"));
-    assert!(
-        read(root, "deploy/daw-ai-codex-auth.conf")
-            .contains("LoadCredential=codex-auth:/root/.codex/auth.json")
-    );
+    assert!(service.contains("CapabilityBoundingSet="));
+    assert!(!root.join("deploy/daw-ai.apparmor").exists());
 }

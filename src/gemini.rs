@@ -103,28 +103,6 @@ pub(crate) struct ReferenceAudio {
     pub(crate) bytes: Vec<u8>,
 }
 
-impl ReferenceAudio {
-    pub(crate) fn materialize_in(&self, session_path: &Path) -> std::io::Result<PathBuf> {
-        let original_extension = Path::new(&self.name)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase);
-        let extension = match (self.mime_type.as_str(), original_extension.as_deref()) {
-            ("audio/wav" | "audio/x-wav", _) => "wav",
-            ("audio/mpeg", _) => "mp3",
-            ("audio/mp4", Some("mp4")) => "mp4",
-            ("audio/mp4", _) => "m4a",
-            ("audio/ogg", Some("oga")) => "oga",
-            ("audio/ogg", _) => "ogg",
-            ("audio/flac", _) => "flac",
-            _ => "audio",
-        };
-        let path = session_path.join(format!("user-reference.{extension}"));
-        fs::write(&path, &self.bytes)?;
-        Ok(path)
-    }
-}
-
 impl GeminiPlanner {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn interpret_with_reference_audio_updates(
@@ -1711,27 +1689,6 @@ mod tests {
         assert_eq!(input[0]["content"][1]["type"], "audio");
         assert_eq!(input[0]["content"][1]["mime_type"], "audio/wav");
         assert_eq!(input[0]["content"][1]["data"], "UklGRg==");
-    }
-
-    #[test]
-    fn reference_audio_materialization_preserves_non_wav_format_safely() {
-        let session =
-            EditSession::create(&Project::demo(), "match this song", 0.0, 4.0).expect("session");
-        let reference = ReferenceAudio {
-            name: "../../Club Reference.M4A".to_owned(),
-            mime_type: "audio/mp4".to_owned(),
-            bytes: b"non-wav-audio".to_vec(),
-        };
-
-        let path = reference
-            .materialize_in(session.path())
-            .expect("materialized reference");
-
-        assert_eq!(
-            path.file_name().and_then(|name| name.to_str()),
-            Some("user-reference.m4a")
-        );
-        assert_eq!(fs::read(path).expect("reference bytes"), reference.bytes);
     }
 
     #[test]
