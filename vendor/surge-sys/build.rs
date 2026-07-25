@@ -1,4 +1,9 @@
-use std::{collections::HashSet, env::{var, var_os}, path::{Path, PathBuf}};
+use std::{
+    collections::{hash_map::DefaultHasher, HashSet},
+    env::{var, var_os},
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+};
 use bindgen::callbacks::{DiscoveredItem, DiscoveredItemId};
 use git2::{build::CheckoutBuilder, Oid};
 
@@ -187,8 +192,13 @@ endif()
         .nth(3)
         .expect("OUT_DIR does not have Cargo's expected layout")
         .to_path_buf();
+    let mut source_hasher = DefaultHasher::new();
+    var("CARGO_MANIFEST_DIR")
+        .expect("Cargo did not set CARGO_MANIFEST_DIR")
+        .hash(&mut source_hasher);
+    SURGE_REVISION.hash(&mut source_hasher);
     cmake::Config::new(src)
-        .out_dir(profile_dir.join("surge-native"))
+        .out_dir(profile_dir.join(format!("surge-native-{:016x}", source_hasher.finish())))
         .define("SURGE_SKIP_JUCE_FOR_RACK", "ON")
         .define("SURGE_SKIP_VST3", "ON")
         .define("SURGE_SKIP_ALSA", "ON")
