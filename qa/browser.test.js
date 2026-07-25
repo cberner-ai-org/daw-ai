@@ -630,6 +630,24 @@ async function run() {
     );
     assert.equal(debugView.debugVisible && debugView.aiHidden, true, "Debug must replace the AI Mode panel");
     assert.deepEqual(debugView.providers, ["Gemini", "Codex"], "Debug must select the AI provider");
+    await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      window.fetch = (resource, options) => resource === '/api/provider' && options?.method === 'POST'
+        ? Promise.resolve(new Response(JSON.stringify({ error: 'provider unavailable' }), {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' },
+          }))
+        : originalFetch(resource, options);
+      const provider = document.querySelector('#ai-provider');
+      provider.value = 'Codex';
+      provider.dispatchEvent(new Event('change'));
+      window.__restoreProviderFetch = () => { window.fetch = originalFetch; };
+    })()`);
+    await waitFor(
+      async () => evaluate(cdp, appSession, "document.querySelector('#ai-provider').value === 'Gemini'"),
+      "failed provider selection rollback",
+    );
+    await evaluate(cdp, appSession, "window.__restoreProviderFetch()");
     const codexProvider = await evaluate(
       cdp,
       appSession,

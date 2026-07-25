@@ -2309,7 +2309,7 @@ fn apply_session_retention_with(root: &Path, policy: SessionRetention) -> io::Re
     let mut sessions = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if !entry.path().is_dir() {
+        if !entry.file_type()?.is_dir() {
             continue;
         }
         let metadata_path = entry.path().join(SESSION_FILE);
@@ -2345,6 +2345,9 @@ fn apply_session_retention_with(root: &Path, policy: SessionRetention) -> io::Re
         }
         for entry in fs::read_dir(&session.path)? {
             let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                continue;
+            }
             let is_audio = entry.path().extension().and_then(|value| value.to_str()) == Some("wav");
             if is_audio {
                 let bytes = entry.metadata()?.len();
@@ -2392,7 +2395,10 @@ fn directory_bytes(path: &Path) -> io::Result<u64> {
     let mut bytes = 0_u64;
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-        let metadata = entry.metadata()?;
+        let metadata = entry.path().symlink_metadata()?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
         bytes = bytes.saturating_add(if metadata.is_dir() {
             directory_bytes(&entry.path())?
         } else {
@@ -2697,6 +2703,8 @@ mod tests {
             .expect("malformed content");
         fs::write(old.join("audio-001.wav"), vec![0_u8; 128]).expect("old audio");
         fs::write(running.join("audio-001.wav"), vec![0_u8; 128]).expect("running audio");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(".", running.join("loop")).expect("session symlink");
 
         apply_session_retention_with(
             &root,
@@ -2710,6 +2718,8 @@ mod tests {
 
         assert!(!old.exists());
         assert!(running.join("audio-001.wav").is_file());
+        #[cfg(unix)]
+        assert!(running.join("loop").symlink_metadata().is_ok());
         assert!(unknown.join("keep.txt").is_file());
         assert!(malformed.join("keep.txt").is_file());
         fs::remove_dir_all(root).expect("remove retention root");
