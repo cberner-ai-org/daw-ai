@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,7 +16,6 @@ use crate::prompt::{Action, EditPlan};
 const CODEX_TIMEOUT: Duration = Duration::from_secs(crate::gemini::EDIT_TIMEOUT_SECONDS);
 const STUDIO_CONTRACT: &str = include_str!("../gemini/STUDIO.md");
 const CODEX_APPROVAL_CONFIG: &str = "approval_policy=\"never\"";
-const SYSTEMD_SANDBOX_ENVIRONMENT: &str = "DAW_AI_CODEX_HOST_SANDBOX";
 static CODEX_HOME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct TemporaryCodexHome {
@@ -91,6 +92,17 @@ impl ChildGuard {
     }
 
     fn terminate(&mut self) {
+        #[cfg(unix)]
+        {
+            if let Ok(process_group) = i32::try_from(self.child.id()) {
+                // The child is its process-group leader, so a negative PID
+                // reaches Codex and every command or MCP server it spawned.
+                unsafe {
+                    libc::kill(-process_group, libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(not(unix))]
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -105,19 +117,10 @@ impl Drop for ChildGuard {
     }
 }
 
-fn systemd_host_sandbox_is_verified() -> bool {
-    std::env::var(SYSTEMD_SANDBOX_ENVIRONMENT).as_deref() == Ok("systemd")
-        && std::env::var_os("INVOCATION_ID").is_some_and(|value| !value.is_empty())
-        && std::env::var_os("CREDENTIALS_DIRECTORY")
-            .map(std::path::PathBuf::from)
-            .is_some_and(|path| path.starts_with("/run/credentials/") && path.is_dir())
-}
-
 fn configure_exec_command(
     command: &mut Command,
     executable: &std::path::Path,
     session_path: &std::path::Path,
-    systemd_host_sandbox: bool,
 ) {
     let mcp_command = format!(
         "mcp_servers.daw_ai.command={:?}",
@@ -146,13 +149,7 @@ fn configure_exec_command(
         .arg("--skip-git-repo-check")
         .arg("--ignore-rules")
         .arg("--sandbox")
-        .arg(if systemd_host_sandbox {
-            // The packaged unit is the security boundary; nested bubblewrap is
-            // incompatible with its namespace and capability restrictions.
-            "danger-full-access"
-        } else {
-            "workspace-write"
-        })
+        .arg("workspace-write")
         .arg("--config")
         .arg(CODEX_APPROVAL_CONFIG)
         .arg("--config")
@@ -248,12 +245,9 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                 command.env("CODEX_HOME", &home.path);
             }
             let executable = std::env::current_exe().map_err(PlannerError::Io)?;
-            configure_exec_command(
-                &mut command,
-                &executable,
-                session.path(),
-                systemd_host_sandbox_is_verified(),
-            );
+            configure_exec_command(&mut command, &executable, session.path());
+            #[cfg(unix)]
+            command.process_group(0);
             let stdout_path = session.path().join("codex-stdout.log");
             let stderr_path = session.path().join("codex-stderr.log");
             let child = command
@@ -365,7 +359,6 @@ mod tests {
             &mut command,
             std::path::Path::new("/usr/local/bin/daw-ai"),
             std::path::Path::new("/tmp/edit-session"),
-            false,
         );
         let arguments = command
             .get_args()
@@ -387,35 +380,38 @@ mod tests {
             .find(|arguments| arguments[0] == "--sandbox")
             .map(|arguments| arguments[1].as_str());
         assert_eq!(sandbox, Some("workspace-write"));
-
-        let mut systemd_command = Command::new("codex");
-        configure_exec_command(
-            &mut systemd_command,
-            std::path::Path::new("/usr/local/bin/daw-ai"),
-            std::path::Path::new("/tmp/edit-session"),
-            true,
-        );
-        let systemd_arguments = systemd_command
-            .get_args()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        let systemd_sandbox = systemd_arguments
-            .windows(2)
-            .find(|arguments| arguments[0] == "--sandbox")
-            .map(|arguments| arguments[1].as_str());
-        assert_eq!(systemd_sandbox, Some("danger-full-access"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn child_guard_terminates_and_reaps_an_unfinished_process() {
-        let child = Command::new("sleep")
-            .arg("60")
+    fn child_guard_terminates_the_complete_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let child = Command::new("sh")
+            .args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
             .spawn()
-            .expect("sleep child");
+            .expect("shell child");
         let pid = child.id();
-        drop(ChildGuard::new(child));
+        let mut child = ChildGuard::new(child);
+        let mut descendant_pid = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.child.stdout.as_mut().expect("piped stdout")),
+            &mut descendant_pid,
+        )
+        .expect("descendant pid");
+        drop(child);
 
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        let descendant_status =
+            fs::read_to_string(format!("/proc/{}/stat", descendant_pid.trim())).ok();
+        assert!(
+            descendant_status.is_none_or(|status| status
+                .rsplit_once(") ")
+                .is_some_and(|(_, process)| process.starts_with("Z "))),
+            "descendant remained running after its process group was terminated"
+        );
     }
 
     #[test]
