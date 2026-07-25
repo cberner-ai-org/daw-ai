@@ -21,6 +21,8 @@
     promptRange: document.querySelector("#prompt-range"),
     promptForm: document.querySelector("#prompt-form"),
     promptInput: document.querySelector("#prompt-input"),
+    referenceAudio: document.querySelector("#reference-audio"),
+    referenceAudioName: document.querySelector("#reference-audio-name"),
     composeButton: document.querySelector("#compose-button"),
     editProgress: document.querySelector("#edit-progress"),
     editProgressLabel: document.querySelector("#edit-progress-label"),
@@ -87,6 +89,7 @@
   const AUDIO_SEEK_DEBOUNCE_MS = 200;
   const TOAST_DISMISS_MS = 4200;
   const ERROR_TOAST_DISMISS_MS = 60_000;
+  const MAX_REFERENCE_AUDIO_BYTES = 2 * 1024 * 1024;
   const LONG_PRESS_MS = 500;
   const LONG_PRESS_MOVE_TOLERANCE_PX = 10;
   const SURGE_PRESETS = [
@@ -928,9 +931,9 @@
           ),
         ].join("")
       : "";
-    const detailedControls = Object.entries(effect.parameters)
+    const detailedParameters = Object.entries(effect.parameters)
       .filter(([parameter, value]) => !["mix", "cutoff", "resonance"].includes(parameter) && Number.isFinite(value))
-      .map(([parameter, value]) => soundRange(
+    const renderDetailed = ([parameter, value]) => soundRange(
         track,
         "effect",
         effect.id,
@@ -942,13 +945,15 @@
         "%",
         "",
         parameter.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase()),
-      ))
-      .join("");
+      );
+    const commonControls = detailedParameters.slice(0, 2).map(renderDetailed).join("");
+    const advancedControls = detailedParameters.slice(2).map(renderDetailed).join("");
     return `<div class="effect-card ${effect.enabled ? "" : "is-disabled"}">
       <div class="effect-card-heading"><span class="effect-pill"><strong>${escapeHtml(effect.name)}</strong> <b>${formatSoundValue(effect.parameters.mix, "%")}</b></span><code>#${effect.id}</code></div>
       ${soundRange(track, "effect", effect.id, effect.name, "mix", effect.parameters.mix, 0, 1, "%")}
       ${filterControls}
-      ${detailedControls}
+      ${commonControls}
+      ${advancedControls ? `<details><summary>Advanced controls</summary><div class="tool-controls">${advancedControls}</div></details>` : ""}
       <div class="tool-actions">
         ${soundToggle(track, "effect", effect.id, effect.name, effect.enabled)}
         <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} earlier`)}" ${index === 0 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.max(0, index - 1)}" data-control-key="${track.id}-routing-${effect.id}-up">&uarr;</button>
@@ -972,6 +977,7 @@
     return `<div class="modulator-card ${modulator.enabled ? "" : "is-disabled"}">
       <div class="effect-card-heading"><strong>${escapeHtml(modulator.name)}</strong><code>#${modulator.id}</code></div>
       ${modulator.enabled && modulator.trigger !== "free" ? `<div class="modulator-route"><b>${escapeHtml(state.project.tracks.find((source) => source.id === sourceTrackId)?.name ?? "Unknown source")}</b><i aria-hidden="true">${modulator.trigger.toUpperCase()} &rarr;</i><b>Modulator</b></div>` : ""}
+      <h4>Common controls</h4>
       <div class="tool-controls">
         <label class="tool-control">Shape
           <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="shape" data-control-key="${track.id}-modulator-${modulator.id}-shape" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} shape`)}">${selectOptions(["sine", "triangle", "square", "random", "envelope", "formula"], modulator.shape)}</select>
@@ -979,6 +985,12 @@
         <label class="tool-control">Target
           <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="target" data-control-key="${track.id}-modulator-${modulator.id}-target" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} target`)}">${targets.map(([value, label]) => `<option value="${value}" ${value === modulator.target ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select>
         </label>
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "rate", modulator.parameters.rate, 0.01, 20, modulator.rateMode === "tempo" ? "x/beat" : "Hz")}
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "depth", modulator.parameters.depth, 0, 1, "%")}
+      </div>
+      <details>
+        <summary>Advanced controls</summary>
+        <div class="tool-controls">
         <label class="tool-control">Rate mode
           <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="rateMode" data-control-key="${track.id}-modulator-${modulator.id}-rateMode" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} rate mode`)}">${selectOptions(["hz", "tempo"], modulator.rateMode)}</select>
         </label>
@@ -991,13 +1003,12 @@
         ${modulator.trigger === "audio" ? `<label>Polarity
           <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="polarity" data-control-key="${track.id}-modulator-${modulator.id}-polarity" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} polarity`)}">${selectOptions(["increase", "decrease"], modulator.polarity)}</select>
         </label>` : ""}
-        ${soundRange(track, "modulator", modulator.id, modulator.name, "rate", modulator.parameters.rate, 0.01, 20, modulator.rateMode === "tempo" ? "x/beat" : "Hz")}
-        ${soundRange(track, "modulator", modulator.id, modulator.name, "depth", modulator.parameters.depth, 0, 1, "%")}
         <label class="tool-control">Surge Formula (Lua)
           <textarea data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="formula" data-control-key="${track.id}-modulator-${modulator.id}-formula" aria-label="${escapeHtml(`${track.name} ${modulator.name} formula`)}">${escapeHtml(modulator.formula || "")}</textarea>
         </label>
         ${modulator.trigger === "audio" ? `${soundRange(track, "modulator", modulator.id, modulator.name, "threshold", modulator.parameters.threshold, 0, 1, "")}${soundRange(track, "modulator", modulator.id, modulator.name, "attackMs", modulator.parameters.attackMs, 0, 1000, "ms")}${soundRange(track, "modulator", modulator.id, modulator.name, "releaseMs", modulator.parameters.releaseMs, 1, 5000, "ms")}` : ""}
-      </div>
+        </div>
+      </details>
       <div class="tool-actions">${soundToggle(track, "modulator", modulator.id, modulator.name, modulator.enabled)}</div>
     </div>`;
   }
@@ -1539,6 +1550,21 @@
     return `client-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
   }
 
+  function fileAsBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.addEventListener("error", () => reject(new Error("Could not read the reference audio")));
+      reader.addEventListener("load", () => resolve(String(reader.result).split(",", 2)[1] || ""));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function clearDraftReferenceAudio() {
+    elements.referenceAudio.value = "";
+    elements.referenceAudioName.textContent =
+      "Attach a sound for Gemini to listen to and match";
+  }
+
   function readPendingEdit() {
     try {
       const serialized = window.localStorage.getItem(PENDING_EDIT_STORAGE_KEY);
@@ -1572,7 +1598,8 @@
 
   function persistPendingEdit(pending) {
     try {
-      window.localStorage.setItem(PENDING_EDIT_STORAGE_KEY, JSON.stringify(pending));
+      const { referenceAudio: _referenceAudio, ...recoverable } = pending;
+      window.localStorage.setItem(PENDING_EDIT_STORAGE_KEY, JSON.stringify(recoverable));
     } catch (error) {
       reportClientIssue("warning", error, "persisting an active edit");
     }
@@ -1903,14 +1930,20 @@
     try {
       let accepted = pending.acceptedJob;
       if (!accepted) {
+        const editBody = new URLSearchParams({
+          operation_id: clientOperationId,
+          prompt,
+          start: String(selectionStart),
+          end: String(selectionEnd),
+        });
+        if (pending.referenceAudio) {
+          editBody.set("reference_audio_name", pending.referenceAudio.name);
+          editBody.set("reference_audio_type", pending.referenceAudio.type);
+          editBody.set("reference_audio_data", pending.referenceAudio.data);
+        }
         accepted = await acceptEdit(
           clientOperationId,
-          new URLSearchParams({
-            operation_id: clientOperationId,
-            prompt,
-            start: String(selectionStart),
-            end: String(selectionEnd),
-          }),
+          editBody,
           () => {
             if (!capturePlayback) return;
             restorePlayback = audio.isActive;
@@ -1989,6 +2022,19 @@
     const submittedText = elements.promptInput.value;
     const prompt = submittedText.trim();
     if (!prompt) return;
+    let referenceAudio = null;
+    const referenceFile = elements.referenceAudio.files[0];
+    if (referenceFile) {
+      if (referenceFile.size > MAX_REFERENCE_AUDIO_BYTES) {
+        showToast("Reference audio must be 2 MB or smaller", true);
+        return;
+      }
+      referenceAudio = {
+        name: referenceFile.name,
+        type: referenceFile.type || "audio/wav",
+        data: await fileAsBase64(referenceFile),
+      };
+    }
     const pending = {
       operationId: operationId(),
       prompt,
@@ -1996,7 +2042,9 @@
       start: state.selectionStart,
       end: state.selectionEnd,
       acceptedJob: null,
+      referenceAudio,
     };
+    clearDraftReferenceAudio();
     persistPendingEdit(pending);
     await runPendingEdit(pending, true);
   }
@@ -2031,8 +2079,8 @@
       await replaceProject(
         async () => {
           adoptProject(await api("/api/reset", { method: "POST" }));
-          state.selectionStart = 8;
-          state.selectionEnd = 16;
+          state.selectionStart = 0;
+          state.selectionEnd = state.project.duration;
           renderProject();
         },
         { preservePosition: false, resumePlayback: false },
@@ -2259,6 +2307,12 @@
   elements.trackRows.addEventListener("contextmenu", keepLongPressForTimeline);
   elements.trackRows.addEventListener("keydown", handleTimelineKey);
   elements.promptForm.addEventListener("submit", submitPrompt);
+  elements.referenceAudio.addEventListener("change", () => {
+    const file = elements.referenceAudio.files[0];
+    elements.referenceAudioName.textContent = file
+      ? `${file.name} (${(file.size / 1024).toFixed(0)} KB)`
+      : "Attach a sound for Gemini to listen to and match";
+  });
   elements.playButton.addEventListener("click", () => void audio.toggle());
   elements.rewindButton.addEventListener("click", () => audio.seek(0));
   elements.undoButton.addEventListener("click", () => void undo());

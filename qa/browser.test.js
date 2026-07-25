@@ -908,9 +908,11 @@ async function run() {
     await evaluate(cdp, appSession, `(() => {
       const originalFetch = window.fetch;
       window.__refusedEditRequests = 0;
+      window.__refusedEditBody = null;
       window.fetch = function fetch(resource, options) {
         if (resource === '/api/edits') {
           window.__refusedEditRequests += 1;
+          window.__refusedEditBody = options.body.toString();
           return Promise.resolve(new Response(JSON.stringify({ error: 'Edit request refused' }), {
             status: 422,
             headers: { 'Content-Type': 'application/json' },
@@ -921,6 +923,11 @@ async function run() {
       window.__restoreFetchAfterRefusedEdit = () => {
         window.fetch = originalFetch;
       };
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(['RIFF'], 'one-shot.wav', { type: 'audio/wav' }));
+      const reference = document.querySelector('#reference-audio');
+      reference.files = transfer.files;
+      reference.dispatchEvent(new Event('change', { bubbles: true }));
       const input = document.querySelector('#prompt-input');
       input.value = 'refused edit';
       document.querySelector('#prompt-form').requestSubmit();
@@ -939,6 +946,22 @@ async function run() {
       await evaluate(cdp, appSession, "window.__refusedEditRequests"),
       1,
       "an explicit acceptance refusal must not retry for the edit execution window",
+    );
+    const refusedEditBody = await evaluate(
+      cdp,
+      appSession,
+      "Object.fromEntries(new URLSearchParams(window.__refusedEditBody))",
+    );
+    assert.equal(refusedEditBody.reference_audio_name, "one-shot.wav");
+    assert.equal(refusedEditBody.reference_audio_type, "audio/wav");
+    assert.equal(refusedEditBody.reference_audio_data, "UklGRg==");
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `({
+        count: document.querySelector('#reference-audio').files.length,
+        label: document.querySelector('#reference-audio-name').textContent,
+      })`),
+      { count: 0, label: "Attach a sound for Gemini to listen to and match" },
+      "submitting transfers attachment ownership out of the next prompt draft",
     );
     await evaluate(cdp, appSession, `(() => {
       window.__restoreFetchAfterRefusedEdit();
