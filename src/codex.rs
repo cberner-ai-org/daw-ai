@@ -388,7 +388,7 @@ fn translate_sandbox_assets_to_host(
     project: &mut Project,
     session_path: &std::path::Path,
     staged_paths: &HashMap<String, String>,
-) {
+) -> Result<(), String> {
     for clip in project
         .tracks
         .iter_mut()
@@ -399,12 +399,21 @@ fn translate_sandbox_assets_to_host(
             .find(|(_, sandbox_path)| *sandbox_path == &clip.asset)
         {
             clip.asset.clone_from(host_path);
-        } else if let Ok(relative) =
-            std::path::Path::new(&clip.asset).strip_prefix(SANDBOX_SESSION_PATH)
-        {
-            clip.asset = session_path.join(relative).to_string_lossy().into_owned();
+            continue;
         }
+        let relative = std::path::Path::new(&clip.asset)
+            .strip_prefix(SANDBOX_SESSION_PATH)
+            .map_err(|_| "Codex audio assets must be inside its session workspace".to_owned())?;
+        let mut components = relative.components();
+        let Some(std::path::Component::Normal(name)) = components.next() else {
+            return Err("Codex audio asset path is invalid".to_owned());
+        };
+        if components.next().is_some() {
+            return Err("Codex audio assets must be direct workspace files".to_owned());
+        }
+        clip.asset = session_path.join(name).to_string_lossy().into_owned();
     }
+    Ok(())
 }
 
 fn translate_host_assets_to_sandbox(
@@ -446,8 +455,20 @@ impl CodexPlanner {
         mut on_progress: impl FnMut(&str),
         mut on_update: impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     ) -> Result<GeminiEdit, PlannerError> {
+        let started = Instant::now();
+        let check_budget = || {
+            if cancellation.load(Ordering::SeqCst) {
+                Err(PlannerError::Interrupted)
+            } else if started.elapsed() >= CODEX_TIMEOUT {
+                Err(PlannerError::TimedOut)
+            } else {
+                Ok(())
+            }
+        };
+        check_budget()?;
         let session = EditSession::create_in(session_root, project, prompt, start, end)
             .map_err(PlannerError::Io)?;
+        check_budget()?;
         session
             .identify_provider("Codex CLI", "Codex session started")
             .map_err(PlannerError::Io)?;
@@ -458,6 +479,7 @@ impl CodexPlanner {
             } else {
                 session.path()
             };
+            check_budget()?;
             let initial_listening = prepare_initial_listening(
                 session.path(),
                 visible_session_path,
@@ -466,6 +488,7 @@ impl CodexPlanner {
                 &mut render_audio,
             )
             .map_err(PlannerError::Io)?;
+            check_budget()?;
             let reference_path = if let Some(reference) = reference_audio {
                 Some(
                     reference
@@ -475,14 +498,17 @@ impl CodexPlanner {
             } else {
                 None
             };
+            check_budget()?;
             let (sandbox_project, staged_paths) = if packaged {
                 stage_sandbox_assets(session.path(), project)
             } else {
                 (project.clone(), HashMap::new())
             };
+            check_budget()?;
             session
                 .synchronize_project(&sandbox_project)
                 .map_err(PlannerError::InvalidOutput)?;
+            check_budget()?;
             let instructions = format!(
                 "You are the autonomous sound-graph producer inside DAW-AI. Work only in this directory. \
 Read request.json and the contract below. Form a musical arrangement plan from the request, genre, \
@@ -530,6 +556,7 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                     .transpose()
                     .map_err(PlannerError::Io)?
             };
+            check_budget()?;
             let executable = std::env::current_exe().map_err(PlannerError::Io)?;
             #[cfg(unix)]
             let mut command = if packaged {
@@ -580,12 +607,12 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                     }
                 })?;
             let mut child = ChildGuard::new(child);
+            check_budget()?;
             child
                 .take_stdin()
                 .expect("piped Codex stdin")
                 .write_all(instructions.as_bytes())
                 .map_err(PlannerError::Io)?;
-            let started = Instant::now();
             let mut plans = Vec::new();
             let mut committed_project = project.clone();
             let mut last_detail = String::new();
@@ -612,7 +639,8 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                             &mut update,
                             session.path(),
                             &staged_paths,
-                        );
+                        )
+                        .map_err(PlannerError::InvalidOutput)?;
                     }
                     committed_project = on_update(GeminiEdit {
                         plan: plan.clone(),
@@ -692,6 +720,8 @@ mod tests {
     use crate::model::{AudioClip, Project};
     use std::fs;
     use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn codex_exec_uses_supported_approval_configuration_and_safe_default_sandbox() {
@@ -844,7 +874,8 @@ mod tests {
             gain: 1.0,
             reversed: false,
         });
-        translate_sandbox_assets_to_host(&mut sandbox_project, &session, &staged);
+        translate_sandbox_assets_to_host(&mut sandbox_project, &session, &staged)
+            .expect("valid sandbox assets");
         assert_eq!(
             sandbox_project.tracks[0].audio_clips[0].asset,
             project.tracks[0].audio_clips[0].asset
@@ -854,6 +885,11 @@ mod tests {
             session.join("audio-001.wav").to_string_lossy()
         );
 
+        sandbox_project.tracks[0].audio_clips[1].asset =
+            "/workspace/../another-session/private.wav".to_owned();
+        assert!(translate_sandbox_assets_to_host(&mut sandbox_project, &session, &staged).is_err());
+        sandbox_project.tracks[0].audio_clips[1].asset =
+            session.join("audio-001.wav").to_string_lossy().into_owned();
         translate_host_assets_to_sandbox(&mut sandbox_project, &session, &staged);
         assert_eq!(
             sandbox_project.tracks[0].audio_clips[0].asset,
@@ -864,6 +900,27 @@ mod tests {
             "/workspace/audio-001.wav"
         );
         fs::remove_dir_all(root).expect("temporary assets cleanup");
+    }
+
+    #[test]
+    fn cancelled_codex_edit_stops_before_baseline_rendering() {
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let result = super::CodexPlanner::interpret_with_updates(
+            std::path::Path::new("/unused"),
+            "test",
+            0.0,
+            1.0,
+            &Project::initial(),
+            None,
+            cancellation,
+            |_| panic!("cancelled edit rendered audio"),
+            |_| {},
+            |_| panic!("cancelled edit published an update"),
+        );
+        assert!(matches!(
+            result,
+            Err(crate::gemini::PlannerError::Interrupted)
+        ));
     }
 
     #[cfg(unix)]
