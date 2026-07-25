@@ -1,4 +1,4 @@
-use std::{collections::HashSet, env::var, path::{Path, PathBuf}};
+use std::{collections::HashSet, env::{var, var_os}, path::{Path, PathBuf}};
 use bindgen::callbacks::{DiscoveredItem, DiscoveredItemId};
 use git2::{build::CheckoutBuilder, Oid};
 
@@ -180,7 +180,15 @@ endif()
         std::fs::write(&cmake_lists, cmake.replace(rust_lua_disable, ""))
             .expect("failed to enable Surge Formula for Rust bindings");
     }
+    // Cargo gives Clippy, tests, and normal builds distinct OUT_DIR fingerprints.
+    // Keep the expensive native build at the profile level so those commands share it.
+    let profile_dir = PathBuf::from(var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("OUT_DIR does not have Cargo's expected layout")
+        .to_path_buf();
     cmake::Config::new(src)
+        .out_dir(profile_dir.join("surge-native"))
         .define("SURGE_SKIP_JUCE_FOR_RACK", "ON")
         .define("SURGE_SKIP_VST3", "ON")
         .define("SURGE_SKIP_ALSA", "ON")
