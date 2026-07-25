@@ -58,6 +58,7 @@
 
   const state = {
     project: null,
+    confirmedAiProvider: "Gemini",
     selectionStart: 8,
     selectionEnd: 16,
     dragPointer: null,
@@ -442,6 +443,7 @@
       adoptProject(await api("/api/project"));
       const provider = await api("/api/provider");
       elements.aiProvider.value = provider.provider;
+      state.confirmedAiProvider = provider.provider;
       renderProject();
     } catch (error) {
       showError(error, "loading the project");
@@ -450,6 +452,7 @@
   }
 
   async function changeAiProvider() {
+    const previousProvider = state.confirmedAiProvider;
     try {
       const response = await api("/api/provider", {
         method: "POST",
@@ -457,8 +460,10 @@
         body: new URLSearchParams({ provider: elements.aiProvider.value }),
       });
       elements.aiProvider.value = response.provider;
+      state.confirmedAiProvider = response.provider;
       showToast(`Using ${response.provider} for AI edits`);
     } catch (error) {
+      elements.aiProvider.value = previousProvider;
       showError(error, "changing the AI provider");
     }
   }
@@ -2092,7 +2097,7 @@
         submittedText,
         start: state.selectionStart,
         end: state.selectionEnd,
-        provider: elements.aiProvider.value,
+        provider: state.confirmedAiProvider,
         acceptedJob: null,
         referenceAudio,
       };

@@ -154,19 +154,15 @@ fn configure_exec_command(
         "mcp_servers.daw_ai.args=[\"--codex-mcp\",{:?}]",
         session_path.to_string_lossy()
     );
-    let mcp_environment = [
-        "DAW_AI_SURGE_PRESET_DIR",
-        "SURGE_DATA_HOME",
-        "XDG_DATA_HOME",
-    ]
-    .into_iter()
-    .filter_map(|name| {
-        std::env::var(name)
-            .ok()
-            .map(|value| format!("{name}={value:?}"))
-    })
-    .collect::<Vec<_>>()
-    .join(",");
+    let mcp_environment = ["DAW_AI_SURGE_PRESET_DIR", "SURGE_DATA_HOME"]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| format!("{name}={value:?}"))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     command
         .arg("exec")
         .arg("--ephemeral")
@@ -303,15 +299,15 @@ fn packaged_codex_command(
 
 #[cfg(unix)]
 fn configured_preset_directories() -> Vec<std::path::PathBuf> {
-    [
-        "DAW_AI_SURGE_PRESET_DIR",
-        "SURGE_DATA_HOME",
-        "XDG_DATA_HOME",
-    ]
-    .into_iter()
-    .filter_map(std::env::var_os)
-    .map(std::path::PathBuf::from)
-    .collect()
+    let mut directories = std::env::var_os("DAW_AI_SURGE_PRESET_DIR")
+        .map(std::path::PathBuf::from)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(home) = std::env::var_os("SURGE_DATA_HOME").map(std::path::PathBuf::from) {
+        directories.push(home.join("patches_factory"));
+        directories.push(home.join("resources/data/patches_factory"));
+    }
+    directories
 }
 
 fn codex_spawn_unavailable(packaged: bool) -> String {
@@ -720,6 +716,11 @@ mod tests {
             arguments
                 .iter()
                 .any(|argument| argument == "approval_policy=\"never\"")
+        );
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.contains("XDG_DATA_HOME"))
         );
         let sandbox = arguments
             .windows(2)
