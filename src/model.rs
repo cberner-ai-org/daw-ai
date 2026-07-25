@@ -394,6 +394,7 @@ pub struct Edit {
 #[derive(Clone, Debug)]
 pub struct EditOperation {
     pub operation_id: String,
+    pub source: String,
     pub status: EditOperationStatus,
     pub applied_steps: usize,
     pub initial_version: u64,
@@ -975,6 +976,7 @@ impl EditOperation {
         #[serde(rename_all = "camelCase")]
         struct PersistedEditOperation<'a> {
             operation_id: &'a str,
+            source: &'a str,
             status: &'a str,
             applied_steps: usize,
             initial_version: u64,
@@ -984,6 +986,7 @@ impl EditOperation {
 
         let persisted = PersistedEditOperation {
             operation_id: &self.operation_id,
+            source: &self.source,
             status: self.status.as_str(),
             applied_steps: self.applied_steps,
             initial_version: self.initial_version,
@@ -1440,6 +1443,7 @@ impl Studio {
         if let Some(operation_id) = operation_id {
             self.project.edit_operations.push(EditOperation {
                 operation_id,
+                source: "Gemini".to_owned(),
                 status: EditOperationStatus::Completed,
                 applied_steps: 1,
                 initial_version: self.project.version.saturating_sub(1),
@@ -1489,7 +1493,12 @@ impl Studio {
         Ok(summary)
     }
 
-    pub(crate) fn record_operation_step(&mut self, operation_id: &str, message: &str) -> bool {
+    pub(crate) fn record_operation_step(
+        &mut self,
+        operation_id: &str,
+        source: &str,
+        message: &str,
+    ) -> bool {
         if let Some(operation) = self
             .project
             .edit_operations
@@ -1505,6 +1514,7 @@ impl Studio {
         } else {
             self.project.edit_operations.push(EditOperation {
                 operation_id: operation_id.to_owned(),
+                source: source.to_owned(),
                 status: EditOperationStatus::Running,
                 applied_steps: 1,
                 initial_version: self.project.version.saturating_sub(1),

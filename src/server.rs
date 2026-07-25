@@ -1487,7 +1487,28 @@ impl Router {
             &edit.project,
             edit.reference_audio.clone(),
             cancellation,
-            render_audio_request,
+            |request| {
+                self.edit_jobs.set_running(
+                    job_id,
+                    "rendering",
+                    "Codex is rendering the requested audio section",
+                );
+                let result = render_audio_request(request);
+                self.edit_jobs.set_running(
+                    job_id,
+                    "planning",
+                    "Codex is listening to the rendered audio section",
+                );
+                result
+            },
+            |detail| {
+                let phase = if detail.contains(" is rendering ") {
+                    "rendering"
+                } else {
+                    "planning"
+                };
+                self.edit_jobs.set_running(job_id, phase, detail);
+            },
             |graph_edit| {
                 self.commit_gemini_update(
                     job_id,
@@ -1541,7 +1562,12 @@ impl Router {
                 graph_edit.plan,
             )
             .map_err(|error| PlannerError::InvalidOutput(studio_error_message(error).to_owned()))?;
-        if !candidate.record_operation_step(&edit.operation_id, &summary) {
+        let source = if edit.codex_selected {
+            "Codex"
+        } else {
+            "Gemini"
+        };
+        if !candidate.record_operation_step(&edit.operation_id, source, &summary) {
             return Err(PlannerError::InvalidOutput(
                 "could not record the published edit operation".to_owned(),
             ));
@@ -1858,9 +1884,25 @@ impl Router {
                 let (summary, source, prompt, start, end) = if index == 0 {
                     ("Initial project", "Project", None, None, None)
                 } else if let Some(edit) = edit {
+                    let source = edit
+                        .operation_id
+                        .as_ref()
+                        .and_then(|operation_id| {
+                            project
+                                .edit_operations
+                                .iter()
+                                .find(|operation| &operation.operation_id == operation_id)
+                        })
+                        .or_else(|| {
+                            project
+                                .edit_operations
+                                .iter()
+                                .find(|operation| operation.project_version == project.version)
+                        })
+                        .map_or("Gemini", |operation| operation.source.as_str());
                     (
                         edit.summary.as_str(),
-                        "Gemini",
+                        source,
                         Some(edit.prompt.as_str()),
                         Some(edit.start),
                         Some(edit.end),
@@ -3157,7 +3199,7 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
-            codex_selected: false,
+            codex_selected: true,
         };
         let plan = |preset: &str, summary: &str| EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3237,6 +3279,7 @@ mod tests {
         );
         let operation = &studio.project().edit_operations[0];
         assert_eq!(operation.operation_id, operation_id);
+        assert_eq!(operation.source, "Codex");
         assert_eq!(
             operation.status,
             crate::model::EditOperationStatus::Completed
@@ -3246,6 +3289,10 @@ mod tests {
         crate::model::Project::from_json(&studio.project().to_json())
             .expect("persistable incremental graph");
         drop(studio);
+        let history: serde_json::Value =
+            serde_json::from_str(&router.history_response().body).expect("history JSON");
+        assert_eq!(history["entries"][1]["source"], "Codex");
+        assert_eq!(history["entries"][2]["source"], "Codex");
 
         let status: serde_json::Value = serde_json::from_str(
             &router

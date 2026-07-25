@@ -172,6 +172,82 @@ fn configure_exec_command(
         .arg("-");
 }
 
+fn packaged_service() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some_and(|value| !value.is_empty())
+        && std::env::var_os("CREDENTIALS_DIRECTORY")
+            .map(std::path::PathBuf::from)
+            .is_some_and(|path| path.starts_with("/run/credentials/"))
+}
+
+#[cfg(unix)]
+fn packaged_codex_command(
+    executable: &std::path::Path,
+    session_path: &std::path::Path,
+    codex_home: Option<&TemporaryCodexHome>,
+) -> Command {
+    let mut command = Command::new("bwrap");
+    command.args([
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--share-net",
+        "--clearenv",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+        "--dir",
+        "/etc",
+        "--ro-bind",
+        "/etc/ssl",
+        "/etc/ssl",
+        "--ro-bind",
+        "/etc/resolv.conf",
+        "/etc/resolv.conf",
+        "--ro-bind",
+        "/etc/hosts",
+        "/etc/hosts",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--bind",
+    ]);
+    command
+        .arg(session_path)
+        .arg("/workspace")
+        .args(["--dir", "/codex-home"]);
+    if let Some(home) = codex_home {
+        command.args(["--bind"]).arg(&home.path).arg("/codex-home");
+    }
+    command.args([
+        "--setenv",
+        "PATH",
+        "/usr/local/bin:/usr/bin:/bin",
+        "--setenv",
+        "HOME",
+        "/workspace",
+        "--setenv",
+        "CODEX_HOME",
+        "/codex-home",
+        "--chdir",
+        "/workspace",
+        "codex",
+    ]);
+    configure_exec_command(&mut command, executable, std::path::Path::new("/workspace"));
+    command
+}
+
 fn prepare_initial_listening(
     session_path: &std::path::Path,
     start: f32,
@@ -219,6 +295,7 @@ impl CodexPlanner {
         mut render_audio: impl FnMut(
             AudioRenderRequest,
         ) -> Result<crate::gemini_tools::AudioRender, String>,
+        mut on_progress: impl FnMut(&str),
         mut on_update: impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     ) -> Result<GeminiEdit, PlannerError> {
         let session = EditSession::create_in(session_root, project, prompt, start, end)
@@ -255,7 +332,6 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                     )),
                 STUDIO_CONTRACT
             );
-            let mut command = Command::new("codex");
             let codex_home = std::env::var_os("CREDENTIALS_DIRECTORY")
                 .map(std::path::PathBuf::from)
                 .map(|directory| directory.join("codex-auth"))
@@ -263,11 +339,30 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                 .map(|credential| TemporaryCodexHome::create_in(&std::env::temp_dir(), &credential))
                 .transpose()
                 .map_err(PlannerError::Io)?;
-            if let Some(home) = codex_home.as_ref() {
-                command.env("CODEX_HOME", &home.path);
-            }
             let executable = std::env::current_exe().map_err(PlannerError::Io)?;
-            configure_exec_command(&mut command, &executable, session.path());
+            #[cfg(unix)]
+            let mut command = if packaged_service() {
+                packaged_codex_command(&executable, session.path(), codex_home.as_ref())
+            } else {
+                let mut command = Command::new("codex");
+                if let Some(home) = codex_home.as_ref() {
+                    command.env("CODEX_HOME", &home.path);
+                }
+                configure_exec_command(&mut command, &executable, session.path());
+                command
+            };
+            #[cfg(not(unix))]
+            let mut command = {
+                let mut command = Command::new("codex");
+                if let Some(home) = codex_home.as_ref() {
+                    command.env("CODEX_HOME", &home.path);
+                }
+                configure_exec_command(&mut command, &executable, session.path());
+                command
+            };
+            command
+                .env_remove("CREDENTIALS_DIRECTORY")
+                .env_remove("GEMINI_API_KEY");
             #[cfg(unix)]
             command.process_group(0);
             let stdout_path = session.path().join("codex-stdout.log");
@@ -300,6 +395,7 @@ Analyze local WAV files when useful. Finish only after the registered tools have
             let started = Instant::now();
             let mut plans = Vec::new();
             let mut committed_project = project.clone();
+            let mut last_detail = String::new();
             let status = loop {
                 if cancellation.load(Ordering::SeqCst) {
                     child.terminate();
@@ -308,6 +404,12 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                 if started.elapsed() >= CODEX_TIMEOUT {
                     child.terminate();
                     return Err(PlannerError::TimedOut);
+                }
+                if let Ok(detail) = session.detail() {
+                    if detail != last_detail {
+                        on_progress(&detail);
+                        last_detail = detail;
+                    }
                 }
                 if let Some((plan, update)) =
                     session.take_update().map_err(PlannerError::InvalidOutput)?
@@ -370,6 +472,8 @@ Analyze local WAV files when useful. Finish only after the registered tools have
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::packaged_codex_command;
     use super::{
         ChildGuard, TemporaryCodexHome, configure_exec_command, prepare_initial_listening,
     };
@@ -421,6 +525,38 @@ mod tests {
         assert!(note.contains("was unavailable:"));
         assert!(note.contains("after repairing"));
         fs::remove_dir_all(session_path).expect("temporary session cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_codex_sees_only_its_session_and_temporary_home() {
+        let command = packaged_codex_command(
+            std::path::Path::new("/usr/local/bin/daw-ai"),
+            std::path::Path::new("/var/lib/daw-ai/gemini-sessions/current"),
+            None,
+        );
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), "bwrap");
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["/var/lib/daw-ai/gemini-sessions/current", "/workspace"])
+        );
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "/var/lib/daw-ai")
+        );
+        assert!(arguments.iter().any(|argument| argument == "--clearenv"));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--cd", "/workspace"])
+        );
     }
 
     #[cfg(unix)]
