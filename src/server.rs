@@ -414,6 +414,7 @@ struct EditRequest {
     end: f32,
     project: crate::model::Project,
     reference_audio: Option<crate::gemini::ReferenceAudio>,
+    codex_selected: bool,
 }
 
 struct EditFailure {
@@ -1096,6 +1097,7 @@ impl Router {
             end,
             project,
             reference_audio,
+            codex_selected: self.codex_selected.load(Ordering::SeqCst),
         };
         let worker = self.clone();
         let spawn = thread::Builder::new()
@@ -1388,7 +1390,7 @@ impl Router {
             "The AI producer is planning, editing, and listening to the sound graph",
         );
         if matches!(&self.planner, Planner::Gemini) {
-            if self.codex_selected.load(Ordering::SeqCst) {
+            if edit.codex_selected {
                 return self.perform_codex_edit(job_id, edit);
             }
             return self.perform_gemini_edit(job_id, edit);
@@ -3155,6 +3157,7 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
+            codex_selected: false,
         };
         let plan = |preset: &str, summary: &str| EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3284,6 +3287,7 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
+            codex_selected: false,
         };
         let first_plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3417,6 +3421,7 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
+            codex_selected: false,
         };
         let plan = EditPlan {
             action: crate::prompt::Action::Configure {

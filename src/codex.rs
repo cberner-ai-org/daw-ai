@@ -172,6 +172,38 @@ fn configure_exec_command(
         .arg("-");
 }
 
+fn prepare_initial_listening(
+    session_path: &std::path::Path,
+    start: f32,
+    end: f32,
+    render_audio: &mut impl FnMut(
+        AudioRenderRequest,
+    ) -> Result<crate::gemini_tools::AudioRender, String>,
+) -> Result<String, std::io::Error> {
+    let initial_end = end.min(start + 16.0);
+    match prepare_audio_render(
+        session_path,
+        &serde_json::json!({"tracks":"all","start":start,"end":initial_end}),
+    )
+    .and_then(render_audio)
+    {
+        Ok(listening) => {
+            let listening_path = session_path.join("codex-listening.wav");
+            fs::write(&listening_path, listening.wav)?;
+            Ok(format!(
+                "The initial Surge XT WAV at {} is the all-tracks render of the requested section \
+from {start:.3} to {initial_end:.3} seconds.",
+                listening_path.display()
+            ))
+        }
+        Err(message) => Ok(format!(
+            "The initial all-tracks render of the requested section from {start:.3} to \
+{initial_end:.3} seconds was unavailable: {message}. Inspect the graph and use the listening tool \
+after repairing any render-blocking problem."
+        )),
+    }
+}
+
 pub(crate) struct CodexPlanner;
 
 impl CodexPlanner {
@@ -195,16 +227,9 @@ impl CodexPlanner {
             .identify_provider("Codex CLI", "Codex session started")
             .map_err(PlannerError::Io)?;
         let result = (|| {
-            let listening = prepare_audio_render(
-                session.path(),
-                &serde_json::json!({"tracks":"all","start":start,"end":end.min(start + 16.0)}),
-            )
-            .and_then(&mut render_audio)
-            .map_err(|message| {
-                PlannerError::Unavailable(format!("Codex listening render failed: {message}"))
-            })?;
-            let listening_path = session.path().join("codex-listening.wav");
-            fs::write(&listening_path, listening.wav).map_err(PlannerError::Io)?;
+            let initial_listening =
+                prepare_initial_listening(session.path(), start, end, &mut render_audio)
+                    .map_err(PlannerError::Io)?;
             let reference_path = if let Some(reference) = reference_audio {
                 Some(
                     reference
@@ -214,17 +239,14 @@ impl CodexPlanner {
             } else {
                 None
             };
-            let initial_end = end.min(start + 16.0);
             let instructions = format!(
                 "You are the autonomous sound-graph producer inside DAW-AI. Work only in this directory. \
 Read request.json and the contract below. Form a musical arrangement plan from the request, genre, \
 selected region, and existing composition. Use the registered daw_ai MCP tools for every graph read, \
 mutation, preset/control lookup, undo, and listening render. The render_audio_region tool saves its \
 WAV locally and returns its directly accessible absolute path, identifying the exact tracks and time \
-section requested. The initial Surge XT WAV at {} is the all-tracks render of the requested section \
-from {start:.3} to {initial_end:.3} seconds.{} \
+section requested. {initial_listening}{} \
 Analyze local WAV files when useful. Finish only after the registered tools have completed the edit.\n\n{}",
-                listening_path.display(),
                 reference_path
                     .as_ref()
                     .map_or_else(String::new, |path| format!(
@@ -348,7 +370,9 @@ Analyze local WAV files when useful. Finish only after the registered tools have
 
 #[cfg(test)]
 mod tests {
-    use super::{ChildGuard, TemporaryCodexHome, configure_exec_command};
+    use super::{
+        ChildGuard, TemporaryCodexHome, configure_exec_command, prepare_initial_listening,
+    };
     use std::fs;
     use std::process::Command;
 
@@ -380,6 +404,23 @@ mod tests {
             .find(|arguments| arguments[0] == "--sandbox")
             .map(|arguments| arguments[1].as_str());
         assert_eq!(sandbox, Some("workspace-write"));
+    }
+
+    #[test]
+    fn failed_initial_listening_does_not_block_codex_instructions() {
+        let session_path = std::env::temp_dir().join(format!(
+            "daw-ai-codex-listening-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&session_path).expect("temporary session");
+        let note = prepare_initial_listening(&session_path, 4.0, 24.0, &mut |_| {
+            Err("missing audio asset".to_owned())
+        })
+        .expect("optional listening note");
+
+        assert!(note.contains("was unavailable:"));
+        assert!(note.contains("after repairing"));
+        fs::remove_dir_all(session_path).expect("temporary session cleanup");
     }
 
     #[cfg(unix)]
