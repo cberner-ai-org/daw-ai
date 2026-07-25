@@ -84,16 +84,6 @@ impl TrackRole {
     }
 }
 
-pub(crate) const fn role_default_filter_cutoff_hz(role: TrackRole) -> f32 {
-    match role {
-        TrackRole::Drums => 3_150.0,
-        TrackRole::Bass => 420.0,
-        TrackRole::Chords => 980.0,
-        TrackRole::Lead => 1_260.0,
-        TrackRole::Texture => 1_470.0,
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Effect {
     pub id: u64,
@@ -2777,6 +2767,13 @@ fn configure_instrument(
         {
             return Err(StudioError::InvalidSoundTool);
         }
+        if let Some(graph_parameter) =
+            crate::surge::instrument_graph_parameter(&instrument.preset, native_id)
+        {
+            instrument
+                .parameter_overrides
+                .retain(|parameter| parameter != graph_parameter);
+        }
         instrument.native_overrides.insert(native_id, value);
         return Ok(());
     }
@@ -3034,7 +3031,7 @@ fn is_instrument_modulation_target(target: &str) -> bool {
     target.starts_with("instrument.") || target.starts_with("native:")
 }
 
-fn valid_modulator_configuration(
+pub(crate) fn valid_modulator_configuration(
     owner_track_id: u64,
     modulator: &Modulator,
     track_ids: &[u64],
@@ -3571,6 +3568,47 @@ mod tests {
             ),
             Err(StudioError::InvalidSoundTool)
         );
+    }
+
+    #[test]
+    fn native_parameter_edits_supersede_migrated_graph_overrides() {
+        let mut studio = Studio::new();
+        let track_id = studio.project().tracks[1].id;
+        let instrument_id = studio.project().tracks[1].instrument.id;
+        studio
+            .configure_sound_tool(track_id, "instrument", instrument_id, None, "cutoff", "0.2")
+            .expect("legacy cutoff override");
+        let native_id =
+            crate::surge::instrument_parameters(&studio.project().tracks[1].instrument.preset)
+                .iter()
+                .find(|parameter| {
+                    crate::surge::instrument_graph_parameter(
+                        &studio.project().tracks[1].instrument.preset,
+                        parameter.id,
+                    ) == Some("cutoff")
+                })
+                .expect("native cutoff")
+                .id;
+
+        studio
+            .configure_sound_tool(
+                track_id,
+                "instrument",
+                instrument_id,
+                None,
+                &format!("native:{native_id}"),
+                "0.8",
+            )
+            .expect("native cutoff override");
+
+        let instrument = &studio.project().tracks[1].instrument;
+        assert!(
+            !instrument
+                .parameter_overrides
+                .iter()
+                .any(|name| name == "cutoff")
+        );
+        assert_eq!(instrument.native_overrides.get(&native_id), Some(&0.8));
     }
 
     #[test]

@@ -1,9 +1,8 @@
 use std::{collections::HashMap, f32::consts::PI};
 
 use crate::model::{
-    Clip, ClipEvent, FILTER_CUTOFF_MAX_HZ, FILTER_CUTOFF_MIN_HZ, FILTER_RESONANCE_DEFAULT,
-    FILTER_RESONANCE_MAX, FILTER_RESONANCE_MIN, Project, Track, TrackRole,
-    role_default_filter_cutoff_hz,
+    Clip, ClipEvent, FILTER_CUTOFF_MAX_HZ, FILTER_CUTOFF_MIN_HZ, FILTER_RESONANCE_MAX,
+    FILTER_RESONANCE_MIN, Project, Track, TrackRole,
 };
 use crate::prompt::{Action, AutomationPoint};
 
@@ -14,27 +13,6 @@ const FFT_SIZE: usize = 512;
 const FFT_HOP: usize = 256;
 const MEL_BANDS: usize = 64;
 const AUTOMATION_SAMPLES: usize = SAMPLE_RATE as usize / 400;
-
-#[derive(Clone, Copy, Default)]
-struct EffectMixes {
-    low_pass: f32,
-    low_pass_cutoff: f32,
-    low_pass_resonance: f32,
-    drive: f32,
-    echo: f32,
-    reverb: f32,
-    room: f32,
-    shimmer: f32,
-    chorus: f32,
-    compression: f32,
-    filter_bypass: bool,
-    drive_amount: f32,
-    delay_time: f32,
-    reverb_decay: f32,
-    modulation_depth: f32,
-    compressor_threshold: f32,
-    output_gain: f32,
-}
 
 #[derive(Default)]
 struct AudioAssetCache {
@@ -59,29 +37,6 @@ impl AudioAssetCache {
 #[derive(Clone, Copy)]
 struct AutomationFrame {
     gain: f32,
-    effect_filter_cutoff: f32,
-    effect_filter_resonance: f32,
-    effect_filter_bypass: bool,
-    drive: f32,
-    echo: f32,
-    reverb: f32,
-    chorus: f32,
-    compression: f32,
-    delay_time: f32,
-    reverb_decay: f32,
-    modulation_depth: f32,
-    compressor_threshold: f32,
-    drive_amount: f32,
-    output_gain: f32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EffectStage {
-    Drive,
-    Echo,
-    Reverb,
-    Chorus,
-    Compression,
 }
 
 struct PatternEvent<'a> {
@@ -320,16 +275,6 @@ fn render_builtin_samples(
     start_sample: usize,
     end_sample: usize,
 ) -> Result<AudioRegion, String> {
-    render_builtin_samples_with_audio_sources(project, track_ids, start_sample, end_sample, true)
-}
-
-fn render_builtin_samples_with_audio_sources(
-    project: &Project,
-    track_ids: &[u64],
-    start_sample: usize,
-    end_sample: usize,
-    resolve_audio_inputs: bool,
-) -> Result<AudioRegion, String> {
     if end_sample <= start_sample {
         return Err("audio range must contain at least one sample".to_owned());
     }
@@ -338,32 +283,6 @@ fn render_builtin_samples_with_audio_sources(
     let mut mix = vec![0.0_f32; end_sample - start_sample];
     let mut event_onsets = Vec::new();
     let mut audio_assets = AudioAssetCache::default();
-    let audio_source_ids = track_ids
-        .iter()
-        .filter_map(|track_id| project.tracks.iter().find(|track| track.id == *track_id))
-        .flat_map(|track| &track.modulators)
-        .filter(|modulator| modulator.enabled && modulator.trigger == "audio")
-        .filter_map(|modulator| modulator.source_track_id)
-        .collect::<std::collections::HashSet<_>>();
-    let audio_sources = if resolve_audio_inputs {
-        Some(
-            audio_source_ids
-                .into_iter()
-                .map(|track_id| {
-                    render_builtin_samples_with_audio_sources(
-                        project,
-                        &[track_id],
-                        start_sample,
-                        end_sample,
-                        false,
-                    )
-                    .map(|region| (track_id, region.samples))
-                })
-                .collect::<Result<HashMap<_, _>, _>>()?,
-        )
-    } else {
-        None
-    };
     for track_id in track_ids {
         let track = project
             .tracks
@@ -373,14 +292,7 @@ fn render_builtin_samples_with_audio_sources(
         if track.muted {
             continue;
         }
-        let state = TrackRenderState::new_builtin_with_audio(
-            project,
-            track,
-            start,
-            end,
-            start_sample,
-            audio_sources.as_ref(),
-        );
+        let state = TrackRenderState::new(project, track, start, end);
         let mut rendered = vec![0.0_f32; mix.len()];
         let beat_duration = 60.0 / f64::from(project.bpm);
         for occurrence in &state.occurrences {
@@ -458,7 +370,7 @@ fn render_builtin_samples_with_audio_sources(
             }
         }
         mix_audio_clips(track, start_sample, &mut rendered, &mut audio_assets)?;
-        process_builtin_track_audio(project, track, &state, start_sample, &mut rendered);
+        apply_track_gain(project, track, &state, start_sample, &mut rendered);
         for (mixed, sample) in mix.iter_mut().zip(rendered) {
             *mixed += sample;
         }
@@ -1233,25 +1145,6 @@ impl<'a> TrackRenderState<'a> {
         )
     }
 
-    fn new_builtin_with_audio(
-        project: &'a Project,
-        track: &'a Track,
-        start: f64,
-        end: f64,
-        render_start_sample: usize,
-        audio_sources: Option<&HashMap<u64, Vec<f32>>>,
-    ) -> Self {
-        Self::new_inner(
-            project,
-            track,
-            start,
-            end,
-            render_start_sample,
-            audio_sources,
-            false,
-        )
-    }
-
     fn new_inner(
         project: &'a Project,
         track: &'a Track,
@@ -1808,145 +1701,6 @@ fn apply_track_gain(
     frames
 }
 
-fn process_builtin_track_audio(
-    project: &Project,
-    track: &Track,
-    render_state: &TrackRenderState<'_>,
-    start_sample: usize,
-    samples: &mut [f32],
-) {
-    let frames = apply_track_gain(project, track, render_state, start_sample, samples);
-    dynamic_resonant_low_pass(
-        samples,
-        &frames,
-        |frame| frame.effect_filter_cutoff,
-        |frame| frame.effect_filter_resonance,
-        |frame| frame.effect_filter_bypass,
-    );
-    for stage in effect_stages(track) {
-        match stage {
-            EffectStage::Drive => {
-                let alpha = 1.0 - (-2.0 * PI * 180.0 / SAMPLE_RATE as f32).exp();
-                let mut low = 0.0;
-                for (index, sample) in samples.iter_mut().enumerate() {
-                    let send = frames[index / AUTOMATION_SAMPLES].drive;
-                    let wet = drive_sample(
-                        *sample
-                            * send
-                            * (0.5 + frames[index / AUTOMATION_SAMPLES].drive_amount * 3.0),
-                    ) * (0.5 + frames[index / AUTOMATION_SAMPLES].output_gain);
-                    low += alpha * (wet - low);
-                    *sample += wet - low;
-                }
-            }
-            EffectStage::Echo => {
-                let delay = frames.first().map_or(30.0 / project.bpm as f32, |frame| {
-                    let beat = 60.0 / project.bpm as f32;
-                    beat * (1.0 + (frame.delay_time * 7.0).round()) / 8.0
-                });
-                dynamic_delay_mix(samples, &frames, delay, |frame| frame.echo)
-            }
-            EffectStage::Reverb => {
-                dynamic_delay_mix(samples, &frames, 0.085, |frame| {
-                    frame.reverb * (0.5 + frame.reverb_decay)
-                });
-            }
-            EffectStage::Chorus => {
-                dynamic_delay_mix(samples, &frames, 0.018, |frame| {
-                    frame.chorus * (0.5 + frame.modulation_depth)
-                });
-            }
-            EffectStage::Compression => {
-                for (index, sample) in samples.iter_mut().enumerate() {
-                    let mix = frames[index / AUTOMATION_SAMPLES].compression;
-                    let drive = 1.25
-                        + (1.0 - frames[index / AUTOMATION_SAMPLES].compressor_threshold) * 4.0;
-                    let compressed = (*sample * drive).tanh() / drive.tanh();
-                    *sample += compressed * mix;
-                }
-            }
-        }
-    }
-}
-
-fn effect_stages(track: &Track) -> Vec<EffectStage> {
-    let mut stages = track
-        .routing
-        .effect_order
-        .iter()
-        .filter_map(|effect_id| {
-            track
-                .effects
-                .iter()
-                .find(|effect| effect.id == *effect_id)
-                .and_then(|effect| effect_stage(&effect.name))
-        })
-        .fold(Vec::new(), |mut stages, stage| {
-            if !stages.contains(&stage) {
-                stages.push(stage);
-            }
-            stages
-        });
-    for stage in [
-        EffectStage::Drive,
-        EffectStage::Echo,
-        EffectStage::Reverb,
-        EffectStage::Chorus,
-        EffectStage::Compression,
-    ] {
-        if !stages.contains(&stage) {
-            stages.push(stage);
-        }
-    }
-    stages
-}
-
-fn effect_stage(name: &str) -> Option<EffectStage> {
-    let normalized = name.to_ascii_lowercase();
-    if normalized.contains("drive")
-        || normalized.contains("distortion")
-        || matches!(
-            normalized.as_str(),
-            "airwindows" | "neuron" | "chow" | "tape" | "treemonster" | "waveshaper" | "bonsai"
-        )
-    {
-        Some(EffectStage::Drive)
-    } else if normalized.contains("echo")
-        || normalized.contains("delay")
-        || matches!(normalized.as_str(), "combulator" | "nimbus")
-    {
-        Some(EffectStage::Echo)
-    } else if normalized.contains("reverb")
-        || matches!(normalized.as_str(), "room" | "shimmer" | "convolution")
-    {
-        Some(EffectStage::Reverb)
-    } else if normalized.contains("chorus")
-        || matches!(
-            normalized.as_str(),
-            "phaser"
-                | "rotary speaker"
-                | "flanger"
-                | "frequency shifter"
-                | "ring modulator"
-                | "ensemble"
-                | "resonator"
-                | "exciter"
-        )
-    {
-        Some(EffectStage::Chorus)
-    } else if normalized.contains("compressor")
-        || normalized.contains("compression")
-        || matches!(
-            normalized.as_str(),
-            "conditioner" | "eq" | "graphic eq" | "mid-side tool" | "vocoder"
-        )
-    {
-        Some(EffectStage::Compression)
-    } else {
-        None
-    }
-}
-
 fn automation_at(
     project: &Project,
     track: &Track,
@@ -1973,121 +1727,33 @@ fn automation_at(
     } else {
         0.0
     };
-    let mut effects = EffectMixes::default();
-    for effect in track.effects.iter().filter(|effect| effect.enabled) {
-        let target = format!("effect:{}.mix", effect.id);
-        apply_effect(
-            &effect.name,
-            parameter_at(project, track, render_state, &target, effect.mix, time),
-            &mut effects,
-        );
-        if let Some(cutoff_hz) = effect.cutoff_hz {
-            effects.low_pass_cutoff = parameter_at(
-                project,
-                track,
-                render_state,
-                &format!("effect:{}.cutoff", effect.id),
-                cutoff_hz,
-                time,
-            );
-        }
-        if let Some(resonance) = effect.resonance {
-            effects.low_pass_resonance = parameter_at(
-                project,
-                track,
-                render_state,
-                &format!("effect:{}.resonance", effect.id),
-                resonance,
-                time,
-            );
-        }
-        for (name, base) in &effect.parameters {
-            let value = parameter_at(
-                project,
-                track,
-                render_state,
-                &format!("effect:{}.{}", effect.id, name),
-                *base,
-                time,
-            );
-            match name.as_str() {
-                "drive" => effects.drive_amount = value,
-                "time" => effects.delay_time = value,
-                "decay" => effects.reverb_decay = value,
-                "depth" => effects.modulation_depth = value,
-                "threshold" => effects.compressor_threshold = value,
-                "output" => effects.output_gain = value,
-                _ => {}
-            }
-        }
-    }
-    let mut regional = RegionalAutomation {
-        role: track.role,
-        time,
-        gain: &mut gain,
-        effects: &mut effects,
-    };
     for edit in &project.edits {
         if time >= f64::from(edit.start) && time < f64::from(edit.end) {
-            apply_regional_automation(
+            apply_regional_gain(
                 &edit.action,
+                track.role,
+                time,
                 f64::from(edit.start),
                 f64::from(edit.end),
-                &mut regional,
+                &mut gain,
             );
         }
     }
-    let effect_filter_cutoff = if effects.low_pass <= 0.0 {
-        20_000.0
-    } else {
-        let wet_cutoff = if effects.low_pass_cutoff > 0.0 {
-            effects.low_pass_cutoff
-        } else {
-            role_default_filter_cutoff_hz(track.role)
-        }
-        .clamp(FILTER_CUTOFF_MIN_HZ, FILTER_CUTOFF_MAX_HZ);
-        20_000.0 * (wet_cutoff / 20_000.0).powf(effects.low_pass.clamp(0.0, 1.0))
-    };
-    AutomationFrame {
-        gain,
-        effect_filter_cutoff,
-        effect_filter_resonance: if effects.low_pass_resonance > 0.0 {
-            effects.low_pass_resonance
-        } else {
-            FILTER_RESONANCE_DEFAULT
-        },
-        effect_filter_bypass: effects.filter_bypass || effects.low_pass <= 0.0,
-        drive: (effects.drive * 0.75).min(0.75),
-        echo: (effects.echo * 0.55).min(0.6),
-        reverb: (effects.reverb.max(effects.room).max(effects.shimmer) * 0.7).min(0.6),
-        chorus: (effects.chorus * 0.5).min(0.5),
-        compression: (effects.compression * 0.45).min(0.5),
-        delay_time: effects.delay_time,
-        reverb_decay: effects.reverb_decay,
-        modulation_depth: effects.modulation_depth,
-        compressor_threshold: effects.compressor_threshold,
-        drive_amount: effects.drive_amount,
-        output_gain: effects.output_gain,
-    }
+    AutomationFrame { gain }
 }
 
-struct RegionalAutomation<'a> {
+fn apply_regional_gain(
+    action: &Action,
     role: TrackRole,
     time: f64,
-    gain: &'a mut f32,
-    effects: &'a mut EffectMixes,
-}
-
-fn apply_regional_automation(
-    action: &Action,
     start: f64,
     end: f64,
-    regional: &mut RegionalAutomation<'_>,
+    gain: &mut f32,
 ) {
     match action {
         Action::Compound { actions } => {
             for action in actions {
-                apply_regional_automation(action, start, end, regional);
+                apply_regional_gain(action, role, time, start, end, gain);
             }
         }
         Action::Timed {
@@ -2098,93 +1764,20 @@ fn apply_regional_automation(
             let duration = end - start;
             let scoped_start = start + duration * f64::from(*relative_start);
             let scoped_end = start + duration * f64::from(*relative_end);
-            if regional.time >= scoped_start && regional.time < scoped_end {
-                apply_regional_automation(action, scoped_start, scoped_end, regional);
+            if time >= scoped_start && time < scoped_end {
+                apply_regional_gain(action, role, time, scoped_start, scoped_end, gain);
             }
         }
-        Action::Gain { amount, target } if target_matches(*target, regional.role) => {
-            *regional.gain *= *amount;
+        Action::Gain { amount, target } if target_matches(*target, role) => {
+            *gain *= *amount;
         }
-        Action::Mute { target } if target_matches(*target, regional.role) => {
-            *regional.gain = 0.0;
-        }
-        Action::Effect { name, mix, target } if target_matches(*target, regional.role) => {
-            apply_effect(name, *mix, regional.effects);
-        }
-        Action::RemoveEffect { name, target } if target_matches(*target, regional.role) => {
-            remove_effect(name, regional.effects);
-        }
+        Action::Mute { target } if target_matches(*target, role) => *gain = 0.0,
         _ => {}
     }
 }
 
 fn target_matches(target: Option<TrackRole>, role: TrackRole) -> bool {
     target.is_none_or(|target| target == role)
-}
-
-fn apply_effect(name: &str, mix: f32, effects: &mut EffectMixes) {
-    let normalized = name.to_ascii_lowercase();
-    if normalized == "room" {
-        effects.room = effects.room.max(mix);
-    } else if normalized == "shimmer" {
-        effects.shimmer = effects.shimmer.max(mix);
-    } else {
-        match effect_stage(name) {
-            Some(EffectStage::Drive) => effects.drive = effects.drive.max(mix),
-            Some(EffectStage::Echo) => effects.echo = effects.echo.max(mix),
-            Some(EffectStage::Reverb) => effects.reverb = effects.reverb.max(mix),
-            Some(EffectStage::Chorus) => effects.chorus = effects.chorus.max(mix),
-            Some(EffectStage::Compression) => {
-                effects.compression = effects.compression.max(mix);
-            }
-            None => {}
-        }
-    }
-    if normalized.contains("low-pass")
-        || normalized.contains("low pass")
-        || normalized.contains("filter")
-    {
-        effects.low_pass = effects.low_pass.max(mix);
-        effects.filter_bypass = false;
-    }
-}
-
-fn remove_effect(name: &str, effects: &mut EffectMixes) {
-    let normalized = name.to_ascii_lowercase();
-    let remove_all = matches!(normalized.as_str(), "effect" | "effects" | "fx");
-    if normalized == "room" || remove_all {
-        effects.room = 0.0;
-    }
-    if normalized == "shimmer" || remove_all {
-        effects.shimmer = 0.0;
-    }
-    if remove_all {
-        effects.drive = 0.0;
-        effects.echo = 0.0;
-        effects.reverb = 0.0;
-        effects.chorus = 0.0;
-        effects.compression = 0.0;
-    } else {
-        match effect_stage(name) {
-            Some(EffectStage::Drive) => effects.drive = 0.0,
-            Some(EffectStage::Echo) => effects.echo = 0.0,
-            Some(EffectStage::Reverb) => effects.reverb = 0.0,
-            Some(EffectStage::Chorus) => effects.chorus = 0.0,
-            Some(EffectStage::Compression) => effects.compression = 0.0,
-            None => {}
-        }
-    }
-    if normalized.contains("compressor") || normalized.contains("compression") || remove_all {
-        effects.compression = 0.0;
-    }
-    if normalized.contains("low-pass")
-        || normalized.contains("low pass")
-        || normalized.contains("filter")
-        || (remove_all && effects.low_pass > 0.0)
-    {
-        effects.low_pass = 0.0;
-        effects.filter_bypass = true;
-    }
 }
 
 fn regional_filter_amount(project: &Project, role: TrackRole, time: f64) -> f32 {
@@ -2249,67 +1842,6 @@ fn removes_filter(name: &str) -> bool {
         || normalized.contains("low-pass")
         || normalized.contains("low pass")
         || normalized.contains("filter")
-}
-
-fn drive_sample(sample: f32) -> f32 {
-    (sample * 40.0).tanh() / 40.0_f32.tanh()
-}
-
-fn dynamic_resonant_low_pass(
-    samples: &mut [f32],
-    frames: &[AutomationFrame],
-    cutoff: impl Fn(&AutomationFrame) -> f32,
-    resonance: impl Fn(&AutomationFrame) -> f32,
-    bypass: impl Fn(&AutomationFrame) -> bool,
-) {
-    let mut state_1 = 0.0;
-    let mut state_2 = 0.0;
-    let mut coefficients = (1.0, 0.0, 0.0, 0.0, 0.0);
-    let mut active_frame = usize::MAX;
-    for (index, sample) in samples.iter_mut().enumerate() {
-        let frame_index = index / AUTOMATION_SAMPLES;
-        let frame = &frames[frame_index];
-        if frame_index != active_frame {
-            active_frame = frame_index;
-            let cutoff = cutoff(frame).clamp(20.0, SAMPLE_RATE as f32 * 0.45);
-            let resonance = resonance(frame).clamp(FILTER_RESONANCE_MIN, FILTER_RESONANCE_MAX);
-            let angular = 2.0 * PI * cutoff / SAMPLE_RATE as f32;
-            let cosine = angular.cos();
-            let alpha = angular.sin() / (2.0 * resonance);
-            let normalizer = 1.0 / (1.0 + alpha);
-            coefficients = (
-                (1.0 - cosine) * 0.5 * normalizer,
-                (1.0 - cosine) * normalizer,
-                (1.0 - cosine) * 0.5 * normalizer,
-                -2.0 * cosine * normalizer,
-                (1.0 - alpha) * normalizer,
-            );
-        }
-        let input = *sample;
-        let (b0, b1, b2, a1, a2) = coefficients;
-        let output = b0 * input + state_1;
-        state_1 = b1 * input - a1 * output + state_2;
-        state_2 = b2 * input - a2 * output;
-        if !bypass(frame) {
-            *sample = output;
-        }
-    }
-}
-
-fn dynamic_delay_mix(
-    samples: &mut [f32],
-    frames: &[AutomationFrame],
-    delay_seconds: f32,
-    mix: impl Fn(&AutomationFrame) -> f32,
-) {
-    let delay = (delay_seconds * SAMPLE_RATE as f32).round() as usize;
-    if delay == 0 || delay >= samples.len() {
-        return;
-    }
-    for index in delay..samples.len() {
-        let source = index - delay;
-        samples[index] += samples[source] * mix(&frames[source / AUTOMATION_SAMPLES]);
-    }
 }
 
 pub(crate) fn analyze(region: &AudioRegion) -> RegionAnalysis {
@@ -2677,18 +2209,6 @@ mod tests {
         let region = render_region_builtin(&project, &[project.tracks[0].id], 0.0, 1.0)
             .expect("offscreen clip render");
         assert_eq!(region.samples.len(), SAMPLE_RATE as usize);
-    }
-
-    #[test]
-    fn builtin_effect_aliases_share_their_processing_stage() {
-        let mut effects = EffectMixes::default();
-        apply_effect("Reverb 2", 0.7, &mut effects);
-        apply_effect("Spring Reverb", 0.8, &mut effects);
-        apply_effect("Phaser", 0.6, &mut effects);
-        assert_eq!(effects.reverb, 0.8);
-        assert_eq!(effects.chorus, 0.6);
-        remove_effect("Reverb 1", &mut effects);
-        assert_eq!(effects.reverb, 0.0);
     }
 
     #[test]
@@ -3149,7 +2669,6 @@ mod tests {
             .position(|track| track.role == TrackRole::Chords)
             .expect("demo chords");
         let track_id = project.tracks[track_index].id;
-        let baseline_frame = automation_frame_at(&project, &project.tracks[track_index], 1.0);
         let baseline = render_region(&project, &[track_id], 0.0, 2.0).expect("baseline render");
         project.edits.push(Edit {
             id: 9_001,
@@ -3181,10 +2700,7 @@ mod tests {
             },
         });
 
-        let active_frame = automation_frame_at(&project, &project.tracks[track_index], 1.0);
         assert!(regional_filter_amount(&project, TrackRole::Chords, 1.0) < 0.0);
-        assert!(active_frame.echo > baseline_frame.echo);
-        assert!(active_frame.reverb < baseline_frame.reverb);
         assert!(regional_rhythm(&project, TrackRole::Chords, 1.0) > 0.15);
         let active = render_region(&project, &[track_id], 0.0, 2.0).expect("regional render");
         assert!(active.event_count > baseline.event_count);
@@ -3538,7 +3054,7 @@ mod tests {
     }
 
     #[test]
-    fn one_native_effect_graph_drives_both_rendering_engines() {
+    fn native_effect_graph_is_rendered_only_by_surge() {
         let mut project = Project::demo();
         let track_id = project
             .tracks
@@ -3570,7 +3086,7 @@ mod tests {
         let builtin_driven =
             render_region_builtin(&project, &[track_id], 0.0, 2.0).expect("built-in distortion");
         assert!(sample_difference(&surge_driven.samples, &surge_baseline.samples) > 0.01);
-        assert!(sample_difference(&builtin_driven.samples, &builtin_baseline.samples) > 0.01);
+        assert_eq!(builtin_driven.samples, builtin_baseline.samples);
 
         project.tracks[1]
             .effects
@@ -3587,7 +3103,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_clips_follow_track_volume_and_effects_in_both_engines() {
+    fn audio_clips_follow_track_volume_but_only_surge_effects() {
         let (mut project, path) = audio_clip_project();
         let track_id = project.tracks[0].id;
         let render = |project: &Project, builtin| {
@@ -3652,10 +3168,14 @@ mod tests {
             });
             project.tracks[0].routing.effect_order.push(9_101);
             let effected = render(&project, builtin);
-            assert!(
-                sample_difference(&effected.samples, &full.samples) > 0.001,
-                "track effects must process audio clips in both engines"
-            );
+            if builtin {
+                assert_eq!(effected.samples, full.samples);
+            } else {
+                assert!(
+                    sample_difference(&effected.samples, &full.samples) > 0.001,
+                    "Surge effects must process audio clips"
+                );
+            }
         }
         std::fs::remove_file(path).expect("remove audio clip fixture");
     }
@@ -4020,9 +3540,6 @@ mod tests {
         };
         let baseline =
             render_region(&baseline_project, &[target_id], 0.0, 2.0).expect("baseline bass");
-        let builtin_baseline = render_region_builtin(&baseline_project, &[target_id], 0.0, 2.0)
-            .expect("built-in baseline bass");
-
         let modulator = &mut project.tracks[target_index].modulators[0];
         modulator.target = "track.volume".to_owned();
         modulator.trigger = "midi".to_owned();
@@ -4034,13 +3551,6 @@ mod tests {
             sample_difference(&midi.samples, &baseline.samples) > 0.000_01,
             "cross-track MIDI events must affect the target"
         );
-        let builtin_midi =
-            render_region_builtin(&project, &[target_id], 0.0, 2.0).expect("built-in MIDI target");
-        assert!(
-            sample_difference(&builtin_midi.samples, &builtin_baseline.samples) > 0.000_01,
-            "built-in rendering must retain native-style host modulation"
-        );
-
         let modulator = &mut project.tracks[target_index].modulators[0];
         modulator.trigger = "audio".to_owned();
         modulator.polarity = "decrease".to_owned();
@@ -4053,12 +3563,6 @@ mod tests {
             analyze(&ducked).rms < analyze(&baseline).rms,
             "source audio envelope must reduce target RMS"
         );
-        let builtin_ducked = render_region_builtin(&project, &[target_id], 0.0, 2.0)
-            .expect("built-in audio-ducked bass");
-        assert!(
-            analyze(&builtin_ducked).rms < analyze(&builtin_baseline).rms,
-            "built-in rendering must feed source audio to sidechain envelopes"
-        );
     }
 
     fn sample_difference(left: &[f32], right: &[f32]) -> f32 {
@@ -4070,7 +3574,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_backend_renders_notes_and_effect_changes() {
+    fn builtin_backend_renders_notes_without_custom_effects() {
         let project = Project::demo();
         let track_id = project.tracks[1].id;
         let dry = render_region_builtin(&project, &[track_id], 0.0, 2.0).expect("built-in render");
@@ -4079,7 +3583,7 @@ mod tests {
         let mut wet_project = project.clone();
         wet_project.tracks[1].effects[0].mix = 1.0;
         let wet = render_region_builtin(&wet_project, &[track_id], 0.0, 2.0)
-            .expect("built-in effect render");
-        assert!(sample_difference(&dry.samples, &wet.samples) > 0.000_01);
+            .expect("built-in render with ignored effects");
+        assert_eq!(dry.samples, wet.samples);
     }
 }

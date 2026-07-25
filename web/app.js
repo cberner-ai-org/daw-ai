@@ -421,11 +421,11 @@
         const overridden = Object.prototype.hasOwnProperty.call(overrides, id);
         const legacyOverridden =
           parameter.graphParameter &&
-          (track.instrument.parameterOverrides || []).includes(parameter.graphParameter);
+          (track.instrument.overrides || []).includes(parameter.graphParameter);
         parameter.value = overridden
           ? Number(overrides[id])
           : legacyOverridden
-            ? Number(track.instrument[parameter.graphParameter])
+            ? Number(track.instrument.parameters?.[parameter.graphParameter])
             : parameter.presetValue;
         parameter.overridden = overridden || legacyOverridden;
       }

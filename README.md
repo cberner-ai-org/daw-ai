@@ -2,7 +2,7 @@
 
 DAW-AI is a local, prompt-driven music studio for making music without learning a traditional DAW. Select a region of the timeline, describe the change in everyday language, and hear the arrangement update immediately.
 
-The project is a small Rust server with a responsive browser client. Surge XT renders the sound graph by default, with a custom built-in Rust backend available for debugging, and the browser only plays the resulting WAV. Prompted edits are produced by Gemini 3.6 Flash, which can hear renders made by the selected backend.
+The project is a small Rust server with a responsive browser client. Surge XT renders instruments and effects, with a dry built-in Rust instrument backend available only for debugging, and the browser only plays the resulting WAV. Prompted edits are produced by Gemini 3.6 Flash, which can hear renders made by the selected backend.
 
 ## Run it
 
