@@ -18,7 +18,7 @@ use crate::audio_stream::{
 use crate::codex::CodexPlanner;
 use crate::concurrency::Limiter;
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
-use crate::gemini_tools::render_audio_request;
+use crate::gemini_tools::{render_audio_request, render_audio_request_cancellable};
 use crate::model::{ChannelOperationAction, Project, Studio, StudioError, json_string};
 #[cfg(test)]
 use crate::project_history::{MAX_HISTORY_BYTES, load_project_history};
@@ -1484,6 +1484,7 @@ impl Router {
         let mut expected_version = edit.project.version;
         let mut published_update = false;
         let cancellation = self.edit_jobs.cancellation(job_id);
+        let render_cancellation = cancellation.clone();
         let completed = CodexPlanner::interpret_with_updates(
             &self.gemini_session_root(),
             &edit.prompt,
@@ -1498,7 +1499,9 @@ impl Router {
                     "rendering",
                     "Codex is rendering the requested audio section",
                 );
-                let result = render_audio_request(request);
+                let result = render_audio_request_cancellable(request, || {
+                    render_cancellation.load(Ordering::SeqCst)
+                });
                 self.edit_jobs.set_running(
                     job_id,
                     "planning",

@@ -181,6 +181,16 @@ pub(crate) fn render_region_with_tracks(
     start: f32,
     end: f32,
 ) -> Result<AudioRegions, String> {
+    render_region_with_tracks_cancellable(project, track_ids, start, end, || false)
+}
+
+pub(crate) fn render_region_with_tracks_cancellable(
+    project: &Project,
+    track_ids: &[u64],
+    start: f32,
+    end: f32,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<AudioRegions, String> {
     if !start.is_finite()
         || !end.is_finite()
         || start < 0.0
@@ -197,6 +207,7 @@ pub(crate) fn render_region_with_tracks(
         track_ids,
         playback_start_sample(start),
         playback_end_sample(end),
+        &mut cancelled,
     )
 }
 
@@ -261,7 +272,16 @@ fn render_tracks_samples(
     start_sample: usize,
     end_sample: usize,
 ) -> Result<AudioRegion, String> {
-    Ok(render_tracks_with_stems_samples(project, track_ids, start_sample, end_sample)?.mix)
+    Ok(
+        render_tracks_with_stems_samples(
+            project,
+            track_ids,
+            start_sample,
+            end_sample,
+            &mut || false,
+        )?
+        .mix,
+    )
 }
 
 fn render_tracks_with_stems_samples(
@@ -269,11 +289,18 @@ fn render_tracks_with_stems_samples(
     track_ids: &[u64],
     start_sample: usize,
     end_sample: usize,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<AudioRegions, String> {
     let start = sample_time(start_sample);
     let preroll_sample = playback_preroll_sample(project, start_sample);
-    let regions =
-        render_audio_samples_with_tracks(project, track_ids, preroll_sample, end_sample, true)?;
+    let regions = render_audio_samples_with_tracks(
+        project,
+        track_ids,
+        preroll_sample,
+        end_sample,
+        true,
+        cancelled,
+    )?;
     let sample_start = start_sample - preroll_sample;
     let sample_end = sample_start + end_sample - start_sample;
     let end = sample_time(end_sample);
@@ -341,7 +368,15 @@ fn render_audio_samples(
     start_sample: usize,
     end_sample: usize,
 ) -> Result<AudioRegion, String> {
-    Ok(render_audio_samples_with_tracks(project, track_ids, start_sample, end_sample, true)?.mix)
+    Ok(render_audio_samples_with_tracks(
+        project,
+        track_ids,
+        start_sample,
+        end_sample,
+        true,
+        &mut || false,
+    )?
+    .mix)
 }
 
 fn render_audio_samples_with_tracks(
@@ -350,7 +385,11 @@ fn render_audio_samples_with_tracks(
     start_sample: usize,
     end_sample: usize,
     resolve_audio_inputs: bool,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<AudioRegions, String> {
+    if cancelled() {
+        return Err("audio render interrupted".to_owned());
+    }
     if track_ids.is_empty() {
         return Err("at least one track ID is required".to_owned());
     }
@@ -380,6 +419,7 @@ fn render_audio_samples_with_tracks(
                 start_sample,
                 end_sample,
                 false,
+                cancelled,
             )?
             .tracks
             .into_iter()
@@ -390,6 +430,9 @@ fn render_audio_samples_with_tracks(
         None
     };
     for &track_id in track_ids {
+        if cancelled() {
+            return Err("audio render interrupted".to_owned());
+        }
         let track = project
             .tracks
             .iter()
@@ -3314,6 +3357,22 @@ mod tests {
             analyze(&ducked).rms < analyze(&baseline).rms,
             "source audio envelope must reduce target RMS"
         );
+    }
+
+    #[test]
+    fn cancellable_render_stops_between_tracks() {
+        let project = Project::demo();
+        let track_ids = project
+            .tracks
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>();
+        let mut checks = 0;
+        let result = render_region_with_tracks_cancellable(&project, &track_ids, 0.0, 1.0, || {
+            checks += 1;
+            checks > 1
+        });
+        assert!(matches!(result, Err(message) if message == "audio render interrupted"));
     }
 
     fn sample_difference(left: &[f32], right: &[f32]) -> f32 {

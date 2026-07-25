@@ -644,7 +644,12 @@ async function run() {
       window.__restoreProviderFetch = () => { window.fetch = originalFetch; };
     })()`);
     await waitFor(
-      async () => evaluate(cdp, appSession, "document.querySelector('#ai-provider').value === 'Gemini'"),
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.querySelector('#ai-provider').value === 'Gemini' &&
+        !document.querySelector('#ai-provider').disabled`,
+      ),
       "failed provider selection rollback",
     );
     await evaluate(cdp, appSession, "window.__restoreProviderFetch()");
@@ -656,17 +661,17 @@ async function run() {
     assert.deepEqual(codexProvider, { provider: "Codex" });
     assert.match(debugView.report, /Synthetic browser failure/);
     assert.match(debugView.report, /Backend warnings and errors are written/);
-    assert.match(debugView.report, /Gemini sessions: 0 retained locally/);
+    assert.match(debugView.report, /AI sessions: 0 retained locally/);
     assert.match(
       await evaluate(cdp, appSession, "document.querySelector('#gemini-session-list').textContent"),
-      /No Gemini sessions recorded yet/,
+      /No AI sessions recorded yet/,
     );
     const sessions = await evaluate(
       cdp,
       appSession,
       "fetch('/api/gemini-sessions').then((response) => response.json())",
     );
-    assert.deepEqual(sessions, { sessions: [] }, "Gemini sessions must be persistently listable");
+    assert.deepEqual(sessions, { sessions: [] }, "AI sessions must be persistently listable");
     await evaluate(cdp, appSession, `(() => {
       Object.defineProperty(navigator, 'clipboard', {
         configurable: true,
@@ -973,10 +978,11 @@ async function run() {
       ),
       "definitive edit-acceptance refusal",
     );
+    const refusedEditRequests = await evaluate(cdp, appSession, "window.__refusedEditRequests");
     assert.equal(
-      await evaluate(cdp, appSession, "window.__refusedEditRequests"),
+      refusedEditRequests,
       1,
-      "an explicit acceptance refusal must not retry for the edit execution window",
+      `an explicit acceptance refusal must not retry for the edit execution window (saw ${refusedEditRequests})`,
     );
     const refusedEditBody = await evaluate(
       cdp,

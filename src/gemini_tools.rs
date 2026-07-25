@@ -1850,11 +1850,19 @@ pub(crate) fn prepare_audio_render(
 }
 
 pub(crate) fn render_audio_request(request: AudioRenderRequest) -> Result<AudioRender, String> {
-    let regions = audio_analysis::render_region_with_tracks(
+    render_audio_request_cancellable(request, || false)
+}
+
+pub(crate) fn render_audio_request_cancellable(
+    request: AudioRenderRequest,
+    cancelled: impl FnMut() -> bool,
+) -> Result<AudioRender, String> {
+    let regions = audio_analysis::render_region_with_tracks_cancellable(
         &request.project,
         &request.track_ids,
         request.start,
         request.end,
+        cancelled,
     )?;
     let measurements = audio_measurements(&request, "Surge XT", &regions);
     Ok(AudioRender {

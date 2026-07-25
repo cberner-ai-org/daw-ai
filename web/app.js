@@ -66,6 +66,8 @@
     touchSelectionMode: false,
     longPress: null,
     promptPending: false,
+    promptSubmissionClaimed: false,
+    providerChangePending: false,
     activeEditJobId: null,
     interruptPending: false,
     editProgressPercent: 0,
@@ -81,6 +83,7 @@
     instrumentParameters: {},
   };
   let historyLoadQueue = Promise.resolve();
+  let providerChangeQueue = Promise.resolve();
 
   let projectMutationQueue = Promise.resolve();
   const RECONCILED_REQUEST_TIMEOUT_MS = 2000;
@@ -451,21 +454,34 @@
     }
   }
 
-  async function changeAiProvider() {
-    const previousProvider = state.confirmedAiProvider;
-    try {
-      const response = await api("/api/provider", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ provider: elements.aiProvider.value }),
+  function changeAiProvider() {
+    const requestedProvider = elements.aiProvider.value;
+    elements.aiProvider.disabled = true;
+    state.providerChangePending = true;
+    const change = providerChangeQueue.then(async () => {
+        const previousProvider = state.confirmedAiProvider;
+        try {
+          const response = await api("/api/provider", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({ provider: requestedProvider }),
+          });
+          elements.aiProvider.value = response.provider;
+          state.confirmedAiProvider = response.provider;
+          showToast(`Using ${response.provider} for AI edits`);
+        } catch (error) {
+          elements.aiProvider.value = previousProvider;
+          showError(error, "changing the AI provider");
+        }
       });
-      elements.aiProvider.value = response.provider;
-      state.confirmedAiProvider = response.provider;
-      showToast(`Using ${response.provider} for AI edits`);
-    } catch (error) {
-      elements.aiProvider.value = previousProvider;
-      showError(error, "changing the AI provider");
-    }
+    const queued = change.finally(() => {
+      if (providerChangeQueue === queued) {
+        state.providerChangePending = false;
+        elements.aiProvider.disabled = false;
+      }
+    });
+    providerChangeQueue = queued;
+    return providerChangeQueue;
   }
 
   function renderProject() {
@@ -2062,6 +2078,7 @@
       }
       return;
     }
+    if (state.promptSubmissionClaimed) return;
     const submittedText = elements.promptInput.value;
     const prompt = submittedText.trim();
     if (!prompt) return;
@@ -2079,11 +2096,13 @@
         return;
       }
     }
+    state.promptSubmissionClaimed = true;
     state.promptPending = true;
     elements.composeButton.disabled = true;
     elements.composeButton.querySelector("span").textContent = referenceFile ? "Reading audio..." : "Starting...";
     let handedOff = false;
     try {
+      if (state.providerChangePending) await providerChangeQueue;
       if (referenceFile) {
         referenceAudio = {
           name: referenceFile.name,
@@ -2113,6 +2132,8 @@
       elements.composeButton.disabled = false;
       elements.composeButton.querySelector("span").textContent = "Make change";
       showError(error, "preparing the prompted edit");
+    } finally {
+      state.promptSubmissionClaimed = false;
     }
   }
 
@@ -2230,7 +2251,7 @@
       `View: ${state.activeView}`,
       `Audio: ${audio.playbackState}; continuous stream ${audio.audioVersion ?? "not loaded"}`,
       `AI edit: ${state.promptPending ? "pending" : "idle"}`,
-      `Gemini sessions: ${state.geminiSessions.length} retained locally`,
+      `AI sessions: ${state.geminiSessions.length} retained locally`,
       `Selection: ${state.selectionStart.toFixed(1)}s - ${state.selectionEnd.toFixed(1)}s`,
     ];
     if (project) {
@@ -2242,13 +2263,13 @@
     } else {
       lines.push("Project: unavailable");
     }
-    lines.push("", "Recent Gemini sessions:");
+    lines.push("", "Recent AI sessions:");
     if (state.geminiSessions.length === 0) {
       lines.push("None found.");
     } else {
       for (const session of state.geminiSessions.slice(0, 10)) {
         lines.push(
-          `${new Date(Number(session.createdAt) || 0).toISOString()} [${session.status || "unknown"}] ` +
+          `${new Date(Number(session.createdAt) || 0).toISOString()} [${session.model || "Unknown provider"}; ${session.status || "unknown"}] ` +
             `${session.appliedSteps || 0} edit actions, ${session.audioListens || 0} listens: ${session.prompt || ""}`,
         );
       }
@@ -2268,7 +2289,7 @@
   function renderDebug() {
     elements.debugReport.value = debugReport();
     if (state.geminiSessions.length === 0) {
-      elements.geminiSessionList.innerHTML = '<div class="empty-log">No Gemini sessions recorded yet.</div>';
+      elements.geminiSessionList.innerHTML = '<div class="empty-log">No AI sessions recorded yet.</div>';
       return;
     }
     elements.geminiSessionList.innerHTML = state.geminiSessions
@@ -2276,7 +2297,7 @@
       .map(
         (session) => `<article class="gemini-session-item">
           <div><strong>${escapeHtml(new Date(Number(session.createdAt) || 0).toLocaleString())}</strong>
-          <span>${escapeHtml(session.status || "unknown")} &middot; ${Number(session.appliedSteps) || 0} actions &middot; ${Number(session.audioListens) || 0} listens</span></div>
+          <span>${escapeHtml(session.model || "Unknown provider")} &middot; ${escapeHtml(session.status || "unknown")} &middot; ${Number(session.appliedSteps) || 0} actions &middot; ${Number(session.audioListens) || 0} listens</span></div>
           <p>${escapeHtml(session.prompt || "Untitled edit")}</p>
         </article>`,
       )
@@ -2312,7 +2333,7 @@
       state.geminiSessions = Array.isArray(response.sessions) ? response.sessions : [];
       renderDebug();
     } catch (error) {
-      showError(error, "loading Gemini sessions");
+      showError(error, "loading AI sessions");
     }
   }
 
