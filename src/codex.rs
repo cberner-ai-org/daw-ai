@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -17,13 +18,18 @@ const CODEX_TIMEOUT: Duration = Duration::from_secs(crate::gemini::EDIT_TIMEOUT_
 const STUDIO_CONTRACT: &str = include_str!("../gemini/STUDIO.md");
 const CODEX_APPROVAL_CONFIG: &str = "approval_policy=\"never\"";
 static CODEX_HOME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const SANDBOX_SESSION_PATH: &str = "/workspace";
 
 struct TemporaryCodexHome {
     path: std::path::PathBuf,
 }
 
 impl TemporaryCodexHome {
-    fn create_in(root: &std::path::Path, credential: &std::path::Path) -> std::io::Result<Self> {
+    fn create_in(
+        root: &std::path::Path,
+        credential: Option<&std::path::Path>,
+        deny_commands: bool,
+    ) -> std::io::Result<Self> {
         for _ in 0..64 {
             let sequence = CODEX_HOME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = root.join(format!(
@@ -38,12 +44,29 @@ impl TemporaryCodexHome {
                             use std::os::unix::fs::PermissionsExt;
                             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
                         }
-                        let auth_path = path.join("auth.json");
-                        fs::copy(credential, &auth_path)?;
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+                        if let Some(credential) = credential {
+                            let auth_path = path.join("auth.json");
+                            fs::copy(credential, &auth_path)?;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+                            }
+                        }
+                        if deny_commands {
+                            fs::write(
+                                path.join("config.toml"),
+                                concat!(
+                                    "default_permissions = \"daw-ai\"\n",
+                                    "[permissions.daw-ai.filesystem]\n",
+                                    "\":minimal\" = \"read\"\n",
+                                    "\"/codex-home\" = \"deny\"\n",
+                                    "[permissions.daw-ai.filesystem.\":workspace_roots\"]\n",
+                                    "\".\" = \"write\"\n",
+                                    "[permissions.daw-ai.network]\n",
+                                    "enabled = false\n"
+                                ),
+                            )?;
                         }
                         Ok::<(), std::io::Error>(())
                     })();
@@ -121,6 +144,7 @@ fn configure_exec_command(
     command: &mut Command,
     executable: &std::path::Path,
     session_path: &std::path::Path,
+    workspace_sandbox: bool,
 ) {
     let mcp_command = format!(
         "mcp_servers.daw_ai.command={:?}",
@@ -148,8 +172,6 @@ fn configure_exec_command(
         .arg("--ephemeral")
         .arg("--skip-git-repo-check")
         .arg("--ignore-rules")
-        .arg("--sandbox")
-        .arg("workspace-write")
         .arg("--config")
         .arg(CODEX_APPROVAL_CONFIG)
         .arg("--config")
@@ -168,8 +190,11 @@ fn configure_exec_command(
                 .flatten(),
         )
         .arg("--cd")
-        .arg(session_path)
-        .arg("-");
+        .arg(session_path);
+    if workspace_sandbox {
+        command.arg("--sandbox").arg("workspace-write");
+    }
+    command.arg("-");
 }
 
 fn packaged_service() -> bool {
@@ -183,7 +208,7 @@ fn packaged_service() -> bool {
 fn packaged_codex_command(
     executable: &std::path::Path,
     session_path: &std::path::Path,
-    codex_home: Option<&TemporaryCodexHome>,
+    codex_home: &TemporaryCodexHome,
 ) -> Command {
     let mut command = Command::new("bwrap");
     command.args([
@@ -226,10 +251,9 @@ fn packaged_codex_command(
     command
         .arg(session_path)
         .arg("/workspace")
-        .args(["--dir", "/codex-home"]);
-    if let Some(home) = codex_home {
-        command.args(["--bind"]).arg(&home.path).arg("/codex-home");
-    }
+        .args(["--bind"])
+        .arg(&codex_home.path)
+        .arg("/codex-home");
     command.args([
         "--setenv",
         "PATH",
@@ -244,12 +268,18 @@ fn packaged_codex_command(
         "/workspace",
         "codex",
     ]);
-    configure_exec_command(&mut command, executable, std::path::Path::new("/workspace"));
+    configure_exec_command(
+        &mut command,
+        executable,
+        std::path::Path::new("/workspace"),
+        false,
+    );
     command
 }
 
 fn prepare_initial_listening(
     session_path: &std::path::Path,
+    visible_session_path: &std::path::Path,
     start: f32,
     end: f32,
     render_audio: &mut impl FnMut(
@@ -269,7 +299,7 @@ fn prepare_initial_listening(
             Ok(format!(
                 "The initial Surge XT WAV at {} is the all-tracks render of the requested section \
 from {start:.3} to {initial_end:.3} seconds.",
-                listening_path.display()
+                visible_session_path.join("codex-listening.wav").display()
             ))
         }
         Err(message) => Ok(format!(
@@ -277,6 +307,79 @@ from {start:.3} to {initial_end:.3} seconds.",
 {initial_end:.3} seconds was unavailable: {message}. Inspect the graph and use the listening tool \
 after repairing any render-blocking problem."
         )),
+    }
+}
+
+fn stage_sandbox_assets(
+    session_path: &std::path::Path,
+    project: &Project,
+) -> (Project, HashMap<String, String>) {
+    let mut sandbox_project = project.clone();
+    let mut paths: HashMap<String, String> = HashMap::new();
+    let mut sequence = 0_usize;
+    for clip in sandbox_project
+        .tracks
+        .iter_mut()
+        .flat_map(|track| &mut track.audio_clips)
+    {
+        let sandbox_path = if let Some(existing) = paths.get(&clip.asset) {
+            existing.clone()
+        } else {
+            sequence += 1;
+            let name = format!("staged-audio-{sequence:03}.wav");
+            if fs::copy(&clip.asset, session_path.join(&name)).is_err() {
+                continue;
+            }
+            let sandbox_path = format!("{SANDBOX_SESSION_PATH}/{name}");
+            paths.insert(clip.asset.clone(), sandbox_path.clone());
+            sandbox_path
+        };
+        clip.asset = sandbox_path;
+    }
+    (sandbox_project, paths)
+}
+
+fn translate_sandbox_assets_to_host(
+    project: &mut Project,
+    session_path: &std::path::Path,
+    staged_paths: &HashMap<String, String>,
+) {
+    for clip in project
+        .tracks
+        .iter_mut()
+        .flat_map(|track| &mut track.audio_clips)
+    {
+        if let Some((host_path, _)) = staged_paths
+            .iter()
+            .find(|(_, sandbox_path)| *sandbox_path == &clip.asset)
+        {
+            clip.asset.clone_from(host_path);
+        } else if let Ok(relative) =
+            std::path::Path::new(&clip.asset).strip_prefix(SANDBOX_SESSION_PATH)
+        {
+            clip.asset = session_path.join(relative).to_string_lossy().into_owned();
+        }
+    }
+}
+
+fn translate_host_assets_to_sandbox(
+    project: &mut Project,
+    session_path: &std::path::Path,
+    staged_paths: &HashMap<String, String>,
+) {
+    for clip in project
+        .tracks
+        .iter_mut()
+        .flat_map(|track| &mut track.audio_clips)
+    {
+        if let Some(sandbox_path) = staged_paths.get(&clip.asset) {
+            clip.asset.clone_from(sandbox_path);
+        } else if let Ok(relative) = std::path::Path::new(&clip.asset).strip_prefix(session_path) {
+            clip.asset = std::path::Path::new(SANDBOX_SESSION_PATH)
+                .join(relative)
+                .to_string_lossy()
+                .into_owned();
+        }
     }
 }
 
@@ -303,10 +406,21 @@ impl CodexPlanner {
         session
             .identify_provider("Codex CLI", "Codex session started")
             .map_err(PlannerError::Io)?;
+        let packaged = packaged_service();
         let result = (|| {
-            let initial_listening =
-                prepare_initial_listening(session.path(), start, end, &mut render_audio)
-                    .map_err(PlannerError::Io)?;
+            let visible_session_path = if packaged {
+                std::path::Path::new(SANDBOX_SESSION_PATH)
+            } else {
+                session.path()
+            };
+            let initial_listening = prepare_initial_listening(
+                session.path(),
+                visible_session_path,
+                start,
+                end,
+                &mut render_audio,
+            )
+            .map_err(PlannerError::Io)?;
             let reference_path = if let Some(reference) = reference_audio {
                 Some(
                     reference
@@ -316,6 +430,14 @@ impl CodexPlanner {
             } else {
                 None
             };
+            let (sandbox_project, staged_paths) = if packaged {
+                stage_sandbox_assets(session.path(), project)
+            } else {
+                (project.clone(), HashMap::new())
+            };
+            session
+                .synchronize_project(&sandbox_project)
+                .map_err(PlannerError::InvalidOutput)?;
             let instructions = format!(
                 "You are the autonomous sound-graph producer inside DAW-AI. Work only in this directory. \
 Read request.json and the contract below. Form a musical arrangement plan from the request, genre, \
@@ -324,31 +446,59 @@ mutation, preset/control lookup, undo, and listening render. The render_audio_re
 WAV locally and returns its directly accessible absolute path, identifying the exact tracks and time \
 section requested. {initial_listening}{} \
 Analyze local WAV files when useful. Finish only after the registered tools have completed the edit.\n\n{}",
-                reference_path
-                    .as_ref()
-                    .map_or_else(String::new, |path| format!(
+                reference_path.as_ref().map_or_else(String::new, |path| {
+                    let visible_path = if packaged {
+                        visible_session_path.join(path.file_name().unwrap_or_default())
+                    } else {
+                        path.clone()
+                    };
+                    format!(
                         " The user's reference audio is at {}.",
-                        path.display()
-                    )),
+                        visible_path.display()
+                    )
+                }),
                 STUDIO_CONTRACT
             );
-            let codex_home = std::env::var_os("CREDENTIALS_DIRECTORY")
+            let credential = std::env::var_os("CREDENTIALS_DIRECTORY")
                 .map(std::path::PathBuf::from)
                 .map(|directory| directory.join("codex-auth"))
-                .filter(|path| path.is_file())
-                .map(|credential| TemporaryCodexHome::create_in(&std::env::temp_dir(), &credential))
-                .transpose()
-                .map_err(PlannerError::Io)?;
+                .filter(|path| path.is_file());
+            let codex_home = if packaged {
+                Some(
+                    TemporaryCodexHome::create_in(
+                        &std::env::temp_dir(),
+                        credential.as_deref(),
+                        true,
+                    )
+                    .map_err(PlannerError::Io)?,
+                )
+            } else {
+                credential
+                    .as_deref()
+                    .map(|credential| {
+                        TemporaryCodexHome::create_in(
+                            &std::env::temp_dir(),
+                            Some(credential),
+                            false,
+                        )
+                    })
+                    .transpose()
+                    .map_err(PlannerError::Io)?
+            };
             let executable = std::env::current_exe().map_err(PlannerError::Io)?;
             #[cfg(unix)]
-            let mut command = if packaged_service() {
-                packaged_codex_command(&executable, session.path(), codex_home.as_ref())
+            let mut command = if packaged {
+                packaged_codex_command(
+                    &executable,
+                    session.path(),
+                    codex_home.as_ref().expect("packaged Codex home"),
+                )
             } else {
                 let mut command = Command::new("codex");
                 if let Some(home) = codex_home.as_ref() {
                     command.env("CODEX_HOME", &home.path);
                 }
-                configure_exec_command(&mut command, &executable, session.path());
+                configure_exec_command(&mut command, &executable, session.path(), true);
                 command
             };
             #[cfg(not(unix))]
@@ -357,7 +507,7 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                 if let Some(home) = codex_home.as_ref() {
                     command.env("CODEX_HOME", &home.path);
                 }
-                configure_exec_command(&mut command, &executable, session.path());
+                configure_exec_command(&mut command, &executable, session.path(), true);
                 command
             };
             command
@@ -411,15 +561,30 @@ Analyze local WAV files when useful. Finish only after the registered tools have
                         last_detail = detail;
                     }
                 }
-                if let Some((plan, update)) =
+                if let Some((plan, mut update)) =
                     session.take_update().map_err(PlannerError::InvalidOutput)?
                 {
+                    if packaged {
+                        translate_sandbox_assets_to_host(
+                            &mut update,
+                            session.path(),
+                            &staged_paths,
+                        );
+                    }
                     committed_project = on_update(GeminiEdit {
                         plan: plan.clone(),
                         project: update,
                     })?;
+                    let mut synchronized_project = committed_project.clone();
+                    if packaged {
+                        translate_host_assets_to_sandbox(
+                            &mut synchronized_project,
+                            session.path(),
+                            &staged_paths,
+                        );
+                    }
                     session
-                        .synchronize_project(&committed_project)
+                        .synchronize_project(&synchronized_project)
                         .map_err(PlannerError::InvalidOutput)?;
                     session
                         .acknowledge_codex_update()
@@ -476,7 +641,9 @@ mod tests {
     use super::packaged_codex_command;
     use super::{
         ChildGuard, TemporaryCodexHome, configure_exec_command, prepare_initial_listening,
+        stage_sandbox_assets, translate_host_assets_to_sandbox, translate_sandbox_assets_to_host,
     };
+    use crate::model::{AudioClip, Project};
     use std::fs;
     use std::process::Command;
 
@@ -487,6 +654,7 @@ mod tests {
             &mut command,
             std::path::Path::new("/usr/local/bin/daw-ai"),
             std::path::Path::new("/tmp/edit-session"),
+            true,
         );
         let arguments = command
             .get_args()
@@ -517,7 +685,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&session_path).expect("temporary session");
-        let note = prepare_initial_listening(&session_path, 4.0, 24.0, &mut |_| {
+        let note = prepare_initial_listening(&session_path, &session_path, 4.0, 24.0, &mut |_| {
             Err("missing audio asset".to_owned())
         })
         .expect("optional listening note");
@@ -530,10 +698,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn packaged_codex_sees_only_its_session_and_temporary_home() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-packaged-codex-home-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("temporary root");
+        let home = TemporaryCodexHome::create_in(&root, None, true).expect("temporary Codex home");
         let command = packaged_codex_command(
             std::path::Path::new("/usr/local/bin/daw-ai"),
             std::path::Path::new("/var/lib/daw-ai/gemini-sessions/current"),
-            None,
+            &home,
         );
         let arguments = command
             .get_args()
@@ -552,11 +726,75 @@ mod tests {
                 .any(|argument| argument == "/var/lib/daw-ai")
         );
         assert!(arguments.iter().any(|argument| argument == "--clearenv"));
+        assert!(!arguments.iter().any(|argument| argument == "--sandbox"));
         assert!(
             arguments
                 .windows(2)
                 .any(|pair| pair == ["--cd", "/workspace"])
         );
+        let config = fs::read_to_string(home.path.join("config.toml")).expect("permission profile");
+        assert!(config.contains("\"/codex-home\" = \"deny\""));
+        drop(home);
+        fs::remove_dir_all(root).expect("temporary root cleanup");
+    }
+
+    #[test]
+    fn packaged_audio_paths_round_trip_between_host_and_sandbox() {
+        let root =
+            std::env::temp_dir().join(format!("daw-ai-codex-assets-test-{}", std::process::id()));
+        let session = root.join("session");
+        fs::create_dir_all(&session).expect("temporary session");
+        let existing = root.join("existing.wav");
+        fs::write(&existing, b"existing audio").expect("existing audio");
+        let mut project = Project::initial();
+        project.tracks[0].audio_clips.push(AudioClip {
+            id: 900,
+            label: "Existing".to_owned(),
+            start: 0.0,
+            end: 1.0,
+            asset: existing.to_string_lossy().into_owned(),
+            source_offset: 0.0,
+            source_duration: 1.0,
+            gain: 1.0,
+            reversed: false,
+        });
+
+        let (mut sandbox_project, staged) = stage_sandbox_assets(&session, &project);
+        assert_eq!(
+            sandbox_project.tracks[0].audio_clips[0].asset,
+            "/workspace/staged-audio-001.wav"
+        );
+        sandbox_project.tracks[0].audio_clips.push(AudioClip {
+            id: 901,
+            label: "Resampled".to_owned(),
+            start: 1.0,
+            end: 2.0,
+            asset: "/workspace/audio-001.wav".to_owned(),
+            source_offset: 0.0,
+            source_duration: 1.0,
+            gain: 1.0,
+            reversed: false,
+        });
+        translate_sandbox_assets_to_host(&mut sandbox_project, &session, &staged);
+        assert_eq!(
+            sandbox_project.tracks[0].audio_clips[0].asset,
+            project.tracks[0].audio_clips[0].asset
+        );
+        assert_eq!(
+            sandbox_project.tracks[0].audio_clips[1].asset,
+            session.join("audio-001.wav").to_string_lossy()
+        );
+
+        translate_host_assets_to_sandbox(&mut sandbox_project, &session, &staged);
+        assert_eq!(
+            sandbox_project.tracks[0].audio_clips[0].asset,
+            "/workspace/staged-audio-001.wav"
+        );
+        assert_eq!(
+            sandbox_project.tracks[0].audio_clips[1].asset,
+            "/workspace/audio-001.wav"
+        );
+        fs::remove_dir_all(root).expect("temporary assets cleanup");
     }
 
     #[cfg(unix)]
@@ -600,8 +838,8 @@ mod tests {
         fs::write(&credential, b"secret").expect("source credential");
 
         let home_path = {
-            let home =
-                TemporaryCodexHome::create_in(&root, &credential).expect("temporary Codex home");
+            let home = TemporaryCodexHome::create_in(&root, Some(&credential), false)
+                .expect("temporary Codex home");
             assert_eq!(
                 fs::read(home.path.join("auth.json")).expect("credential copy"),
                 b"secret"
