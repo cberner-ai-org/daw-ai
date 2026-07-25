@@ -909,10 +909,14 @@ async function run() {
       const originalFetch = window.fetch;
       window.__refusedEditRequests = 0;
       window.__refusedEditBody = null;
+      window.__persistedReferenceAtRequest = null;
       window.fetch = function fetch(resource, options) {
         if (resource === '/api/edits') {
           window.__refusedEditRequests += 1;
           window.__refusedEditBody = options.body.toString();
+          window.__persistedReferenceAtRequest = JSON.parse(
+            localStorage.getItem('daw-ai.pending-edit.v1'),
+          ).referenceAudio;
           return Promise.resolve(new Response(JSON.stringify({ error: 'Edit request refused' }), {
             status: 422,
             headers: { 'Content-Type': 'application/json' },
@@ -924,12 +928,13 @@ async function run() {
         window.fetch = originalFetch;
       };
       const transfer = new DataTransfer();
-      transfer.items.add(new File(['RIFF'], 'one-shot.wav', { type: 'audio/wav' }));
+      transfer.items.add(new File(['RIFF'], 'one-shot.wav'));
       const reference = document.querySelector('#reference-audio');
       reference.files = transfer.files;
       reference.dispatchEvent(new Event('change', { bubbles: true }));
       const input = document.querySelector('#prompt-input');
       input.value = 'refused edit';
+      document.querySelector('#prompt-form').requestSubmit();
       document.querySelector('#prompt-form').requestSubmit();
     })()`);
     await waitFor(
@@ -955,6 +960,11 @@ async function run() {
     assert.equal(refusedEditBody.reference_audio_name, "one-shot.wav");
     assert.equal(refusedEditBody.reference_audio_type, "audio/wav");
     assert.equal(refusedEditBody.reference_audio_data, "UklGRg==");
+    assert.deepEqual(
+      await evaluate(cdp, appSession, "window.__persistedReferenceAtRequest"),
+      { name: "one-shot.wav", type: "audio/wav", data: "UklGRg==" },
+      "an unaccepted edit must retain its reference audio for reload recovery",
+    );
     assert.deepEqual(
       await evaluate(cdp, appSession, `({
         count: document.querySelector('#reference-audio').files.length,
@@ -2372,6 +2382,7 @@ async function run() {
       "loaded native parameters must appear as exact modulator targets",
     );
     await evaluate(cdp, appSession, `(() => {
+      document.querySelector('[data-advanced-controls="modulator:250"]').open = true;
       const target = document.querySelector(
         '[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"]',
       );
@@ -2382,6 +2393,11 @@ async function run() {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
       return project.tracks[1].modulators[0].target === nativeParameter;
     }, "persisted discovered native modulation target");
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('[data-advanced-controls=\"modulator:250\"]').open"),
+      true,
+      "advanced modulator controls must remain expanded after an update",
+    );
     assert.equal(
       await evaluate(cdp, appSession, `document.querySelector(
         '[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"]',

@@ -362,7 +362,7 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             SOUND_TOOL_PARAMETER_TOOL_NAME,
-            "Discover the editable controls for one effect or modulator. Use common for the primary musical controls and advanced for routing, envelope, formula, and secondary controls. Apply a returned parameter with set_parameter.",
+            "Discover the editable controls for one effect or modulator. Use common for the primary musical controls and advanced for routing, envelope, formula, and secondary controls. Apply ordinary results with set_parameter; apply modulator formula source with update_modulator so the full 8192-character value is accepted.",
             object_schema(
                 serde_json::json!({
                     "trackId":{"type":"integer","minimum":1},
@@ -866,7 +866,7 @@ pub(crate) fn list_sound_tool_parameters(
                 serde_json::json!({"parameter":"threshold","name":"Threshold","value":modulator.threshold,"minimum":0,"maximum":1,"common":false}),
                 serde_json::json!({"parameter":"attackMs","name":"Attack","value":modulator.attack_ms,"minimum":0,"maximum":1000,"unit":"ms","common":false}),
                 serde_json::json!({"parameter":"releaseMs","name":"Release","value":modulator.release_ms,"minimum":1,"maximum":5000,"unit":"ms","common":false}),
-                serde_json::json!({"parameter":"formula","name":"Surge Formula (Lua)","value":modulator.formula,"maximumLength":8192,"common":false}),
+                serde_json::json!({"parameter":"formula","name":"Surge Formula (Lua)","value":modulator.formula,"maximumLength":8192,"mutationTool":"update_modulator","common":false}),
             ]
         }
         _ => return Err("tool must be effect or modulator".to_owned()),
@@ -2342,6 +2342,34 @@ mod tests {
             .expect("cutoff parameter");
         assert!((cutoff["value"].as_f64().expect("cutoff value") - 0.123).abs() < 0.000_001);
         assert_eq!(cutoff["overridden"], true);
+    }
+
+    #[test]
+    fn formula_discovery_routes_long_source_to_modulator_update() {
+        let project = Project::demo();
+        let track = &project.tracks[1];
+        let modulator = &track.modulators[0];
+        let session = EditSession::create(&project, "inspect formula", 0.0, 1.0).expect("session");
+
+        let response = list_sound_tool_parameters(
+            session.path(),
+            &serde_json::json!({
+                "trackId":track.id,
+                "tool":"modulator",
+                "toolId":modulator.id,
+                "group":"advanced"
+            }),
+        )
+        .expect("modulator parameters");
+        let response: JsonValue = serde_json::from_str(&response).expect("parameter JSON");
+        let formula = response["parameters"]
+            .as_array()
+            .expect("parameters")
+            .iter()
+            .find(|parameter| parameter["parameter"] == "formula")
+            .expect("formula parameter");
+        assert_eq!(formula["maximumLength"], 8_192);
+        assert_eq!(formula["mutationTool"], "update_modulator");
     }
 
     #[test]
