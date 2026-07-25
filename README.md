@@ -24,6 +24,12 @@ For a system service, use systemd's `LoadCredential=` with a credential named `g
 
 The model can search and load Surge XT's factory `.fxp` library. Development builds discover it in the pinned Surge checkout automatically. Packaged deployments should copy Surge's `resources/data/patches_factory` directory to `/usr/local/share/daw-ai/patches_factory`, or set `DAW_AI_SURGE_PRESET_DIR` to its installed location.
 
+On hosts that restrict unprivileged user namespaces with AppArmor, install
+`deploy/daw-ai.apparmor` as `/etc/apparmor.d/daw-ai` and load it with
+`apparmor_parser -r /etc/apparmor.d/daw-ai`. This grants user-namespace creation
+only to the installed DAW-AI executable so its per-session Codex bubblewrap
+sandbox can start without weakening the host-wide policy.
+
 Start the studio on the charter's default port:
 
 ```sh

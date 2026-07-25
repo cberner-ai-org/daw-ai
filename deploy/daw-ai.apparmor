@@ -1,0 +1,9 @@
+# DAW-AI uses an unprivileged user namespace to create each Codex bubblewrap sandbox.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile daw-ai /usr/local/bin/daw-ai flags=(unconfined) {
+  userns,
+
+  include if exists <local/daw-ai>
+}
