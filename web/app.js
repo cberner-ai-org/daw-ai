@@ -857,10 +857,14 @@
 
   function captureAdvancedUiState() {
     const clips = new Map();
+    const advancedControls = new Map();
     for (const editor of elements.channelList.querySelectorAll("[data-clip-key]")) {
       clips.set(editor.dataset.clipKey, { open: editor.open });
     }
-    return { drawerScrollTop: elements.advancedDrawer.scrollTop, clips };
+    for (const details of elements.channelList.querySelectorAll("[data-advanced-controls]")) {
+      advancedControls.set(details.dataset.advancedControls, details.open);
+    }
+    return { drawerScrollTop: elements.advancedDrawer.scrollTop, clips, advancedControls };
   }
 
   function restoreAdvancedUiState(uiState) {
@@ -869,6 +873,9 @@
       const clipState = uiState.clips.get(editor.dataset.clipKey);
       if (!clipState) continue;
       editor.open = clipState.open;
+    }
+    for (const details of elements.channelList.querySelectorAll("[data-advanced-controls]")) {
+      details.open = uiState.advancedControls.get(details.dataset.advancedControls) || false;
     }
   }
 
@@ -932,7 +939,7 @@
         ].join("")
       : "";
     const detailedParameters = Object.entries(effect.parameters)
-      .filter(([parameter, value]) => !["mix", "cutoff", "resonance"].includes(parameter) && Number.isFinite(value))
+      .filter(([parameter, value]) => !["mix", "cutoff", "resonance"].includes(parameter) && Number.isFinite(value));
     const renderDetailed = ([parameter, value]) => soundRange(
         track,
         "effect",
@@ -953,7 +960,7 @@
       ${soundRange(track, "effect", effect.id, effect.name, "mix", effect.parameters.mix, 0, 1, "%")}
       ${filterControls}
       ${commonControls}
-      ${advancedControls ? `<details><summary>Advanced controls</summary><div class="tool-controls">${advancedControls}</div></details>` : ""}
+      ${advancedControls ? `<details data-advanced-controls="effect:${effect.id}"><summary>Advanced controls</summary><div class="tool-controls">${advancedControls}</div></details>` : ""}
       <div class="tool-actions">
         ${soundToggle(track, "effect", effect.id, effect.name, effect.enabled)}
         <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} earlier`)}" ${index === 0 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.max(0, index - 1)}" data-control-key="${track.id}-routing-${effect.id}-up">&uarr;</button>
@@ -988,7 +995,7 @@
         ${soundRange(track, "modulator", modulator.id, modulator.name, "rate", modulator.parameters.rate, 0.01, 20, modulator.rateMode === "tempo" ? "x/beat" : "Hz")}
         ${soundRange(track, "modulator", modulator.id, modulator.name, "depth", modulator.parameters.depth, 0, 1, "%")}
       </div>
-      <details>
+      <details data-advanced-controls="modulator:${modulator.id}">
         <summary>Advanced controls</summary>
         <div class="tool-controls">
         <label class="tool-control">Rate mode
@@ -1559,6 +1566,22 @@
     });
   }
 
+  function referenceAudioType(file) {
+    const supported = ["audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/flac"];
+    if (supported.includes(file.type)) return file.type;
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    return {
+      wav: "audio/wav",
+      wave: "audio/wav",
+      mp3: "audio/mpeg",
+      m4a: "audio/mp4",
+      mp4: "audio/mp4",
+      ogg: "audio/ogg",
+      oga: "audio/ogg",
+      flac: "audio/flac",
+    }[extension] || null;
+  }
+
   function clearDraftReferenceAudio() {
     elements.referenceAudio.value = "";
     elements.referenceAudioName.textContent =
@@ -1584,7 +1607,14 @@
         (typeof pending.acceptedJob === "object" &&
           typeof pending.acceptedJob.id === "string" &&
           pending.acceptedJob.operationId === pending.operationId);
-      if (validOperationId && validRequest && validJob) return pending;
+      const validReference =
+        pending.referenceAudio == null ||
+        (pending.acceptedJob === null &&
+          typeof pending.referenceAudio === "object" &&
+          typeof pending.referenceAudio.name === "string" &&
+          typeof pending.referenceAudio.type === "string" &&
+          typeof pending.referenceAudio.data === "string");
+      if (validOperationId && validRequest && validJob && validReference) return pending;
     } catch (_error) {
       // Invalid or unavailable storage must not prevent the studio from loading.
     }
@@ -1598,10 +1628,13 @@
 
   function persistPendingEdit(pending) {
     try {
-      const { referenceAudio: _referenceAudio, ...recoverable } = pending;
+      const recoverable = { ...pending };
+      if (pending.acceptedJob) delete recoverable.referenceAudio;
       window.localStorage.setItem(PENDING_EDIT_STORAGE_KEY, JSON.stringify(recoverable));
+      return true;
     } catch (error) {
       reportClientIssue("warning", error, "persisting an active edit");
+      return false;
     }
   }
 
@@ -2024,29 +2057,52 @@
     if (!prompt) return;
     let referenceAudio = null;
     const referenceFile = elements.referenceAudio.files[0];
+    let mimeType = null;
     if (referenceFile) {
       if (referenceFile.size > MAX_REFERENCE_AUDIO_BYTES) {
         showToast("Reference audio must be 2 MB or smaller", true);
         return;
       }
-      referenceAudio = {
-        name: referenceFile.name,
-        type: referenceFile.type || "audio/wav",
-        data: await fileAsBase64(referenceFile),
-      };
+      mimeType = referenceAudioType(referenceFile);
+      if (!mimeType) {
+        showToast("Reference audio format is not supported", true);
+        return;
+      }
     }
-    const pending = {
-      operationId: operationId(),
-      prompt,
-      submittedText,
-      start: state.selectionStart,
-      end: state.selectionEnd,
-      acceptedJob: null,
-      referenceAudio,
-    };
-    clearDraftReferenceAudio();
-    persistPendingEdit(pending);
-    await runPendingEdit(pending, true);
+    state.promptPending = true;
+    elements.composeButton.disabled = true;
+    elements.composeButton.querySelector("span").textContent = referenceFile ? "Reading audio..." : "Starting...";
+    let handedOff = false;
+    try {
+      if (referenceFile) {
+        referenceAudio = {
+          name: referenceFile.name,
+          type: mimeType,
+          data: await fileAsBase64(referenceFile),
+        };
+      }
+      const pending = {
+        operationId: operationId(),
+        prompt,
+        submittedText,
+        start: state.selectionStart,
+        end: state.selectionEnd,
+        acceptedJob: null,
+        referenceAudio,
+      };
+      if (!persistPendingEdit(pending) && referenceAudio) {
+        throw new Error("Could not preserve the reference audio for edit recovery");
+      }
+      clearDraftReferenceAudio();
+      handedOff = true;
+      await runPendingEdit(pending, true);
+    } catch (error) {
+      if (handedOff) throw error;
+      state.promptPending = false;
+      elements.composeButton.disabled = false;
+      elements.composeButton.querySelector("span").textContent = "Make change";
+      showError(error, "preparing the prompted edit");
+    }
   }
 
   function undo() {
