@@ -797,6 +797,7 @@ impl Router {
         let (store, studio, mut history) = open_project_with_history(project_path)?;
         trim_project_history(studio.project(), &mut history);
         save_project_state(&store, studio.project(), &history)?;
+        prune_codex_assets_for_store(&store, &history);
         let users = Arc::new(UserRegistry {
             root,
             planner: planner.clone(),
@@ -908,6 +909,7 @@ impl Router {
         let (store, studio, mut history) = open_project_with_history(project_path)?;
         trim_project_history(studio.project(), &mut history);
         save_project_state(&store, studio.project(), &history)?;
+        prune_codex_assets_for_store(&store, &history);
         persist_user_use(&directory)?;
         let router = Self {
             history: Arc::new(Mutex::new(history)),
@@ -2127,7 +2129,12 @@ impl Router {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        save_project_state(store, project, history)
+        save_project_state(store, project, history)?;
+        if let Err(error) = crate::codex::prune_project_assets(&self.gemini_session_root(), history)
+        {
+            eprintln!("warning: could not prune unreferenced Codex audio assets: {error}");
+        }
+        Ok(())
     }
 
     fn project_path(&self) -> &std::path::Path {
@@ -2155,6 +2162,17 @@ impl Router {
         self.studio
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn prune_codex_assets_for_store(store: &crate::storage::ProjectStore, history: &ProjectHistory) {
+    let session_root = store
+        .path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("gemini-sessions");
+    if let Err(error) = crate::codex::prune_project_assets(&session_root, history) {
+        eprintln!("warning: could not prune unreferenced Codex audio assets: {error}");
     }
 }
 
