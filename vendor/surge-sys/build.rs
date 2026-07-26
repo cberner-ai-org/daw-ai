@@ -331,6 +331,7 @@ fn main() {
         .blocklist_item("FE_.*")            // fix for various double definitions (FE?).
         .blocklist_item("FP_.*")            // fix for various double definitions (FE counterpart?).
         .blocklist_item("__gnu_.*")         // fix for proprietary data (somewhat).
+        .blocklist_function("SurgeSynthesizer::idForParameter")
         .allowlist_item("Surge.*")          // fix for everything else (the nuclear option).
         .allowlist_item(".*idFor.*")        // fix for functions i need (unexported).
         .allowlist_item(".*Storage.*")      // fix for surge storage (most stuff).

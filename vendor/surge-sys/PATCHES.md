@@ -20,4 +20,6 @@ required size or alignment.
 
 The `idForParameter` plumbing writes its C++ ID through an output pointer
 instead of returning the opaque ID by value. This keeps the unstable `u128`
-value ABI out of the C boundary covered by the lint allowance.
+value ABI out of the C boundary covered by the lint allowance. The native
+by-value member is blocklisted from generated bindings so raw consumers cannot
+bypass that pointer wrapper.
