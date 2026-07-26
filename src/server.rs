@@ -971,6 +971,14 @@ impl Router {
             ("GET", "/app.css") => Response::static_asset("text/css; charset=utf-8", APP_CSS),
             ("GET", "/app.js") => Response::static_asset("text/javascript; charset=utf-8", APP_JS),
             ("GET", "/api/health") => Response::json(200, "{\"status\":\"ok\"}".to_owned()),
+            ("GET", "/api/surge-presets") => {
+                let presets = crate::surge_presets::catalog()
+                    .into_iter()
+                    .map(|preset| json_string(&preset.id))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Response::json(200, format!("{{\"presets\":[{presets}]}}"))
+            }
             ("GET", "/api/project") => {
                 let studio = self.lock_studio();
                 self.project_response(&studio)
@@ -2871,6 +2879,19 @@ mod tests {
     }
 
     #[test]
+    fn serves_installed_surge_presets_to_the_advanced_ui() {
+        let response = Router::demo().handle(&request("GET", "/api/surge-presets", ""));
+        assert_eq!(response.status, 200);
+        let catalog: serde_json::Value =
+            serde_json::from_str(&response.body).expect("preset catalog JSON");
+        assert!(catalog["presets"].as_array().is_some_and(|presets| {
+            presets
+                .iter()
+                .any(|preset| preset == "Factory/Leads/Classic Lead 1")
+        }));
+    }
+
+    #[test]
     fn gemini_sessions_are_always_persistent_and_listed_for_debugging() {
         let router = Router::demo();
         let response = router.handle(&request("GET", "/api/gemini-sessions", ""));
@@ -3936,10 +3957,10 @@ mod tests {
     }
 
     #[test]
-    fn serves_bounded_byte_ranges_for_day_long_audio() {
+    fn serves_bounded_byte_ranges_for_maximum_wav_audio() {
         let router = Router::demo();
         let mut project = router.lock_studio().project().clone();
-        project.duration = 24.0 * 60.0 * 60.0;
+        project.duration = audio_analysis::MAX_WAV_SECONDS;
         *router.lock_studio() = Studio::from_project(project);
         let version = router.lock_studio().project().version;
         let mut range_request = request(
@@ -3958,8 +3979,8 @@ mod tests {
 
         let body_start = find_bytes(&response, b"\r\n\r\n").expect("HTTP response head") + 4;
         let head = std::str::from_utf8(&response[..body_start]).expect("UTF-8 response head");
-        let total_length =
-            WAV_HEADER_BYTES + audio_analysis::playback_sample_count(0.0, 24.0 * 60.0 * 60.0) * 4;
+        let total_length = WAV_HEADER_BYTES
+            + audio_analysis::playback_sample_count(0.0, audio_analysis::MAX_WAV_SECONDS) * 4;
         assert!(head.starts_with("HTTP/1.1 206 Partial Content\r\n"));
         assert!(head.contains("Content-Length: 100\r\n"));
         assert!(head.contains("Accept-Ranges: bytes\r\n"));

@@ -78,6 +78,7 @@
     graphNodeSelection: {},
     midiEventSelection: {},
     instrumentParameters: {},
+    surgePresets: ["Init"],
   };
   let historyLoadQueue = Promise.resolve();
   let projectMutationQueue = Promise.resolve();
@@ -91,20 +92,6 @@
   const MAX_REFERENCE_AUDIO_BYTES = 2 * 1024 * 1024;
   const LONG_PRESS_MS = 500;
   const LONG_PRESS_MOVE_TOLERANCE_PX = 10;
-  const SURGE_PRESETS = [
-    "Init",
-    "Surge Kick",
-    "Surge Snare",
-    "Surge Closed Hat",
-    "Surge Open Hat",
-    "Surge Crash",
-    "Surge Percussion",
-    "Surge Bass",
-    "Surge Pad",
-    "Surge Lead",
-    "Surge Atmosphere",
-  ];
-
   class AudioEngine {
     constructor() {
       this.playbackState = "idle";
@@ -458,9 +445,20 @@
     try {
       adoptProject(await api("/api/project"));
       renderProject();
+      void loadSurgePresets();
     } catch (error) {
       showError(error, "loading the project");
       elements.savedState.textContent = "Offline";
+    }
+  }
+
+  async function loadSurgePresets() {
+    try {
+      const catalog = await api("/api/surge-presets");
+      state.surgePresets = ["Init", ...catalog.presets];
+      if (state.activeView === "advanced") renderAdvanced();
+    } catch (error) {
+      reportClientIssue("warning", error, "loading the Surge XT preset catalog");
     }
   }
 
@@ -692,7 +690,7 @@
                 <div class="tool-controls instrument-preset-controls">
                   <label class="tool-control">Preset
                     <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="preset" data-control-key="${track.id}-instrument-${track.instrument.id}-preset" aria-label="${escapeHtml(`${track.name} instrument #${track.instrument.id} Surge XT preset`)}">
-                      ${selectOptions(SURGE_PRESETS.includes(track.instrument.preset) ? SURGE_PRESETS : [track.instrument.preset, ...SURGE_PRESETS], track.instrument.preset)}
+                      ${selectOptions(state.surgePresets.includes(track.instrument.preset) ? state.surgePresets : [track.instrument.preset, ...state.surgePresets], track.instrument.preset)}
                     </select>
                   </label>
                 </div>
@@ -1030,9 +1028,6 @@
       targets.push([modulator.target, modulator.target]);
     }
     const sourceTrackId = modulator.sourceTrackId ?? track.id;
-    const sourceTracks = state.project.tracks
-      .map((source) => `<option value="${source.id}" ${source.id === sourceTrackId ? "selected" : ""}>${escapeHtml(source.name)} (#${source.id})</option>`)
-      .join("");
     return `<div class="modulator-card ${modulator.enabled ? "" : "is-disabled"}">
       <div class="effect-card-heading"><strong>${escapeHtml(modulator.name)}</strong><code>#${modulator.id}</code></div>
       ${modulator.enabled && modulator.trigger !== "free" ? `<div class="modulator-route"><b>${escapeHtml(state.project.tracks.find((source) => source.id === sourceTrackId)?.name ?? "Unknown source")}</b><i aria-hidden="true">${modulator.trigger.toUpperCase()} &rarr;</i><b>Modulator</b></div>` : ""}
@@ -1054,18 +1049,14 @@
           <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="rateMode" data-control-key="${track.id}-modulator-${modulator.id}-rateMode" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} rate mode`)}">${selectOptions(["hz", "tempo"], modulator.rateMode)}</select>
         </label>
         <label class="tool-control">Trigger
-          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="trigger" data-control-key="${track.id}-modulator-${modulator.id}-trigger" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} trigger`)}">${selectOptions(["free", "midi", "audio"], modulator.trigger)}</select>
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="trigger" data-control-key="${track.id}-modulator-${modulator.id}-trigger" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} trigger`)}">${selectOptions(["free", "midi"], modulator.trigger)}</select>
         </label>
         ${modulator.trigger !== "free" ? `<label>Source track
-          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="sourceTrackId" data-control-key="${track.id}-modulator-${modulator.id}-sourceTrackId" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} source track`)}">${sourceTracks}</select>
-        </label>` : ""}
-        ${modulator.trigger === "audio" ? `<label>Polarity
-          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="polarity" data-control-key="${track.id}-modulator-${modulator.id}-polarity" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} polarity`)}">${selectOptions(["increase", "decrease"], modulator.polarity)}</select>
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="sourceTrackId" data-control-key="${track.id}-modulator-${modulator.id}-sourceTrackId" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} source track`)}"><option value="${track.id}" selected>${escapeHtml(track.name)} (#${track.id})</option></select>
         </label>` : ""}
         <label class="tool-control">Surge Formula (Lua)
           <textarea data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="formula" data-control-key="${track.id}-modulator-${modulator.id}-formula" aria-label="${escapeHtml(`${track.name} ${modulator.name} formula`)}">${escapeHtml(modulator.formula || "")}</textarea>
         </label>
-        ${modulator.trigger === "audio" ? `${soundRange(track, "modulator", modulator.id, modulator.name, "threshold", modulator.parameters.threshold, 0, 1, "")}${soundRange(track, "modulator", modulator.id, modulator.name, "attackMs", modulator.parameters.attackMs, 0, 1000, "ms")}${soundRange(track, "modulator", modulator.id, modulator.name, "releaseMs", modulator.parameters.releaseMs, 1, 5000, "ms")}` : ""}
         </div>
       </details>
       <div class="tool-actions">${soundToggle(track, "modulator", modulator.id, modulator.name, modulator.enabled)}</div>
