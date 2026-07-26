@@ -628,7 +628,11 @@ fn parse_clip(
     if !matches!(playback_mode, "loop" | "once") {
         return Err(invalid("MIDI clip playback mode must be loop or once"));
     }
-    let maximum_beats = if playback_mode == "once" { 64.0 } else { 16.0 };
+    let maximum_beats = if playback_mode == "once" {
+        crate::model::MAX_ONCE_PLAYBACK_BEATS
+    } else {
+        crate::model::MAX_LOOP_PLAYBACK_BEATS
+    };
     let published_length = clip
         .get("playback")
         .and_then(JsonValue::as_object)
@@ -640,7 +644,9 @@ fn parse_clip(
         None => range(clip, "loopBeats", 0.25, maximum_beats)?,
     };
     if !loop_beats.is_finite() || !(0.25..=maximum_beats).contains(&loop_beats) {
-        return Err(invalid("MIDI clip playback length is out of range"));
+        return Err(invalid(format!(
+            "MIDI clip {playback_mode} playback length must be between 0.25 and {maximum_beats} beats"
+        )));
     }
     let event_values = array(clip, "events")?;
     if event_values.len() > MAX_EVENTS_PER_CLIP {

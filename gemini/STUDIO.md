@@ -4,15 +4,14 @@ DAW-AI is a backend-rendered studio powered by Surge XT. Use the registered tool
 
 ## Graph
 
-Call `read_sound_graph` before editing and whenever a later call needs newly created stable IDs.
+Call `read_sound_graph` without `nodeId` before editing to get compact topology. Pass an exact returned `nodeId` when you need one node's details. Mutation tools return newly created stable IDs directly.
 
 - A track contains one Surge XT instrument, MIDI clips, effects, modulators, routing, volume, and mute state.
 - MIDI events use beat-relative `time` and `duration`, MIDI `pitch`, and normalized `velocity`. A clip has an absolute `startBeat` and `durationBeats`; `playback.mode` is `loop` with `lengthBeats`, or `once`.
 - The instrument is Surge XT. Its factory preset and current native state determine its sound.
 - Effects embedded by a preset have `source: "preset"`; effects appended later have `source: "added"`. Both are stable-ID Surge effects. Preset and added effects share Surge XT's eight serial slots.
-- `modulationTargets` and instrument-leaf `modulationTarget` fields are the authoritative modulation target IDs.
-- `automationTargets` are the authoritative automation IDs and ranges. Selection controls identify hold interpolation with `automationCurve: "hold"`.
-- `routing.audio`, `routing.control`, and `routing.edges` describe the active signal graph.
+- Instrument-leaf `modulationTarget` fields are the authoritative modulation target IDs.
+- Topology `connections` describe the active MIDI, audio, ownership, and modulation graph.
 
 The graph's IDs, current values, routing, and states are authoritative.
 
@@ -45,11 +44,11 @@ One modulation object configures a native Surge XT modulation source and target 
 - `target` is copied from graph or instrument discovery.
 - `shape` is `sine`, `triangle`, `square`, `random`, `envelope`, or `formula`.
 - `rateMode` is `hz` or tempo-synced cycles per beat.
-- `trigger` is `free`, `midi`, or `audio`.
+- `trigger` is `free` or `midi`.
 - Free-running and MIDI-triggered modulation use native Surge XT modulation sources.
 - Formula modulation supplies Surge Formula source in `formula`.
 
-Same-track native targets execute inside Surge XT. Cross-track sources and DAW-owned targets such as `track.volume` execute in DAW-AI. Use the target IDs and controls returned by discovery.
+Same-track native targets execute inside Surge XT. Use the target IDs and controls returned by instrument discovery.
 
 ## Listening
 

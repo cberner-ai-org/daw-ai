@@ -9,6 +9,9 @@ const HISTORY_LIMIT: usize = 50;
 const TRACK_LIMIT: usize = 128;
 pub(crate) const EDIT_LOG_LIMIT: usize = 256;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
+pub(crate) const MAX_MIDI_EVENTS_PER_CLIP: usize = 128;
+pub(crate) const MAX_LOOP_PLAYBACK_BEATS: f32 = 16.0;
+pub(crate) const MAX_ONCE_PLAYBACK_BEATS: f32 = 256.0;
 pub(crate) const SURGE_ENGINE: &str = "Surge XT";
 pub(crate) const SURGE_PRESETS: &[&str] = &["Init"];
 
@@ -2587,8 +2590,14 @@ fn validate_clip_fields(
         || end > project_duration
         || !loop_beats.is_finite()
         || match playback_mode {
-            "loop" => !(0.25..=16.0).contains(&loop_beats) || notes.len() > 128,
-            "once" => !(0.25..=256.0).contains(&loop_beats) || notes.len() > 128,
+            "loop" => {
+                !(0.25..=MAX_LOOP_PLAYBACK_BEATS).contains(&loop_beats)
+                    || notes.len() > MAX_MIDI_EVENTS_PER_CLIP
+            }
+            "once" => {
+                !(0.25..=MAX_ONCE_PLAYBACK_BEATS).contains(&loop_beats)
+                    || notes.len() > MAX_MIDI_EVENTS_PER_CLIP
+            }
             _ => true,
         }
         || notes.iter().any(|note| {
