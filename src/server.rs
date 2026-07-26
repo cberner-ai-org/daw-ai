@@ -29,6 +29,7 @@ use crate::prompt::{EditPlan, PromptEngine};
 use crate::storage::{ProjectStore, replace_text_file};
 
 const MAX_REQUEST_BYTES: usize = 6 * 1024 * 1024;
+const MAX_REQUEST_HEADER_BYTES: usize = 32 * 1024;
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
 const MAX_ACTIVE_EDIT_JOBS: usize = 4;
 const MAX_RETAINED_EDIT_JOBS: usize = 64;
@@ -2050,13 +2051,16 @@ impl Request {
                 return Err("incomplete request".to_owned());
             }
             bytes.extend_from_slice(&chunk[..count]);
-            if bytes.len() > MAX_REQUEST_BYTES {
-                return Err("request is too large".to_owned());
-            }
             if let Some(position) = find_bytes(&bytes, b"\r\n\r\n") {
                 break position + 4;
             }
+            if bytes.len() > MAX_REQUEST_HEADER_BYTES {
+                return Err("request headers are too large".to_owned());
+            }
         };
+        if header_end > MAX_REQUEST_HEADER_BYTES {
+            return Err("request headers are too large".to_owned());
+        }
 
         let headers = std::str::from_utf8(&bytes[..header_end])
             .map_err(|_| "request headers must be UTF-8".to_owned())?;
@@ -2072,15 +2076,42 @@ impl Request {
         let target = request_parts
             .next()
             .ok_or_else(|| "missing path".to_owned())?;
-        if request_parts.next().is_none() {
-            return Err("missing HTTP version".to_owned());
+        let version = request_parts
+            .next()
+            .ok_or_else(|| "missing HTTP version".to_owned())?;
+        if request_parts.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+            return Err("invalid request line".to_owned());
+        }
+        if !target.starts_with('/') {
+            return Err("request path must be origin-form".to_owned());
         }
         let path = target.split('?').next().unwrap_or(target).to_owned();
 
-        let headers: HashMap<String, String> = lines
-            .filter_map(|line| line.split_once(':'))
-            .map(|(name, value)| (name.trim().to_lowercase(), value.trim().to_owned()))
-            .collect();
+        let mut parsed_headers = HashMap::new();
+        for line in lines.filter(|line| !line.is_empty()) {
+            let (name, value) = line
+                .split_once(':')
+                .ok_or_else(|| "invalid request header".to_owned())?;
+            if name.is_empty()
+                || name.trim() != name
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+            {
+                return Err("invalid request header name".to_owned());
+            }
+            let name = name.to_ascii_lowercase();
+            if parsed_headers
+                .insert(name, value.trim().to_owned())
+                .is_some()
+            {
+                return Err("duplicate request header".to_owned());
+            }
+        }
+        let headers = parsed_headers;
+        if headers.contains_key("transfer-encoding") {
+            return Err("transfer encoding is not supported".to_owned());
+        }
         let content_length = headers.get("content-length").map_or(Ok(0_usize), |value| {
             value
                 .parse::<usize>()
@@ -3710,6 +3741,28 @@ mod tests {
         assert_eq!(parsed.path, "/api/edits");
         assert_eq!(parsed.headers["host"], "localhost");
         assert_eq!(parse_form(&parsed.body)["prompt"], "warm & wide");
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_unbounded_http_headers() {
+        for raw in [
+            "POST /api/logs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n",
+            "POST /api/logs HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET / HTTP/2\r\nHost: localhost\r\n\r\n",
+            "GET / HTTP/1.1\r\nmalformed\r\n\r\n",
+        ] {
+            assert!(
+                Request::read(&mut raw.as_bytes()).is_err(),
+                "accepted {raw:?}"
+            );
+        }
+
+        let oversized = format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nX-Fill: {}\r\n\r\n",
+            "x".repeat(MAX_REQUEST_HEADER_BYTES)
+        );
+        assert!(Request::read(&mut oversized.as_bytes()).is_err());
     }
 
     #[test]

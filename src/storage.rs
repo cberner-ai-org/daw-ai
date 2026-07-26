@@ -1,5 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -118,14 +120,16 @@ pub(crate) fn replace_text_file(path: &Path, source: &str) -> io::Result<()> {
     let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(".{file_name}.{}.{id}.tmp", std::process::id()));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
         file.write_all(source.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        replace_destination(&temporary, path)
+        replace_destination(&temporary, path)?;
+        sync_parent_directory(parent)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -159,6 +163,16 @@ pub(crate) fn quarantine_invalid_file(path: &Path) -> io::Result<PathBuf> {
         io::ErrorKind::AlreadyExists,
         "could not allocate an invalid-project quarantine path",
     ))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn replace_destination(temporary: &Path, destination: &Path) -> io::Result<()> {
