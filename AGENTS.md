@@ -8,10 +8,9 @@ Treat the charter.md file as the authoritative project document from the user. N
 unless the user explicitly instructs you to. It should only be modified by the user. Your job is
 to implement the project and features that they describe in this document.
 
-## Before completing codebase-changing work
+## Before opening a PR
 
-**Run `just test` and confirm it passes after making any change that can affect the codebase
-in the current working directory.**
+**Run `just test` and confirm it passes before opening a PR.**
 This target runs the `pre` recipe first, which checks Rust formatting, runs Clippy with warnings
 denied, and checks the JavaScript syntax. It then runs the Rust test suite, builds the server,
 and exercises the core UI workflows in headless Chrome or Chromium.
@@ -22,6 +21,7 @@ If any of those fail, fix the underlying issue; do not bypass checks.
 - Comments should be brief and focus on important invariants, architectural details, or other
   long-term relevant information. They should not contain minor implementation details of the current
   commit.
+- DO NOT use non-ASCII characters in the codebase. Escaped characters are acceptable, but not raw characters
 
 ## Tests
 
