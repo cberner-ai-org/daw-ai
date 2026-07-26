@@ -26,8 +26,11 @@ extern "C" {
     bool surge_parameter_is_discrete(SurgeSynthesizer* surge, int parameter);
     bool surge_parameter_is_boolean(SurgeSynthesizer* surge, int parameter);
     bool surge_parameter_can_temposync(SurgeSynthesizer* surge, int parameter);
+    bool surge_parameter_is_temposync(SurgeSynthesizer* surge, int parameter);
     bool surge_parameter_can_deactivate(SurgeSynthesizer* surge, int parameter);
     bool surge_parameter_is_deactivated(SurgeSynthesizer* surge, int parameter);
+    bool surge_set_parameter_temposync(SurgeSynthesizer* surge, int parameter, bool enabled);
+    bool surge_set_parameter_deactivated(SurgeSynthesizer* surge, int parameter, bool enabled);
     int surge_parameter_choice_count(SurgeSynthesizer* surge, int parameter);
     float surge_parameter_choice_value(SurgeSynthesizer* surge, int parameter, int choice);
     void surge_parameter_choice_display(SurgeSynthesizer* surge, int parameter, int choice,

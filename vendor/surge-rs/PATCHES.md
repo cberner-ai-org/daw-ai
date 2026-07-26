@@ -10,3 +10,5 @@ chain used by MIDI instruments. The alpha binding otherwise exposes output only.
 DAW-AI also wraps the parameter-semantic and native-choice queries exposed by
 the patched bridge, including Surge XT's native modulation-target validation.
 Parameter writes use the bridge's headless-state safety check.
+The wrapper also exposes restoration of native tempo-sync and deactivation
+flags for preset effect parameters.

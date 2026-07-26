@@ -65,6 +65,10 @@ unsafe extern "C" {
         surge: *mut SurgeSynthesizer,
         parameter: i32,
     ) -> bool;
+    pub fn surge_parameter_is_temposync(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+    ) -> bool;
     pub fn surge_parameter_can_deactivate(
         surge: *mut SurgeSynthesizer,
         parameter: i32,
@@ -72,6 +76,16 @@ unsafe extern "C" {
     pub fn surge_parameter_is_deactivated(
         surge: *mut SurgeSynthesizer,
         parameter: i32,
+    ) -> bool;
+    pub fn surge_set_parameter_temposync(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+        enabled: bool,
+    ) -> bool;
+    pub fn surge_set_parameter_deactivated(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+        enabled: bool,
     ) -> bool;
     pub fn surge_parameter_choice_count(surge: *mut SurgeSynthesizer, parameter: i32) -> i32;
     pub fn surge_parameter_choice_value(
