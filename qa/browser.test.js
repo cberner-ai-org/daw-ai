@@ -2786,7 +2786,19 @@ async function run() {
       appSession,
       "window.__transportPlayCalls.length",
     );
-    await evaluate(cdp, appSession, "window.__transportMedia.dispatchEvent(new Event('error'))");
+    await evaluate(cdp, appSession, `(() => {
+      const originalFetch = window.fetch;
+      window.__audioAccessRefreshes = 0;
+      window.fetch = (...args) => {
+        const requestUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+        if (requestUrl === '/api/audio-access') window.__audioAccessRefreshes += 1;
+        return originalFetch(...args);
+      };
+      window.__restoreFetchAfterAudioRetry = () => {
+        window.fetch = originalFetch;
+      };
+      window.__transportMedia.dispatchEvent(new Event('error'));
+    })()`);
     await waitFor(
       async () => evaluate(
         cdp,
@@ -2803,6 +2815,12 @@ async function run() {
       previousSource: window.__transportPlayCalls.at(-2).source,
     })`);
     assert.equal(retriedTransport.sameElement, true, "every playback and retry must reuse one media element");
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__audioAccessRefreshes"),
+      1,
+      "a playback retry must refresh the stream token after a service restart",
+    );
+    await evaluate(cdp, appSession, "window.__restoreFetchAfterAudioRetry()");
     assert.notEqual(
       retriedTransport.latestSource,
       retriedTransport.previousSource,
