@@ -872,18 +872,14 @@ pub(crate) fn list_instrument_parameters(
         .map(|parameter| {
             let legacy_override =
                 crate::surge::legacy_instrument_parameter_override(&track.instrument, parameter.id);
-            let value = track
+            let requested_override = track
                 .instrument
                 .native_overrides
                 .get(&parameter.id)
                 .copied()
-                .or(legacy_override)
-                .unwrap_or(parameter.value);
-            let overridden = track
-                .instrument
-                .native_overrides
-                .contains_key(&parameter.id)
-                || legacy_override.is_some();
+                .or(legacy_override);
+            let overridden =
+                requested_override.is_some_and(|value| (value - parameter.value).abs() < 0.000_01);
             let mut value = serde_json::json!({
                 "parameter": format!("native:{}", parameter.id),
                 "graphParameter": crate::surge::instrument_graph_parameter(
@@ -891,7 +887,7 @@ pub(crate) fn list_instrument_parameters(
                     parameter.id
                 ),
                 "name": parameter.name,
-                "value": value,
+                "value": parameter.value,
                 "presetValue": parameter.preset_value,
                 "display": parameter.display,
                 "overridden": overridden,
@@ -904,8 +900,12 @@ pub(crate) fn list_instrument_parameters(
                 },
                 "mutationTool":"set_parameter"
             });
-            if parameter.voice_modulatable && parameter.scene_modulatable {
+            if parameter.voice_modulatable || parameter.scene_modulatable {
                 value["modulationTarget"] = serde_json::json!(format!("native:{}", parameter.id));
+                value["modulation"] = serde_json::json!({
+                    "midi": parameter.voice_modulatable,
+                    "free": parameter.scene_modulatable
+                });
             }
             if !parameter.choices.is_empty() {
                 value["choices"] = serde_json::json!(

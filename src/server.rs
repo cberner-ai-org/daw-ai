@@ -1893,11 +1893,14 @@ impl Router {
                     &track.instrument,
                     parameter.id,
                 );
-                let overridden = track
+                let requested_override = track
                     .instrument
                     .native_overrides
-                    .contains_key(&parameter.id)
-                    || legacy_override.is_some();
+                    .get(&parameter.id)
+                    .copied()
+                    .or(legacy_override);
+                let overridden = requested_override
+                    .is_some_and(|value| (value - parameter.value).abs() < 0.000_01);
                 serde_json::json!({
                     "parameter": format!("native:{}", parameter.id),
                     "graphParameter": crate::surge::instrument_graph_parameter(
