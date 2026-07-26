@@ -15,7 +15,11 @@ unsafe extern "C" {
     pub fn getSynthSideId(id: *const SurgeSynthesizer_ID) -> i32;
 
     pub fn fromSynthSideId(surge: *const SurgeSynthesizer, i: i32 , q: *mut SurgeSynthesizer_ID) -> bool;
-    pub fn idForParameter(surge: *const SurgeSynthesizer, p: *const Parameter) -> SurgeSynthesizer_ID;
+    pub fn idForParameter(
+        surge: *const SurgeSynthesizer,
+        p: *const Parameter,
+        q: *mut SurgeSynthesizer_ID,
+    );
     pub fn getParameterDisplay(surge: *const SurgeSynthesizer, index: *mut SurgeSynthesizer_ID, text: *mut ffi::c_char);
     pub fn getParameterDisplayAlt(surge: *const SurgeSynthesizer, index: *mut SurgeSynthesizer_ID, text: *mut ffi::c_char);
     pub fn getParameterName(surge: *const SurgeSynthesizer, index: *mut SurgeSynthesizer_ID, text: *mut ffi::c_char);

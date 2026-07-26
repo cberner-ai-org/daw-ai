@@ -22,7 +22,7 @@ EXP	int getSynthSideId(const SurgeSynthesizer::ID* id);
 #define IAT1 const ID* index, char* text
 #define IDPO const ID* index
 EXP	bool fromSynthSideId			(CSUR, int i, ID* q);
-EXP	ID idForParameter			(CSUR, const Parameter* p);
+EXP	void idForParameter			(CSUR, const Parameter* p, ID* q);
 EXP	void getParameterDisplay		(CSUR, IAT1);
 EXP	void getParameterDisplayAlt		(CSUR, IAT1);
 EXP	void getParameterName			(CSUR, IAT1);

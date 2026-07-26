@@ -17,7 +17,7 @@ EXP	int getSynthSideId(const ID* id)		{ return id->getSynthSideId(); }
 #define IAT2 *index, text
 #define IDPO const ID* index
 EXP	bool fromSynthSideId			(CSUR, int i, ID* q)		{ return surge->fromSynthSideId(i, *q); }
-EXP	ID idForParameter			(CSUR, const Parameter* p)	{ return surge->idForParameter(p); }
+EXP	void idForParameter			(CSUR, const Parameter* p, ID* q)	{ *q = surge->idForParameter(p); }
 EXP	void getParameterDisplay		(CSUR, IAT1)			{ return surge->getParameterDisplay(IAT2); }
 EXP	void getParameterDisplayAlt		(CSUR, IAT1)			{ return surge->getParameterDisplay(IAT2); }
 EXP	void getParameterName			(CSUR, IAT1)			{ return surge->getParameterName(IAT2); }

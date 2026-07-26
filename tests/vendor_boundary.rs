@@ -27,6 +27,15 @@ fn vendored_surge_boundary_keeps_pins_and_patched_api() {
         read(root, "vendor/surge-sys/src/lib.rs").contains("improper_ctypes"),
         "generated opaque u128 storage needs a scoped FFI lint allowance"
     );
+    assert!(
+        read(root, "vendor/surge-sys/cpp/plumber.h")
+            .contains("void idForParameter\t\t\t(CSUR, const Parameter* p, ID* q)"),
+        "opaque Surge IDs must cross the C boundary through pointers"
+    );
+    assert!(
+        read(root, "vendor/surge-sys/src/hell_ffi.rs").contains("q: *mut SurgeSynthesizer_ID"),
+        "the Rust declaration must match the pointer-based C wrapper"
+    );
 
     let binding = read(root, "vendor/surge-rs/src/glue/synthesizer.rs");
     assert!(binding.contains("pub fn set_input_buffer"));

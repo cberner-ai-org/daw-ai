@@ -193,7 +193,11 @@ impl SurgeSynthesizer {
     }
 
     pub fn id_for_parameter(&self, parameter: &Parameter) -> SurgeId {
-        unsafe { SurgeId(hell_ffi::idForParameter(self.ptr, parameter.ptr)) }
+        unsafe {
+            let mut id = std::mem::MaybeUninit::uninit();
+            hell_ffi::idForParameter(self.ptr, parameter.ptr, id.as_mut_ptr());
+            SurgeId(id.assume_init())
+        }
     }
 
     pub fn get_parameter_display(&self, index: &mut SurgeId) -> String {
