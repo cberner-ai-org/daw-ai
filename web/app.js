@@ -286,10 +286,26 @@
       this.retryTimer = window.setTimeout(() => {
         this.retryTimer = null;
         if (generation === this.playbackGeneration && this.isActive) {
-          void this.startStream(generation);
+          void this.refreshAccessAndRestart(generation, streamAttempt);
         }
       }, delay);
       updateTransport();
+    }
+
+    async refreshAccessAndRestart(generation, streamAttempt) {
+      try {
+        await this.initialize();
+      } catch (error) {
+        this.retryPlayback(error, generation, streamAttempt);
+        return;
+      }
+      if (
+        generation === this.playbackGeneration &&
+        streamAttempt === this.streamAttempt &&
+        this.isActive
+      ) {
+        await this.startStream(generation);
+      }
     }
 
     tick() {
