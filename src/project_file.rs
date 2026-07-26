@@ -22,7 +22,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     let value: JsonValue =
         serde_json::from_str(source).map_err(|error| invalid(format!("invalid JSON: {error}")))?;
     let root = object(&value, "sound graph")?;
-    if integer(root, "schemaVersion")? != 2 {
+    if integer(root, "schemaVersion")? != 3 {
         return Err(invalid("schemaVersion is unsupported"));
     }
     let name = limited_string(root, "name", 1, 160)?;
@@ -164,58 +164,10 @@ fn parse_track(
     if !valid_surge_preset(preset) {
         return Err(invalid("instrument preset is unsupported"));
     }
-    let instrument_parameters = object(
-        field(instrument_object, "parameters")?,
-        "instrument parameters",
-    )?;
-    let overrides = instrument_object
-        .get("overrides")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| invalid("instrument overrides must be an array"))?
-        .iter()
-        .map(|value| {
-            let parameter = value
-                .as_str()
-                .ok_or_else(|| invalid("instrument overrides must be strings"))?;
-            if !matches!(
-                parameter,
-                "attack"
-                    | "decay"
-                    | "sustain"
-                    | "release"
-                    | "cutoff"
-                    | "resonance"
-                    | "pitch"
-                    | "timbre"
-                    | "output"
-            ) {
-                return Err(invalid("instrument override is unsupported"));
-            }
-            Ok(parameter.to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if overrides
-        .iter()
-        .collect::<std::collections::HashSet<_>>()
-        .len()
-        != overrides.len()
-    {
-        return Err(invalid("instrument overrides must be unique"));
-    }
     let mut instrument = Instrument {
         id: instrument_id,
         engine: SURGE_ENGINE.to_owned(),
         preset: preset.to_owned(),
-        attack: range(instrument_parameters, "attack", 0.0, 1.0)?,
-        decay: range(instrument_parameters, "decay", 0.0, 1.0)?,
-        sustain: range(instrument_parameters, "sustain", 0.0, 1.0)?,
-        release: range(instrument_parameters, "release", 0.0, 1.0)?,
-        cutoff: range(instrument_parameters, "cutoff", 0.0, 1.0)?,
-        resonance: range(instrument_parameters, "resonance", 0.0, 1.0)?,
-        pitch: range(instrument_parameters, "pitch", 0.0, 1.0)?,
-        timbre: range(instrument_parameters, "timbre", 0.0, 1.0)?,
-        output: range(instrument_parameters, "output", 0.0, 1.0)?,
-        parameter_overrides: overrides,
         native_overrides: parse_native_overrides(instrument_object, preset)?,
     };
     normalize_native_overrides(&mut instrument);
@@ -379,8 +331,6 @@ fn parse_effect(
         name,
         preset_slot,
         mix: range(parameters, "mix", 0.0, 1.0)?,
-        cutoff_hz: None,
-        resonance: None,
         enabled: boolean(effect, "enabled")?,
         parameters: extra_parameters,
         parameter_overrides,
@@ -1139,18 +1089,8 @@ fn parse_role(value: &str) -> Result<TrackRole, ProjectFileError> {
 
 fn surge_preset(value: &str) -> Result<&'static str, ProjectFileError> {
     match value {
-        "Init" | "sine" => Ok("Init"),
-        "Surge Kick" => Ok("Surge Kick"),
-        "Surge Snare" => Ok("Surge Snare"),
-        "Surge Closed Hat" => Ok("Surge Closed Hat"),
-        "Surge Open Hat" => Ok("Surge Open Hat"),
-        "Surge Crash" => Ok("Surge Crash"),
-        "Surge Percussion" => Ok("Surge Percussion"),
-        "Surge Bass" | "square" => Ok("Surge Bass"),
-        "Surge Pad" | "triangle" => Ok("Surge Pad"),
-        "Surge Lead" | "sawtooth" => Ok("Surge Lead"),
-        "Surge Atmosphere" => Ok("Surge Atmosphere"),
-        _ => Err(invalid("unsupported Surge XT starter patch")),
+        "Init" => Ok("Init"),
+        _ => Err(invalid("unsupported Surge XT preset")),
     }
 }
 
@@ -1179,10 +1119,6 @@ fn sound_tool(value: &str) -> Result<&'static str, ProjectFileError> {
 fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
     match value {
         "preset" => Ok("preset"),
-        "attack" => Ok("attack"),
-        "release" => Ok("release"),
-        "cutoff" => Ok("cutoff"),
-        "resonance" => Ok("resonance"),
         "pitch" => Ok("pitch"),
         "mix" => Ok("mix"),
         "enabled" => Ok("enabled"),
@@ -1202,12 +1138,6 @@ fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
 
 fn effect_name(value: &str, allow_all: bool) -> Result<&'static str, ProjectFileError> {
     match value {
-        "Reverb" | "Room" => Ok("Reverb 2"),
-        "Echo" => Ok("Delay"),
-        "Low-pass filter" => Ok("EQ"),
-        "Punch compressor" => Ok("Conditioner"),
-        "Drive" => Ok("Distortion"),
-        "Shimmer" => Ok("Nimbus"),
         "Reverb 2" => Ok("Reverb 2"),
         "Delay" => Ok("Delay"),
         "Chorus" => Ok("Chorus"),
@@ -1319,9 +1249,9 @@ fn parse_native_overrides(
     object: &Object,
     preset: &str,
 ) -> Result<std::collections::BTreeMap<i32, f32>, ProjectFileError> {
-    let Some(value) = object.get("nativeOverrides") else {
-        return Ok(std::collections::BTreeMap::new());
-    };
+    let value = object
+        .get("nativeOverrides")
+        .ok_or_else(|| invalid("instrument nativeOverrides is required"))?;
     let values = value
         .as_object()
         .ok_or_else(|| invalid("instrument nativeOverrides must be an object"))?;
@@ -1431,6 +1361,25 @@ fn invalid(message: impl Into<String>) -> ProjectFileError {
 mod tests {
     use super::*;
 
+    fn project_with_eq() -> Project {
+        let mut project = Project::demo();
+        let track = &mut project.tracks[1];
+        let effect = Effect {
+            id: 99_000,
+            name: "EQ".to_owned(),
+            preset_slot: None,
+            mix: 0.5,
+            enabled: true,
+            parameters: crate::surge::effect_parameter_values("EQ"),
+            parameter_overrides: Vec::new(),
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
+        };
+        track.routing.effect_order.push(effect.id);
+        track.effects.push(effect);
+        project
+    }
+
     #[test]
     fn round_trips_the_demo_sound_graph() {
         let original = Project::demo();
@@ -1449,12 +1398,7 @@ mod tests {
 
     #[test]
     fn rejects_projects_missing_current_schema_fields() {
-        for pointer in [
-            "/channelOperations",
-            "/tracks/0/instrument/overrides",
-            "/tracks/0/instrument/parameters/decay",
-            "/tracks/1/effects/0/overrides",
-        ] {
+        for pointer in ["/channelOperations", "/tracks/0/instrument/nativeOverrides"] {
             let mut project: JsonValue =
                 serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
             project
@@ -1496,7 +1440,7 @@ mod tests {
             serde_json::Value::Null,
         ] {
             let mut project: serde_json::Value =
-                serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+                serde_json::from_str(&project_with_eq().to_json()).expect("demo JSON");
             project["tracks"][1]["effects"][0]["presetSlot"] = value.clone();
             let error = match parse_project(&project.to_string()) {
                 Ok(_) => panic!("accepted invalid presetSlot {value}"),
@@ -1508,7 +1452,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_preset_effect_slots() {
-        let mut project = Project::demo();
+        let mut project = project_with_eq();
         let track = &mut project.tracks[1];
         let mut duplicate = track.effects[0].clone();
         duplicate.id = 99_001;
@@ -1534,8 +1478,6 @@ mod tests {
                     name: (*name).to_owned(),
                     preset_slot: None,
                     mix: 0.5,
-                    cutoff_hz: None,
-                    resonance: None,
                     enabled: true,
                     parameters: crate::surge::effect_parameter_values(name),
                     parameter_overrides: Vec::new(),
@@ -1716,7 +1658,7 @@ mod tests {
 
     #[test]
     fn rejects_legacy_effect_aliases() {
-        let source = Project::demo().to_json().replacen(
+        let source = project_with_eq().to_json().replacen(
             "\"name\":\"EQ\"",
             "\"name\":\"Low-pass filter\"",
             1,

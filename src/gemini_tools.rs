@@ -662,7 +662,7 @@ pub(crate) fn read_sound_graph(session_path: &Path) -> Result<String, String> {
         .get_mut("tracks")
         .and_then(JsonValue::as_array_mut)
         .ok_or_else(|| "current sound graph has no tracks".to_owned())?;
-    for (track, serialized) in project.tracks.iter().zip(tracks) {
+    for serialized in tracks {
         let Some(object) = serialized.as_object_mut() else {
             continue;
         };
@@ -672,61 +672,10 @@ pub(crate) fn read_sound_graph(session_path: &Path) -> Result<String, String> {
             .get_mut("instrument")
             .and_then(JsonValue::as_object_mut)
         {
-            instrument.remove("parameters");
-            instrument.remove("overrides");
-        }
-        let aliases = crate::surge::instrument_parameters_for_instrument(&track.instrument)
-            .into_iter()
-            .filter_map(|parameter| {
-                crate::surge::instrument_graph_parameter(&track.instrument.preset, parameter.id)
-                    .map(|name| {
-                        (
-                            format!("instrument.{name}"),
-                            format!("native:{}", parameter.id),
-                        )
-                    })
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        replace_instrument_aliases(serialized, &aliases);
-        for target_list in ["modulationTargets", "automationTargets"] {
-            if let Some(targets) = serialized
-                .get_mut(target_list)
-                .and_then(JsonValue::as_array_mut)
-            {
-                targets.retain(|target| {
-                    target
-                        .get("id")
-                        .and_then(JsonValue::as_str)
-                        .is_none_or(|id| !id.starts_with("instrument."))
-                });
-            }
+            instrument.remove("nativeOverrides");
         }
     }
     Ok(graph.to_string())
-}
-
-fn replace_instrument_aliases(
-    value: &mut JsonValue,
-    aliases: &std::collections::HashMap<String, String>,
-) {
-    match value {
-        JsonValue::String(text) => {
-            if let Some(native) = aliases.get(text) {
-                *text = native.clone();
-            }
-        }
-        JsonValue::Array(values) => {
-            for value in values {
-                replace_instrument_aliases(value, aliases);
-            }
-        }
-        JsonValue::Object(object) => {
-            for value in object.values_mut() {
-                replace_instrument_aliases(value, aliases);
-            }
-        }
-        _ => {}
-    }
 }
 
 pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String> {
@@ -871,14 +820,11 @@ pub(crate) fn list_instrument_parameters(
     let parameters = selected
         .into_iter()
         .map(|parameter| {
-            let legacy_override =
-                crate::surge::legacy_instrument_parameter_override(&track.instrument, parameter.id);
             let requested_override = track
                 .instrument
                 .native_overrides
                 .get(&parameter.id)
-                .copied()
-                .or(legacy_override);
+                .copied();
             let overridden =
                 requested_override.is_some_and(|value| (value - parameter.value).abs() < 0.000_01);
             let mut value = serde_json::json!({
@@ -1067,7 +1013,6 @@ fn module_parameters<'a>(
     let matches = |parameter: &&crate::surge::InstrumentParameter| {
         let name = parameter.name.as_str();
         match module {
-            "quick" => crate::surge::instrument_graph_parameter("Init", parameter.id).is_some(),
             "global" => !name.starts_with("Scene ") && !is_effect_slot_parameter(name),
             _ => scene_module_matches(name, module),
         }
@@ -1194,12 +1139,6 @@ pub(crate) fn list_sound_tool_parameters(
                 serde_json::json!({"parameter":"enabled","name":"Enabled","value":effect.enabled,"type":"boolean"}),
                 serde_json::json!({"parameter":"mix","name":"Mix","value":effect.mix,"minimum":0,"maximum":1}),
             ];
-            if let Some(value) = effect.cutoff_hz {
-                values.push(serde_json::json!({"parameter":"cutoff","name":"Cutoff","value":value,"minimum":80,"maximum":16000,"unit":"Hz"}));
-            }
-            if let Some(value) = effect.resonance {
-                values.push(serde_json::json!({"parameter":"resonance","name":"Resonance","value":value,"minimum":0.1,"maximum":20,"unit":"Q"}));
-            }
             let mut discovered = crate::surge::effect_parameter_values(&effect.name);
             for (parameter, value) in &effect.parameters {
                 if discovered.contains_key(parameter) {
@@ -2478,6 +2417,24 @@ fn write_replace(path: &Path, source: &str) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn project_with_effect(name: &str) -> Project {
+        let mut project = Project::demo();
+        let effect = crate::model::Effect {
+            id: 99_000,
+            name: name.to_owned(),
+            preset_slot: None,
+            mix: 0.5,
+            enabled: true,
+            parameters: crate::surge::effect_parameter_values(name),
+            parameter_overrides: Vec::new(),
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
+        };
+        project.tracks[0].routing.effect_order.push(effect.id);
+        project.tracks[0].effects.push(effect);
+        project
+    }
+
     #[test]
     fn declares_direct_graph_editing_and_audio_tools() {
         let declarations = tool_declarations();
@@ -2707,7 +2664,7 @@ mod tests {
 
     #[test]
     fn formula_discovery_routes_long_source_to_modulator_update() {
-        let mut project = Project::demo();
+        let mut project = project_with_effect("Delay");
         project.tracks[1].modulators[0].shape = "formula".to_owned();
         project.tracks[1].modulators[0].formula = "return sin(phase)".to_owned();
         let track = &project.tracks[1];
@@ -2736,7 +2693,7 @@ mod tests {
 
     #[test]
     fn effect_discovery_exposes_only_native_surge_names() {
-        let mut project = Project::demo();
+        let mut project = project_with_effect("Exciter");
         let track = &mut project.tracks[0];
         let effect = &mut track.effects[0];
         effect.name = "Delay".to_owned();
@@ -2777,7 +2734,7 @@ mod tests {
 
     #[test]
     fn generic_effect_discovery_returns_every_surge_control_with_semantics() {
-        let mut project = Project::demo();
+        let mut project = project_with_effect("Graphic EQ");
         let track = &mut project.tracks[0];
         let effect = &mut track.effects[0];
         effect.name = "Exciter".to_owned();
@@ -2813,7 +2770,7 @@ mod tests {
 
     #[test]
     fn every_discovered_native_effect_parameter_is_editable() {
-        let mut project = Project::demo();
+        let mut project = project_with_effect("Graphic EQ");
         let track = &mut project.tracks[0];
         let effect = &mut track.effects[0];
         effect.name = "Graphic EQ".to_owned();

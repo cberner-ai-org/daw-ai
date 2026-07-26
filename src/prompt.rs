@@ -113,8 +113,6 @@ struct PromptContext<'a> {
 #[derive(Clone, Copy)]
 struct DropBass {
     track_id: u64,
-    instrument_id: u64,
-    modulator_id: Option<u64>,
 }
 
 impl PromptEngine {
@@ -221,59 +219,6 @@ impl PromptEngine {
                     ),
                 };
             }
-        }
-
-        if contains_any(
-            &normalized,
-            &["lfo", "modulator", "modulation", "vibrato", "tremolo"],
-        ) {
-            if let Some(target) = target {
-                let parameter = if contains_any(&normalized, &["pitch", "vibrato"]) {
-                    "instrument.pitch"
-                } else if contains_any(&normalized, &["volume", "level", "tremolo"]) {
-                    "track.volume"
-                } else {
-                    "instrument.cutoff"
-                };
-                return EditPlan {
-                    action: Action::Modulator {
-                        parameter: parameter.to_owned(),
-                        shape: "sine",
-                        rate: if parameter == "instrument.pitch" {
-                            5.0
-                        } else {
-                            0.5
-                        },
-                        depth: 0.2,
-                        target,
-                    },
-                    summary: format!("Added moving modulation to the {}", target.display_name()),
-                };
-            }
-        }
-
-        if let (Some(preset), Some(target)) = (surge_preset_name(&normalized), target) {
-            if wants_addition {
-                return EditPlan {
-                    action: Action::Compound {
-                        actions: vec![
-                            Action::AddTrack { role: target },
-                            Action::Instrument { preset, target },
-                        ],
-                    },
-                    summary: format!(
-                        "Added a new {} part with the {preset} patch",
-                        target.display_name()
-                    ),
-                };
-            }
-            return EditPlan {
-                action: Action::Instrument { preset, target },
-                summary: format!(
-                    "Changed the {} instrument to the {preset} patch",
-                    target.display_name()
-                ),
-            };
         }
 
         let mut removed_effects = removable_effect_names(&normalized);
@@ -522,72 +467,6 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
             ]),
         },
     ]);
-    if let Some(bass) = drop_bass {
-        actions.push(Action::Configure {
-            track_id: bass.track_id,
-            target: TrackRole::Bass,
-            tool: "instrument",
-            tool_id: bass.instrument_id,
-            clip_id: None,
-            parameter: "preset",
-            value: "Surge Bass".to_owned(),
-        });
-    } else {
-        actions.push(Action::Instrument {
-            preset: "Surge Bass",
-            target: TrackRole::Bass,
-        });
-    }
-    if let Some((track_id, tool_id)) =
-        drop_bass.and_then(|bass| bass.modulator_id.map(|id| (bass.track_id, id)))
-    {
-        actions.extend([
-            Action::Configure {
-                track_id,
-                target: TrackRole::Bass,
-                tool: "modulator",
-                tool_id,
-                clip_id: None,
-                parameter: "shape",
-                value: "square".to_owned(),
-            },
-            Action::Configure {
-                track_id,
-                target: TrackRole::Bass,
-                tool: "modulator",
-                tool_id,
-                clip_id: None,
-                parameter: "rate",
-                value: "2".to_owned(),
-            },
-            Action::Configure {
-                track_id,
-                target: TrackRole::Bass,
-                tool: "modulator",
-                tool_id,
-                clip_id: None,
-                parameter: "depth",
-                value: "0.72".to_owned(),
-            },
-            Action::Configure {
-                track_id,
-                target: TrackRole::Bass,
-                tool: "modulator",
-                tool_id,
-                clip_id: None,
-                parameter: "enabled",
-                value: "true".to_owned(),
-            },
-        ]);
-    } else {
-        actions.push(Action::Modulator {
-            parameter: "instrument.cutoff".to_owned(),
-            shape: "square",
-            rate: 2.0,
-            depth: 0.72,
-            target: TrackRole::Bass,
-        });
-    }
     actions.push(Action::Effect {
         name: "Conditioner",
         mix: 0.68,
@@ -634,16 +513,7 @@ fn drop_bass_for_selection(context: PromptContext<'_>) -> Option<DropBass> {
                     && same_time(clip.start, context.selection_start)
                     && same_time(clip.end, context.selection_end)
             });
-        owns_selection.then(|| DropBass {
-            track_id: track.id,
-            instrument_id: track.instrument.id,
-            modulator_id: track
-                .modulators
-                .iter()
-                .rev()
-                .find(|modulator| modulator.target == "instrument.cutoff")
-                .map(|modulator| modulator.id),
-        })
+        owns_selection.then_some(DropBass { track_id: track.id })
     })
 }
 
@@ -812,20 +682,6 @@ fn removable_effect_names(prompt: &str) -> Vec<&'static str> {
         names.push("Nimbus");
     }
     names
-}
-
-fn surge_preset_name(prompt: &str) -> Option<&'static str> {
-    if contains_any(prompt, &["saw", "sawtooth"]) {
-        Some("Surge Lead")
-    } else if contains_any(prompt, &["square", "pulse wave"]) {
-        Some("Surge Bass")
-    } else if contains_any(prompt, &["triangle wave", "triangle waveform"]) {
-        Some("Surge Pad")
-    } else if contains_any(prompt, &["sine", "sine wave"]) {
-        Some("Init")
-    } else {
-        None
-    }
 }
 
 fn creative_fallback(prompt: &str, target: Option<TrackRole>) -> EditPlan {
@@ -1044,16 +900,8 @@ mod tests {
         );
         assert_eq!(
             PromptEngine::interpret("add a sawtooth lead", 112).action,
-            Action::Compound {
-                actions: vec![
-                    Action::AddTrack {
-                        role: TrackRole::Lead,
-                    },
-                    Action::Instrument {
-                        preset: "Surge Lead",
-                        target: TrackRole::Lead,
-                    },
-                ],
+            Action::AddTrack {
+                role: TrackRole::Lead,
             }
         );
     }
@@ -1072,37 +920,6 @@ mod tests {
             Action::Gain {
                 amount: 1.28,
                 target: None,
-            }
-        );
-    }
-
-    #[test]
-    fn understands_instrument_and_modulator_requests() {
-        assert_eq!(
-            PromptEngine::interpret("use a sawtooth waveform for the bass", 112).action,
-            Action::Instrument {
-                preset: "Surge Lead",
-                target: TrackRole::Bass,
-            }
-        );
-        assert_eq!(
-            PromptEngine::interpret("add vibrato modulation to the lead", 112).action,
-            Action::Modulator {
-                parameter: "instrument.pitch".to_owned(),
-                shape: "sine",
-                rate: 5.0,
-                depth: 0.2,
-                target: TrackRole::Lead,
-            }
-        );
-        assert_eq!(
-            PromptEngine::interpret("add a sawtooth LFO to the bass", 112).action,
-            Action::Modulator {
-                parameter: "instrument.cutoff".to_owned(),
-                shape: "sine",
-                rate: 0.5,
-                depth: 0.2,
-                target: TrackRole::Bass,
             }
         );
     }
