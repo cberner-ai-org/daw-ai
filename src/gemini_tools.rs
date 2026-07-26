@@ -390,7 +390,7 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         }),
         function(
             PRESET_TOOL_NAME,
-            "Browse one level of the installed Surge XT factory preset hierarchy. Start at Factory, choose a child folder from the returned musical metadata, and continue until preset IDs are returned for set_surge_preset.",
+            "Browse one level of the installed Surge XT factory preset hierarchy. Start at Factory and continue with exact returned folder paths until preset IDs are returned for set_surge_preset.",
             object_schema(
                 serde_json::json!({
                     "path":{"type":"string","minLength":7,"maxLength":160,"description":"Exact folder path returned by a prior call. Omit to browse the Factory root."}
@@ -446,14 +446,12 @@ fn function(name: &str, description: &str, parameters: JsonValue) -> JsonValue {
 
 fn mutation_tool_declarations() -> Vec<JsonValue> {
     let id = || serde_json::json!({"type":"integer","minimum":1});
-    let role =
-        || serde_json::json!({"type":"string","enum":["drums","bass","chords","lead","texture"]});
     let notes = || {
         serde_json::json!({
             "type":"array","maxItems":128,"items":{"type":"object","properties":{
                 "time":{"type":"number","minimum":0,"maximum":256,"description":"Beat offset from the clip start."},
                 "duration":{"type":"number","minimum":0.0625,"maximum":256},
-                "pitch":{"type":"integer","minimum":0,"maximum":127,"description":"For a dedicated starter drum voice use only its canonical pitch: kick 36, snare 38, closedHat 42, openHat 46, crash 49. Never combine drum voices on one Surge track."},
+                "pitch":{"type":"integer","minimum":0,"maximum":127},
                 "velocity":{"type":"number","minimum":0.01,"maximum":1}
             },"required":["time","duration","pitch","velocity"],"additionalProperties":false}
         })
@@ -463,7 +461,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             "trackId":id(), "label":{"type":"string","minLength":1,"maxLength":64},
             "startBeat":{"type":"number","minimum":0,"description":"Absolute beat from the start of the project."},
             "durationBeats":{"type":"number","minimum":0.25,"maximum":256},
-            "playback":{"description":"Default to loop for drums, bass grooves, chord accompaniment, arpeggios, and riffs. Use once mainly for melodies, fills, transitions, or material whose individual events genuinely develop without repetition.","oneOf":[
+            "playback":{"oneOf":[
                 {"type":"object","properties":{"mode":{"type":"string","enum":["loop"]},"lengthBeats":{"type":"number","minimum":0.25,"maximum":16}},"required":["mode","lengthBeats"],"additionalProperties":false},
                 {"type":"object","properties":{"mode":{"type":"string","enum":["once"]}},"required":["mode"],"additionalProperties":false}
             ]},
@@ -473,14 +471,8 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
     vec![
         function(
             "new_track",
-            "Create one neutral Surge XT track at unity gain with the Init preset, no MIDI clips, effects, or modulators. You must explicitly choose every desired preset, effect, modulator, and mix change. For drums, one track is one drum voice: drumVoice is required and explicitly selects that Surge starter patch. Returns stable IDs for subsequent calls.",
-            object_schema(
-                serde_json::json!({
-                    "role":role(),
-                    "drumVoice":{"type":"string","enum":["kick","snare","closedHat","openHat","crash"],"description":"Required for role=drums and invalid for other roles. Explicitly selects one dedicated Surge starter patch."}
-                }),
-                &["role"],
-            ),
+            "Create one Surge XT track with the Init preset, no clips, effects, or modulators. Returns its stable ID.",
+            object_schema(serde_json::json!({}), &[]),
         ),
         function(
             "delete_track",
@@ -500,7 +492,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "add_midi_clip",
-            "Add a beat-positioned MIDI clip without changing other clips. Default rhythmic accompaniment to a 4-, 8-, or 16-beat loop; use once mainly for melody and genuinely non-repeating fills, transitions, or development.",
+            "Add a beat-positioned MIDI clip without changing other clips.",
             object_schema(
                 clip_properties(),
                 &[
@@ -715,8 +707,78 @@ pub(crate) struct AudioRenderRequest {
 }
 
 pub(crate) fn read_sound_graph(session_path: &Path) -> Result<String, String> {
-    fs::read_to_string(session_path.join(GRAPH_FILE))
-        .map_err(|error| format!("could not read current sound graph: {error}"))
+    let project = current_project(session_path)?;
+    let mut graph = serde_json::from_str::<JsonValue>(&project.to_json())
+        .map_err(|error| format!("could not serialize current sound graph: {error}"))?;
+    let tracks = graph
+        .get_mut("tracks")
+        .and_then(JsonValue::as_array_mut)
+        .ok_or_else(|| "current sound graph has no tracks".to_owned())?;
+    for (track, serialized) in project.tracks.iter().zip(tracks) {
+        let Some(object) = serialized.as_object_mut() else {
+            continue;
+        };
+        object.remove("name");
+        object.remove("role");
+        if let Some(instrument) = object
+            .get_mut("instrument")
+            .and_then(JsonValue::as_object_mut)
+        {
+            instrument.remove("parameters");
+            instrument.remove("overrides");
+        }
+        let aliases = crate::surge::instrument_parameters_for_instrument(&track.instrument)
+            .into_iter()
+            .filter_map(|parameter| {
+                crate::surge::instrument_graph_parameter(&track.instrument.preset, parameter.id)
+                    .map(|name| {
+                        (
+                            format!("instrument.{name}"),
+                            format!("native:{}", parameter.id),
+                        )
+                    })
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        replace_instrument_aliases(serialized, &aliases);
+        for target_list in ["modulationTargets", "automationTargets"] {
+            if let Some(targets) = serialized
+                .get_mut(target_list)
+                .and_then(JsonValue::as_array_mut)
+            {
+                targets.retain(|target| {
+                    target
+                        .get("id")
+                        .and_then(JsonValue::as_str)
+                        .is_none_or(|id| !id.starts_with("instrument."))
+                });
+            }
+        }
+    }
+    Ok(graph.to_string())
+}
+
+fn replace_instrument_aliases(
+    value: &mut JsonValue,
+    aliases: &std::collections::HashMap<String, String>,
+) {
+    match value {
+        JsonValue::String(text) => {
+            if let Some(native) = aliases.get(text) {
+                *text = native.clone();
+            }
+        }
+        JsonValue::Array(values) => {
+            for value in values {
+                replace_instrument_aliases(value, aliases);
+            }
+        }
+        JsonValue::Object(object) => {
+            for value in object.values_mut() {
+                replace_instrument_aliases(value, aliases);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String> {
@@ -740,13 +802,10 @@ pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String
         .folders
         .iter()
         .map(|folder| {
-            let (description, suggested_roles) = preset_folder_metadata(&folder.path);
             serde_json::json!({
                 "name":folder.name,
                 "path":folder.path,
-                "presetCount":folder.preset_count,
-                "description":description,
-                "suggestedRoles":suggested_roles
+                "presetCount":folder.preset_count
             })
         })
         .collect::<Vec<_>>();
@@ -756,19 +815,15 @@ pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String
         .map(|preset| {
             serde_json::json!({
                 "id":preset.id,
-                "name":preset.name,
-                "nameHints":preset_name_hints(&preset.name)
+                "name":preset.name
             })
         })
         .collect::<Vec<_>>();
-    let (description, suggested_roles) = preset_folder_metadata(&level.path);
     Ok(serde_json::json!({
         "installed":!catalog.is_empty(),
         "total":catalog.len(),
         "path":level.path,
         "parent":level.parent,
-        "description":description,
-        "suggestedRoles":suggested_roles,
         "folders":folders,
         "presets":presets
     })
@@ -803,7 +858,6 @@ pub(crate) fn list_instrument_parameters(
             "preset": track.instrument.preset,
             "midiContext": surge_midi_context(&parameters),
             "modules": [
-                module_entry("quick", "Quick Controls", 8),
                 global,
                 module_entry("scene:a", "Scene A", 0),
                 module_entry("scene:b", "Scene B", 0),
@@ -881,10 +935,6 @@ pub(crate) fn list_instrument_parameters(
                 requested_override.is_some_and(|value| (value - parameter.value).abs() < 0.000_01);
             let mut value = serde_json::json!({
                 "parameter": format!("native:{}", parameter.id),
-                "graphParameter": crate::surge::instrument_graph_parameter(
-                    &track.instrument.preset,
-                    parameter.id
-                ),
                 "name": parameter.name,
                 "value": parameter.value,
                 "presetValue": parameter.preset_value,
@@ -953,7 +1003,6 @@ fn surge_midi_context(parameters: &[crate::surge::InstrumentParameter]) -> JsonV
             .map(|parameter| parameter.display.clone())
     };
     serde_json::json!({
-        "recommendedRange": null,
         "sceneMode": display("Scene Mode"),
         "splitPoint": display("Split Point"),
         "sceneA": {
@@ -1338,112 +1387,6 @@ fn display_parameter_name(name: &str) -> String {
     display
 }
 
-fn preset_folder_metadata(path: &str) -> (&'static str, &'static [&'static str]) {
-    let category = path
-        .strip_prefix("Factory/")
-        .unwrap_or(path)
-        .split('/')
-        .next()
-        .unwrap_or(path);
-    match category {
-        "Basses" => (
-            "Bass patches ranging from subs to harmonically rich and designed basses.",
-            &["bass"],
-        ),
-        "Brass" => (
-            "Synth and modeled brass colors for stabs, chords, and leads.",
-            &["chords", "lead"],
-        ),
-        "Chords" => (
-            "Patches designed for chordal playing and rhythmic stabs.",
-            &["chords"],
-        ),
-        "FX" => (
-            "Sound effects, transitions, atmospheres, impacts, and unusual textures.",
-            &["texture"],
-        ),
-        "Keys" => (
-            "Keyboard-like patches for harmony, riffs, and melodic parts.",
-            &["chords", "lead"],
-        ),
-        "Leads" => (
-            "Monophonic and polyphonic foreground synth voices.",
-            &["lead"],
-        ),
-        "MPE" => (
-            "Expressive patches designed for multidimensional performance.",
-            &["lead", "chords", "texture"],
-        ),
-        "Pads" => (
-            "Sustained, spacious, and evolving harmonic textures.",
-            &["chords", "texture"],
-        ),
-        "Percussion" => (
-            "Individual synthesized kicks, snares, toms, and percussion sounds.",
-            &["drums"],
-        ),
-        "Plucks" => (
-            "Short, percussive tonal patches for riffs, arpeggios, and melodies.",
-            &["lead", "chords"],
-        ),
-        "Polysynths" => (
-            "General polyphonic synthesizer patches for chords and stacked melodies.",
-            &["chords", "lead"],
-        ),
-        "Sequences" => (
-            "Rhythmic and internally animated patches that may carry their own motion.",
-            &["lead", "texture"],
-        ),
-        "Splits" => (
-            "Keyboard-split patches combining multiple timbral regions.",
-            &["chords", "lead"],
-        ),
-        "Templates" => (
-            "Sound-design starting points rather than finished role-specific patches.",
-            &["bass", "chords", "lead", "texture"],
-        ),
-        "Tutorials" => (
-            "Educational patches demonstrating Surge synthesis and modulation techniques.",
-            &["texture"],
-        ),
-        "Vocoder" => (
-            "Patches intended for vocoder-style or formant-focused sounds.",
-            &["lead", "texture"],
-        ),
-        "Winds" => (
-            "Synthesized and modeled wind-instrument colors.",
-            &["lead", "chords"],
-        ),
-        _ => ("Installed Surge XT factory preset folders.", &[]),
-    }
-}
-
-fn preset_name_hints(name: &str) -> Vec<&'static str> {
-    let name = name.to_ascii_lowercase();
-    [
-        ("sub", "sub-bass"),
-        ("dist", "distorted"),
-        ("dirty", "distorted"),
-        ("saw", "saw"),
-        ("fm", "fm"),
-        ("acid", "acid"),
-        ("pluck", "pluck"),
-        ("bell", "bell"),
-        ("warm", "warm"),
-        ("soft", "soft"),
-        ("pad", "pad"),
-        ("drone", "drone"),
-        ("kick", "kick"),
-        ("snare", "snare"),
-        ("seq", "sequence"),
-        ("vocal", "vocal"),
-        ("choir", "choir"),
-    ]
-    .into_iter()
-    .filter_map(|(needle, hint)| name.contains(needle).then_some(hint))
-    .collect()
-}
-
 pub(crate) fn is_mutation_tool(name: &str) -> bool {
     MUTATION_TOOL_NAMES.contains(&name)
 }
@@ -1466,41 +1409,11 @@ pub(crate) fn apply_agent_mutation(
     let mut midi_context = None;
     let summary = match name {
         "new_track" => {
-            let role = required_role(object, "role")?;
             let id = studio
-                .add_empty_channel(role)
+                .add_empty_channel(TrackRole::Texture)
                 .map_err(studio_error_message)?;
-            let drum_voice = object.get("drumVoice").and_then(JsonValue::as_str);
-            if role != TrackRole::Drums && drum_voice.is_some() {
-                return Err("drumVoice is only valid when role is drums".to_owned());
-            }
-            if role == TrackRole::Drums && drum_voice.is_none() {
-                return Err("drumVoice is required when role is drums".to_owned());
-            }
-            let voice = if role == TrackRole::Drums {
-                drum_voice
-            } else {
-                None
-            };
-            if let Some(voice) = voice {
-                let (preset, _) = drum_voice_spec(voice)?;
-                let instrument_id = studio
-                    .project()
-                    .tracks
-                    .iter()
-                    .find(|track| track.id == id)
-                    .map(|track| track.instrument.id)
-                    .ok_or_else(|| format!("track {id} does not exist"))?;
-                studio
-                    .configure_sound_tool(id, "instrument", instrument_id, None, "preset", preset)
-                    .map_err(studio_error_message)?;
-            }
             result_id = Some(id);
-            if let Some(voice) = voice {
-                format!("Created drums {voice} voice track {id}")
-            } else {
-                format!("Created {} track {id}", role.as_str())
-            }
+            format!("Created track {id}")
         }
         "delete_track" => {
             let id = required_id(object, "trackId")?;
@@ -1547,7 +1460,6 @@ pub(crate) fn apply_agent_mutation(
         "add_midi_clip" => {
             let (track_id, spec) = clip_arguments(object, studio.project().bpm)?;
             validate_clip_selection(&spec, selection_start, selection_end)?;
-            validate_surge_drum_notes(studio.project(), track_id, &spec.notes)?;
             let id = studio
                 .create_midi_clip(track_id, &spec)
                 .map_err(studio_error_message)?;
@@ -1557,7 +1469,6 @@ pub(crate) fn apply_agent_mutation(
         "update_midi_clip" => {
             let clip_id = required_id(object, "clipId")?;
             let (track_id, spec) = clip_arguments(object, studio.project().bpm)?;
-            validate_surge_drum_notes(studio.project(), track_id, &spec.notes)?;
             studio
                 .replace_midi_clip(track_id, clip_id, &spec, selection_start, selection_end)
                 .map_err(studio_error_message)?;
@@ -1896,58 +1807,6 @@ fn validate_clip_selection(
     Ok(())
 }
 
-fn drum_voice_spec(voice: &str) -> Result<(&'static str, u8), String> {
-    match voice {
-        "kick" => Ok(("Surge Kick", 36)),
-        "snare" => Ok(("Surge Snare", 38)),
-        "closedHat" => Ok(("Surge Closed Hat", 42)),
-        "openHat" => Ok(("Surge Open Hat", 46)),
-        "crash" => Ok(("Surge Crash", 49)),
-        _ => Err("drumVoice must be kick, snare, closedHat, openHat, or crash".to_owned()),
-    }
-}
-
-fn validate_surge_drum_notes(
-    project: &Project,
-    track_id: u64,
-    notes: &[crate::prompt::MidiNote],
-) -> Result<(), String> {
-    let track = project
-        .tracks
-        .iter()
-        .find(|track| track.id == track_id)
-        .ok_or_else(|| format!("track {track_id} does not exist"))?;
-    if track.role != TrackRole::Drums {
-        return Ok(());
-    }
-    let expected = match track.instrument.preset.as_str() {
-        "Surge Kick" => Some(36),
-        "Surge Snare" => Some(38),
-        "Surge Closed Hat" => Some(42),
-        "Surge Open Hat" => Some(46),
-        "Surge Crash" => Some(49),
-        _ => None,
-    };
-    if let Some(expected) = expected {
-        if notes.iter().any(|note| note.pitch != expected) {
-            return Err(format!(
-                "this Surge drum voice accepts only MIDI pitch {expected}; create a separate drums track with the matching drumVoice for other sounds"
-            ));
-        }
-    } else {
-        let mut pitches = notes.iter().map(|note| note.pitch).collect::<Vec<_>>();
-        pitches.sort_unstable();
-        pitches.dedup();
-        if pitches.len() > 1 {
-            return Err(
-                "a Surge percussion preset is one pitched instrument, not a General MIDI kit; use one pitch on this track and create separate drums tracks for other voices"
-                    .to_owned(),
-            );
-        }
-    }
-    Ok(())
-}
-
 fn required_id(object: &Map<String, JsonValue>, name: &str) -> Result<u64, String> {
     object
         .get(name)
@@ -1983,11 +1842,6 @@ fn required_string<'a>(object: &'a Map<String, JsonValue>, name: &str) -> Result
         .and_then(JsonValue::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("{name} must be a nonempty string"))
-}
-
-fn required_role(object: &Map<String, JsonValue>, name: &str) -> Result<TrackRole, String> {
-    TrackRole::from_name(required_string(object, name)?)
-        .ok_or_else(|| format!("{name} is not a supported track role"))
 }
 
 fn clip_arguments(
@@ -2218,8 +2072,6 @@ fn audio_measurements(
                 .map(|track| {
                     serde_json::json!({
                         "trackId": track.id,
-                        "name": track.name,
-                        "role": track.role.as_str(),
                         "muted": track.muted,
                         "measurements": region_measurements(region)
                     })
@@ -2337,9 +2189,7 @@ fn audio_region_arguments(
                     let available = project
                         .tracks
                         .iter()
-                        .map(|track| {
-                            format!("{} ({}, {})", track.id, track.name, track.role.as_str())
-                        })
+                        .map(|track| track.id.to_string())
                         .collect::<Vec<_>>()
                         .join(", ");
                     return Err(format!(
@@ -2380,7 +2230,7 @@ fn selected_channel_labels(project: &Project, track_ids: &[u64]) -> String {
     track_ids
         .iter()
         .filter_map(|track_id| project.tracks.iter().find(|track| track.id == *track_id))
-        .map(|track| format!("{} ({}, ID {})", track.name, track.role.as_str(), track.id))
+        .map(|track| format!("Track ID {}", track.id))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2419,10 +2269,7 @@ fn sound_tool_inventory(project: &Project) -> Vec<JsonValue> {
         .map(|track| {
             serde_json::json!({
                 "id": track.id,
-                "name": track.name,
-                "role": track.role.as_str(),
                 "instrumentId": track.instrument.id,
-                "instrumentParameters": crate::model::instrument_parameter_names(),
                 "effects": track.effects.iter().map(|effect| {
                     serde_json::json!({"id": effect.id, "name": effect.name})
                 }).collect::<Vec<_>>(),
@@ -2810,17 +2657,20 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "add_midi_clip")
             .expect("MIDI clip declaration");
-        assert!(
-            midi["description"]
-                .as_str()
-                .unwrap()
-                .contains("Default rhythmic accompaniment")
+        assert_eq!(
+            midi["description"],
+            "Add a beat-positioned MIDI clip without changing other clips."
         );
-        assert!(
-            midi["parameters"]["properties"]["playback"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("Default to loop for drums")
+        let new_track = declarations
+            .iter()
+            .find(|tool| tool["name"] == "new_track")
+            .expect("new track declaration");
+        assert_eq!(
+            new_track["parameters"]["properties"]
+                .as_object()
+                .expect("new track properties")
+                .len(),
+            0
         );
         let update_modulator = declarations
             .iter()
@@ -2833,49 +2683,24 @@ mod tests {
     }
 
     #[test]
-    fn instrument_parameter_listing_reports_legacy_graph_overrides() {
+    fn sound_graph_hides_legacy_convenience_parameters() {
         let mut project = Project::demo();
-        let track_id = project.tracks[1].id;
-        {
-            let track = &mut project.tracks[1];
-            track.instrument.native_overrides.clear();
-            track.instrument.cutoff = 0.123;
-            track
-                .instrument
-                .parameter_overrides
-                .push("cutoff".to_owned());
-        }
+        project.tracks[1].modulators[0].target = "instrument.cutoff".to_owned();
         let session =
             EditSession::create(&project, "inspect migrated controls", 0.0, 1.0).expect("session");
-        let preset_cutoff_display =
-            crate::surge::instrument_parameters(&project.tracks[1].instrument.preset)
-                .into_iter()
-                .find(|parameter| {
-                    crate::surge::instrument_graph_parameter(
-                        &project.tracks[1].instrument.preset,
-                        parameter.id,
-                    ) == Some("cutoff")
-                })
-                .expect("preset cutoff")
-                .display;
-
-        let response = list_instrument_parameters(
-            session.path(),
-            &serde_json::json!({"trackId":track_id,"module":"quick"}),
-        )
-        .expect("instrument parameters");
-        let response: JsonValue = serde_json::from_str(&response).expect("parameter JSON");
-        let cutoff = response["parameters"]
-            .as_array()
-            .and_then(|parameters| {
-                parameters
-                    .iter()
-                    .find(|parameter| parameter["graphParameter"] == "cutoff")
-            })
-            .expect("cutoff parameter");
-        assert!((cutoff["value"].as_f64().expect("cutoff value") - 0.123).abs() < 0.000_001);
-        assert_eq!(cutoff["overridden"], true);
-        assert_ne!(cutoff["display"], preset_cutoff_display);
+        let response = read_sound_graph(session.path()).expect("sound graph");
+        let response: JsonValue = serde_json::from_str(&response).expect("graph JSON");
+        let track = &response["tracks"][1];
+        assert!(track.get("name").is_none());
+        assert!(track.get("role").is_none());
+        assert!(track["instrument"].get("parameters").is_none());
+        assert!(track["instrument"].get("overrides").is_none());
+        assert!(!response.to_string().contains("instrument.cutoff"));
+        assert!(
+            track["modulators"][0]["target"]
+                .as_str()
+                .is_some_and(|target| target.starts_with("native:"))
+        );
     }
 
     #[test]
@@ -2889,10 +2714,10 @@ mod tests {
         )
         .expect("module JSON");
         let modules = index["modules"].as_array().expect("modules");
-        assert_eq!(modules.len(), 5);
-        assert_eq!(modules[0]["id"], "quick");
+        assert_eq!(modules.len(), 4);
+        assert_eq!(modules[0]["id"], "global");
         assert!(index["midiContext"].is_object());
-        assert!(index["midiContext"]["recommendedRange"].is_null());
+        assert!(index["midiContext"].get("recommendedRange").is_none());
         assert!(index.to_string().len() < 2_000);
 
         let scene: JsonValue = serde_json::from_str(
@@ -3376,12 +3201,8 @@ mod tests {
         let original = Project::demo();
         let session =
             EditSession::create(&original, "shape the bass", 4.0, 8.0).expect("edit session");
-        let response = apply_agent_mutation(
-            session.path(),
-            "new_track",
-            &serde_json::json!({"role":"lead"}),
-        )
-        .expect("new track");
+        let response = apply_agent_mutation(session.path(), "new_track", &serde_json::json!({}))
+            .expect("new track");
         let response: JsonValue = serde_json::from_str(&response).unwrap();
         let track_id = response["id"].as_u64().expect("created track ID");
         let (plan, project) = session.take_update().unwrap().expect("published update");
@@ -3404,40 +3225,21 @@ mod tests {
     }
 
     #[test]
-    fn drum_tracks_are_dedicated_surge_voices() {
+    fn midi_pitches_are_not_constrained_by_track_opinions() {
         let original = Project::initial();
-        let session = EditSession::create(&original, "add hats", 0.0, 4.0).expect("edit session");
-        let error = apply_agent_mutation(
-            session.path(),
-            "new_track",
-            &serde_json::json!({"role":"drums"}),
-        )
-        .expect_err("drum voice must be explicit");
-        assert!(error.contains("drumVoice is required"), "{error}");
-
-        let response = apply_agent_mutation(
-            session.path(),
-            "new_track",
-            &serde_json::json!({"role":"drums","drumVoice":"closedHat"}),
-        )
-        .expect("new drum voice");
+        let session = EditSession::create(&original, "add notes", 0.0, 4.0).expect("edit session");
+        let response = apply_agent_mutation(session.path(), "new_track", &serde_json::json!({}))
+            .expect("new track");
         let response: JsonValue = serde_json::from_str(&response).unwrap();
         let track_id = response["id"].as_u64().expect("created track ID");
-        let (_, project) = session.take_update().unwrap().expect("published update");
-        let track = project
-            .tracks
-            .iter()
-            .find(|track| track.id == track_id)
-            .expect("created drum voice");
-        assert_eq!(track.instrument.preset, "Surge Closed Hat");
-        assert!(track.instrument.parameter_overrides.is_empty());
+        session.take_update().unwrap().expect("published update");
 
-        let error = apply_agent_mutation(
+        apply_agent_mutation(
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
                 "trackId":track_id,
-                "label":"Invalid combined kit",
+                "label":"Multiple pitches",
                 "startBeat":0,
                 "durationBeats":4,
                 "playback":{"mode":"loop","lengthBeats":4},
@@ -3447,8 +3249,7 @@ mod tests {
                 ]
             }),
         )
-        .expect_err("combined kit must be rejected");
-        assert!(error.contains("only MIDI pitch 42"), "{error}");
+        .expect("multiple pitches are valid");
     }
 
     #[test]
@@ -3508,7 +3309,8 @@ mod tests {
             .find(|folder| folder["path"] == "Factory/Pads")
             .expect("Pads folder");
         assert!(pads["presetCount"].as_u64().unwrap() > 10);
-        assert_eq!(pads["suggestedRoles"][0], "chords");
+        assert!(pads.get("suggestedRoles").is_none());
+        assert!(pads.get("description").is_none());
 
         let catalog: JsonValue = serde_json::from_str(
             &list_surge_presets(&serde_json::json!({"path":"Factory/Leads"}))
@@ -3548,7 +3350,7 @@ mod tests {
         .expect("factory preset mutation");
         let response: JsonValue = serde_json::from_str(&response).expect("mutation JSON");
         assert!(response["midiContext"]["sceneMode"].is_string());
-        assert!(response["midiContext"]["recommendedRange"].is_null());
+        assert!(response["midiContext"].get("recommendedRange").is_none());
         let (_, project) = session.take_update().unwrap().expect("published update");
         assert_eq!(project.tracks[2].instrument.preset, preset_with_effects.id);
         assert!(
@@ -3831,7 +3633,7 @@ mod tests {
         )
         .expect_err("unknown channel");
         assert!(error.contains("available track IDs"));
-        assert!(error.contains("1 (Pulse Kit, drums)"));
+        assert!(error.contains("available track IDs: 1"));
     }
 
     #[test]

@@ -57,7 +57,7 @@ For each prompt, Gemini receives the edit range and checked-in studio contract u
 
 Surge factory patches expose their embedded effect slots in the same sound graph as added effects. New effects append after the preset chain instead of replacing it, and changing presets refreshes only the preset-sourced effects. New effects are initialized from Surge's native state without DAW-AI aliases or parameter defaults. Instrument controls expose separately named edit and modulation fields, while effect discovery returns all native controls in one call with Surge-native names, choices, values, display text, and semantics.
 
-Surge patches do not define a recommended MIDI-note range. Preset loading and instrument discovery therefore report `recommendedRange: null` plus Surge's scene mode, split point, and scene pitch/octave settings. These are authoritative register clues, not a fabricated recommendation; Gemini should audition the patch when choosing its musical register.
+Surge patches expose their scene mode, split point, and scene pitch/octave settings directly. DAW-AI does not add a recommended MIDI-note range.
 
 Gemini may render before or after edits whenever listening would help, but no separate model reviews or rejects its completion decision. It may also complete based on graph inspection alone. There is no predetermined iteration or tool-call limit; the overall 20-minute request timeout is the loop boundary. The server publishes each successful atomic mutation as an undoable edit while Gemini is still working. Direct Advanced edits and channel creation or deletion use the same persisted graph.
 
