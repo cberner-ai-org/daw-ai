@@ -208,12 +208,23 @@ mod tests {
         let path = temporary_project_path("store");
         let (store, mut studio) = ProjectStore::open(path.clone()).expect("new store");
         studio
-            .configure_sound_tool(1, "instrument", 101, None, "preset", "Surge Lead")
+            .configure_sound_tool(
+                1,
+                "instrument",
+                101,
+                None,
+                "preset",
+                "Factory/Leads/Classic Lead 1",
+            )
             .expect("valid graph edit");
         store.save(studio.project()).expect("saved graph");
 
         let (_, reloaded) = ProjectStore::open(path.clone()).expect("reloaded store");
-        assert!(reloaded.to_json().contains("\"preset\":\"Surge Lead\""));
+        assert!(
+            reloaded
+                .to_json()
+                .contains("\"preset\":\"Factory/Leads/Classic Lead 1\"")
+        );
         fs::remove_file(path).expect("remove test graph");
     }
 

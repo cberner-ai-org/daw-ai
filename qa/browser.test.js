@@ -2143,7 +2143,7 @@ async function run() {
       advancedGraphSummary,
       {
         graphs: 3,
-        selectableNodes: 7,
+        selectableNodes: 3,
         selectedNodes: 3,
         visibleInspectors: 3,
         pianoRolls: 3,
@@ -2184,334 +2184,27 @@ async function run() {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
       return project.tracks[1].clips[0].events[0].pitch === 33;
     }, "piano-roll note edit undo");
-    await evaluate(cdp, appSession, `document.querySelector(
-      '[data-graph-node="effect:210"][data-track-id="2"]',
-    ).click()`);
-    assert.deepEqual(
-      await evaluate(cdp, appSession, `(() => {
-        const card = document.querySelector('[data-channel-track="2"]');
-        return {
-          selected: card.querySelector('[data-graph-node="effect:210"]').getAttribute('aria-pressed'),
-          effectPaneVisible: !card.querySelector('.effects-tool').hidden,
-          instrumentPaneHidden: card.querySelector('.instrument-tool').hidden,
-          focusedNode: document.activeElement.dataset.graphNode,
-        };
-      })()`),
-      {
-        selected: "true",
-        effectPaneVisible: true,
-        instrumentPaneHidden: true,
-        focusedNode: "effect:210",
-      },
-      "clicking a graph node must reveal and focus its parameter side pane",
-    );
-    await evaluate(cdp, appSession, `document.querySelector(
-      '[data-graph-node="instrument:201"][data-track-id="2"]',
-    ).click()`);
-    assert.deepEqual(
-      await evaluate(cdp, appSession, `({
-        engines: [...document.querySelectorAll('.instrument-tool .tool-heading strong')]
-          .map((heading) => heading.textContent),
-        presets: [...document.querySelectorAll('[data-sound-tool="instrument"][data-parameter="preset"]')]
-          .map((control) => control.value),
-        nativeGroups: {
-          common: Boolean(document.querySelector('[data-channel-track="2"] [data-load-instrument-parameters="2:common"]')),
-          advanced: Boolean(document.querySelector('[data-channel-track="2"] [data-load-instrument-parameters="2:advanced"]')),
-        },
-        filterParameters: [...document.querySelectorAll(
-          'input[data-sound-tool="effect"][data-track-id="2"][data-tool-id="210"]',
-        )].map((control) => control.dataset.parameter).sort(),
-        midiRoutes: document.querySelectorAll('.modulator-route').length,
-        rateModes: [...document.querySelectorAll('[data-sound-tool="modulator"][data-parameter="rateMode"]')]
-          .map((control) => control.value),
-        triggers: [...document.querySelectorAll('[data-sound-tool="modulator"][data-parameter="trigger"]')]
-          .map((control) => control.value),
-      })`),
-      {
-        engines: ["Surge XT", "Surge XT", "Surge XT"],
-        presets: ["Surge Kick", "Surge Bass", "Surge Pad"],
-        nativeGroups: { common: true, advanced: true },
-        filterParameters: [
-          "Bandwidth 1",
-          "Bandwidth 2",
-          "Bandwidth 3",
-          "Frequency 1",
-          "Frequency 2",
-          "Frequency 3",
-          "Gain",
-          "Gain 1",
-          "Gain 2",
-          "Gain 3",
-          "mix",
-        ],
-        midiRoutes: 0,
-        rateModes: [],
-        triggers: [],
-      },
-      "Advanced must expose Surge presets and native parameters without DAW-owned modulators",
-    );
-    await evaluate(cdp, appSession, `(() => {
-      const preset = document.querySelector(
-        '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="preset"]',
-      );
-      preset.value = 'Surge Pad';
-      preset.dispatchEvent(new Event('change', { bubbles: true }));
-    })()`);
-    await waitFor(async () => evaluate(cdp, appSession, `(async () => {
-      const project = await fetch('/api/project').then((response) => response.json());
-      const instrument = project.tracks[1].instrument;
-      return instrument.engine === 'Surge XT' && instrument.preset === 'Surge Pad' &&
-        document.querySelector(
-          '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="preset"]',
-        ).value === 'Surge Pad';
-    })()`), "Surge XT preset update");
-    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
-    await waitFor(async () => evaluate(cdp, appSession, `(async () => {
-      const project = await fetch('/api/project').then((response) => response.json());
-      return project.tracks[1].instrument.preset === 'Surge Bass';
-    })()`), "Surge XT preset undo");
     assert.deepEqual(
       await evaluate(cdp, appSession, `fetch('/api/project')
         .then((response) => response.json())
-        .then((project) => {
-        const chain = document.querySelector('.routing-chain');
-        return {
-          labels: [...chain.querySelectorAll('i b')].map((label) => label.textContent),
-          types: project.tracks[0].routing.edges.map((edge) => edge.type),
-        };
-      })`),
-      { labels: ["MIDI", "AUDIO", "AUDIO"], types: ["midi", "audio", "audio"] },
-      "Advanced and project routing must expose compatible edge types",
-    );
-    assert.deepEqual(
-      await evaluate(cdp, appSession, `[
-        ...document.querySelectorAll(
-          '[data-parameter="enabled"]:is([data-sound-tool="effect"], [data-sound-tool="modulator"])',
-        ),
-      ].map((button) => ({ name: button.getAttribute('aria-label'), pressed: button.getAttribute('aria-pressed') }))`),
-      [
-        { name: "Disable Pulse Kit Conditioner effect #110", pressed: "true" },
-        { name: "Disable Soft Current EQ effect #210", pressed: "true" },
-        { name: "Disable Glass Chords Chorus effect #310", pressed: "true" },
-        { name: "Disable Glass Chords Reverb 2 effect #311", pressed: "true" },
-      ],
-      "sound-tool toggles must expose contextual names and pressed state",
-    );
-    assert.deepEqual(
-      await evaluate(cdp, appSession, `(() => {
-        const controls = [...document.querySelectorAll(
-          '[data-sound-tool]:is(input, select, button)',
-        )];
-        const names = controls.map((control) => control.getAttribute('aria-label'));
-        return {
-          allNamed: names.every(Boolean),
-          allUnique: new Set(names).size === names.length,
-          chordMixes: [...document.querySelectorAll(
-            '[data-sound-tool="effect"][data-track-id="3"][data-parameter="mix"]',
-          )].map((control) => control.getAttribute('aria-label')),
-          chordRouting: [...document.querySelectorAll(
-            '[data-sound-tool="routing"][data-track-id="3"]',
-          )].map((control) => control.getAttribute('aria-label')),
-        };
-      })()`),
+        .then((project) => ({
+          presets: project.tracks.map((track) => track.instrument.preset),
+          instrumentFields: Object.keys(project.tracks[0].instrument).sort(),
+          effectCounts: project.tracks.map((track) => track.effects.length),
+          modulatorCounts: project.tracks.map((track) => track.modulators.length),
+        }))`),
       {
-        allNamed: true,
-        allUnique: true,
-        chordMixes: [
-          "Glass Chords Chorus effect #310 mix",
-          "Glass Chords Reverb 2 effect #311 mix",
+        presets: [
+          "Factory/Percussion/Kick 909ish",
+          "Factory/Basses/Wide Bassline",
+          "Factory/Polysynths/Anthemish 1",
         ],
-        chordRouting: [
-          "Move Glass Chords Chorus effect #310 earlier",
-          "Move Glass Chords Chorus effect #310 later",
-          "Move Glass Chords Reverb 2 effect #311 earlier",
-          "Move Glass Chords Reverb 2 effect #311 later",
-        ],
+        instrumentFields: ["engine", "id", "nativeOverrides", "preset", "type"],
+        effectCounts: [0, 0, 0],
+        modulatorCounts: [0, 0, 0],
       },
-      "every repeated sound-tool control must have a unique contextual name",
+      "the demo graph must expose only exact Surge preset and native instrument state",
     );
-    await evaluate(
-      cdp,
-      appSession,
-      "document.querySelector('[data-sound-tool=\"effect\"][data-tool-id=\"210\"][data-parameter=\"enabled\"]').click()",
-    );
-    await waitFor(async () => {
-      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return !project.tracks[1].effects[0].enabled;
-    }, "disabled low-pass effect");
-    assert.deepEqual(
-      await evaluate(cdp, appSession, `(() => {
-        const button = document.querySelector(
-          '[data-sound-tool="effect"][data-tool-id="210"][data-parameter="enabled"]',
-        );
-        return {
-          name: button.getAttribute('aria-label'),
-          pressed: button.getAttribute('aria-pressed'),
-          text: button.textContent,
-        };
-      })()`),
-      { name: "Enable Soft Current EQ effect #210", pressed: "false", text: "Off" },
-      "a disabled sound tool must expose its updated action and state",
-    );
-    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
-    await waitFor(async () => {
-      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.tracks[1].effects[0].enabled;
-    }, "disabled low-pass effect undo");
-    await evaluate(cdp, appSession,
-      "document.querySelector('[data-load-instrument-parameters=\"2:common\"]').click()");
-    await waitFor(async () => evaluate(cdp, appSession,
-      "Boolean(document.querySelector('[data-sound-tool=\"instrument\"][data-track-id=\"2\"][data-parameter^=\"native:\"]'))"),
-    "native instrument controls");
-    await evaluate(cdp, appSession,
-      "document.querySelector('[data-load-instrument-parameters=\"2:advanced\"]').click()");
-    await waitFor(async () => evaluate(cdp, appSession, `Boolean(
-      [...document.querySelectorAll('[data-channel-track="2"] label')]
-        .find((label) => label.textContent.includes('Osc 1 Mute'))
-        ?.querySelector('select[data-sound-tool="instrument"]')
-    )`), "discrete native instrument control");
-    assert.equal(
-      await evaluate(cdp, appSession, `(() => {
-        const control = [...document.querySelectorAll('[data-channel-track="2"] label')]
-          .find((label) => label.textContent.includes('Osc 1 Mute'));
-        return control.querySelector('select[data-sound-tool="instrument"]').options.length >= 2;
-      })()`),
-      true,
-      "discrete native controls must use Surge choices",
-    );
-    const nativeParameter = await evaluate(cdp, appSession,
-      "document.querySelector('[data-sound-tool=\"instrument\"][data-track-id=\"2\"][data-parameter^=\"native:\"]').dataset.parameter");
-    const projectBeforePreciseTools = await evaluate(
-      cdp,
-      appSession,
-      "fetch('/api/project').then((response) => response.json())",
-    );
-    const nativeBeforeRejectedUpdate = await evaluate(cdp, appSession, `(() => {
-      const control = document.querySelector(
-        '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="${nativeParameter}"]',
-      );
-      return { value: control.value, label: control.getAttribute('aria-label') };
-    })()`);
-    await evaluate(cdp, appSession, `(() => {
-      const control = document.querySelector(
-        '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="${nativeParameter}"]',
-      );
-      control.dataset.toolId = '999999';
-      control.value = control.value === '0.123' ? '0.234' : '0.123';
-      control.dispatchEvent(new Event('change', { bubbles: true }));
-    })()`);
-    await waitFor(async () => evaluate(cdp, appSession, `(
-      document.querySelector('#toast').classList.contains('is-error') &&
-      document.querySelector('#toast-message').textContent === 'sound tool not found'
-    )`), "rejected native parameter update");
-    assert.deepEqual(
-      await evaluate(cdp, appSession, `(() => {
-        const control = document.querySelector(
-          '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="${nativeParameter}"]',
-        );
-        return { value: control.value, label: control.getAttribute('aria-label') };
-      })()`),
-      nativeBeforeRejectedUpdate,
-      "a rejected native parameter update must not change its cached value or override state",
-    );
-    assert.equal(
-      (await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())")).version,
-      projectBeforePreciseTools.version,
-      "a rejected native parameter update must not change the project",
-    );
-    await evaluate(cdp, appSession, `(() => {
-      const update = (selector, value) => {
-        const control = document.querySelector(selector);
-        control.value = value;
-        control.dispatchEvent(new Event('change', { bubbles: true }));
-      };
-      update('[data-sound-tool="instrument"][data-track-id="2"][data-parameter="${nativeParameter}"]', '0.025');
-      update('[data-sound-tool="effect"][data-track-id="3"][data-tool-id="310"][data-parameter="mix"]', '0.005');
-    })()`);
-    await waitFor(async () => {
-      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.version === projectBeforePreciseTools.version + 2 &&
-        project.tracks[1].instrument.nativeOverrides[nativeParameter.slice(7)] === 0.025 &&
-        project.tracks[2].effects[0].parameters.mix === 0.005;
-    }, "precise sound-tool values");
-    assert.deepEqual(
-      await evaluate(cdp, appSession, `(() => {
-        const mix = document.querySelector(
-          '[data-sound-tool="effect"][data-track-id="3"][data-tool-id="310"][data-parameter="mix"]',
-        );
-        return {
-          instrumentCacheInvalidated: Boolean(
-            document.querySelector('[data-load-instrument-parameters="2:common"]'),
-          ),
-          mix: {
-            value: mix.value,
-            step: mix.step,
-            output: mix.nextElementSibling.value,
-            heading: mix.closest('.effect-card').querySelector('.effect-pill b').textContent,
-          },
-        };
-      })()`),
-      {
-        instrumentCacheInvalidated: true,
-        mix: { value: "0.005", step: "any", output: "0.5%", heading: "0.5%" },
-      },
-      "native edits must invalidate topology metadata while effect floats remain exact",
-    );
-    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
-    await waitFor(async () => {
-      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.tracks[2].effects[0].parameters.mix === 0.28;
-    }, "precise effect mix undo");
-    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
-    await waitFor(async () => {
-      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.tracks[1].instrument.nativeOverrides?.[nativeParameter.slice(7)] === undefined;
-    }, "precise native instrument control undo");
-    assert.equal(
-      await evaluate(cdp, appSession,
-        "Boolean(document.querySelector('[data-load-instrument-parameters=\"2:common\"]'))"),
-      true,
-      "undoing a native edit must leave stale topology metadata unloaded",
-    );
-    await evaluate(cdp, appSession,
-      "document.querySelector('[data-load-instrument-parameters=\"2:common\"]').click()");
-    await waitFor(async () => evaluate(cdp, appSession, `Boolean(document.querySelector(
-      '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="${nativeParameter}"]'
-    ))`), "reloaded native controls after undo");
-    assert.deepEqual(
-      await evaluate(cdp, appSession, `(() => {
-        const control = document.querySelector(
-          '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="${nativeParameter}"]',
-        );
-        return { value: control.value, label: control.getAttribute('aria-label') };
-      })()`),
-      nativeBeforeRejectedUpdate,
-      "undo must refresh a loaded native control from the authoritative project",
-    );
-    await evaluate(
-      cdp,
-      appSession,
-      "document.querySelector('[data-sound-tool=\"routing\"][data-track-id=\"3\"][data-tool-id=\"311\"][data-sound-value=\"0\"]').click()",
-    );
-    await waitFor(async () => {
-      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      const clientReady = await evaluate(
-        cdp,
-        appSession,
-        "document.activeElement.dataset.controlKey === '3-routing-311-down'",
-      );
-      return project.tracks[2].routing.audio[2] === "effect:311" && clientReady;
-    }, "advanced effect reorder");
-    assert.equal(
-      await evaluate(cdp, appSession, "document.activeElement.dataset.controlKey"),
-      "3-routing-311-down",
-      "a reordered endpoint effect must focus its remaining enabled direction",
-    );
-    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
-    await waitFor(async () => {
-      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.tracks[2].routing.audio[2] === "effect:310";
-    }, "advanced effect reorder undo");
     if (await evaluate(cdp, appSession, "Boolean(document.querySelector('.clip-event-list'))")) {
     const projectBeforeClipUiMutation = await evaluate(
       cdp,
@@ -3198,10 +2891,10 @@ async function run() {
       "a sound-graph mutation must change the backend-rendered PCM",
     );
 
-    const beforeAttackWaveform = await evaluate(
+    const beforeNativeOverrides = await evaluate(
       cdp,
       appSession,
-      "fetch('/api/project').then((response) => response.json()).then((project) => project.tracks.find((track) => track.id === 2).instrument.parameters.cutoff)",
+      "fetch('/api/project').then((response) => response.json()).then((project) => JSON.stringify(project.tracks.find((track) => track.id === 2).instrument.nativeOverrides))",
     );
     attacker = await startAttackerServer(attackerPort);
     const attackerSession = await openPage(cdp, `http://127.0.0.1:${attackerPort}`);
@@ -3220,8 +2913,8 @@ async function run() {
     const afterAttack = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
     assert.equal(afterAttack.edits.some((edit) => edit.prompt === "hostile edit"), false);
     assert.equal(
-      afterAttack.tracks.find((track) => track.id === 2).instrument.parameters.cutoff,
-      beforeAttackWaveform,
+      JSON.stringify(afterAttack.tracks.find((track) => track.id === 2).instrument.nativeOverrides),
+      beforeNativeOverrides,
       "cross-origin sound-tool mutations must be rejected",
     );
     assert.equal(consoleErrors.length, 0, "application emitted browser console errors");

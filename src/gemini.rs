@@ -1125,15 +1125,15 @@ fn effect_name(name: &str, allow_all: bool) -> Result<&'static str, PlannerError
 fn surge_preset_name(name: &str) -> Result<&'static str, PlannerError> {
     match name {
         "Init" => Ok("Init"),
-        "Surge Kick" => Ok("Surge Kick"),
+        "Factory/Percussion/Kick 909ish" => Ok("Factory/Percussion/Kick 909ish"),
         "Surge Snare" => Ok("Surge Snare"),
         "Surge Closed Hat" => Ok("Surge Closed Hat"),
         "Surge Open Hat" => Ok("Surge Open Hat"),
         "Surge Crash" => Ok("Surge Crash"),
         "Surge Percussion" => Ok("Surge Percussion"),
-        "Surge Bass" => Ok("Surge Bass"),
-        "Surge Pad" => Ok("Surge Pad"),
-        "Surge Lead" => Ok("Surge Lead"),
+        "Factory/Basses/Wide Bassline" => Ok("Factory/Basses/Wide Bassline"),
+        "Factory/Polysynths/Anthemish 1" => Ok("Factory/Polysynths/Anthemish 1"),
+        "Factory/Leads/Classic Lead 1" => Ok("Factory/Leads/Classic Lead 1"),
         "Surge Atmosphere" => Ok("Surge Atmosphere"),
         _ => Err(invalid("unknown Surge XT starter patch")),
     }
@@ -1409,7 +1409,7 @@ mod tests {
         execute_tool(
             &session,
             1,
-            &call("set_parameter", preset_edit("Surge Lead")),
+            &call("set_parameter", preset_edit("Factory/Leads/Classic Lead 1")),
             &mut state,
             &mut render_audio,
             &mut |edit| {
@@ -1443,7 +1443,7 @@ mod tests {
         execute_tool(
             &session,
             3,
-            &call("set_parameter", preset_edit("Surge Lead")),
+            &call("set_parameter", preset_edit("Factory/Leads/Classic Lead 1")),
             &mut state,
             &mut render_audio,
             &mut |edit| {
@@ -1457,7 +1457,10 @@ mod tests {
         execute_tool(
             &session,
             4,
-            &call("set_parameter", preset_edit("Surge Pad")),
+            &call(
+                "set_parameter",
+                preset_edit("Factory/Polysynths/Anthemish 1"),
+            ),
             &mut state,
             &mut render_audio,
             &mut |edit| Ok(edit.project),
@@ -1500,7 +1503,7 @@ mod tests {
             serde_json::json!({
                 "id":"multi","status":"requires_action","steps":[
                     {"type":"function_call","id":"edit-bass","name":"set_parameter",
-                     "arguments":preset_edit("Surge Lead")},
+                     "arguments":preset_edit("Factory/Leads/Classic Lead 1")},
                     {"type":"function_call","id":"tempo-early","name":"set_tempo",
                      "arguments":{"bpm":140}}
                 ]
@@ -1548,7 +1551,7 @@ mod tests {
             serde_json::json!({
                 "id": "edit", "status": "requires_action", "steps": [{
                     "type": "function_call", "id": "edit-bass", "name": "set_parameter",
-                    "arguments": preset_edit("Surge Lead")
+                    "arguments": preset_edit("Factory/Leads/Classic Lead 1")
                 }]
             }),
             serde_json::json!({
@@ -1586,7 +1589,10 @@ mod tests {
 
         assert_eq!(response_index, 3);
         assert_eq!(updates, 1);
-        assert_eq!(result.project.tracks[1].instrument.preset, "Surge Lead");
+        assert_eq!(
+            result.project.tracks[1].instrument.preset,
+            "Factory/Leads/Classic Lead 1"
+        );
         assert_eq!(session.stats().unwrap(), (1, 1));
     }
 
@@ -1603,7 +1609,7 @@ mod tests {
             serde_json::json!({
                 "id":"edit","status":"requires_action","steps":[{
                     "type":"function_call","id":"edit-bass","name":"set_parameter",
-                    "arguments":preset_edit("Surge Lead")
+                    "arguments":preset_edit("Factory/Leads/Classic Lead 1")
                 }]
             }),
             serde_json::json!({"id":"done","status":"completed","steps":[]}),
@@ -1920,7 +1926,7 @@ mod tests {
                 "summary":"Changed the bass source and added movement",
                 "musicalPlan":"Use a lead patch and square-wave cutoff modulation.",
                 "actions":[
-                    {"kind":"instrument","target":"bass","name":"Surge Lead","value":0},
+                    {"kind":"instrument","target":"bass","name":"Factory/Leads/Classic Lead 1","value":0},
                     {"kind":"modulator","target":"bass","name":"instrument.cutoff","value":0.25,"setting":"square","rate":2}
                 ]
             }"#,
@@ -1931,7 +1937,7 @@ mod tests {
             Action::Compound {
                 actions: vec![
                     Action::Instrument {
-                        preset: "Surge Lead",
+                        preset: "Factory/Leads/Classic Lead 1",
                         target: TrackRole::Bass,
                     },
                     Action::Modulator {

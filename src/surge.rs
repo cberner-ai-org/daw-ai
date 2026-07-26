@@ -22,11 +22,6 @@ const ALL_EFFECT_SLOTS: [&str; 16] = [
 const MAX_NATIVE_PARAMETERS: i32 = 800;
 const VOICE_LFO_SOURCE: i32 = 17;
 const SCENE_LFO_SOURCE: i32 = 23;
-const FILTER_LP12: f32 = 1.0 / 31.0;
-const OSC_SINE: f32 = 1.0 / 11.0;
-const OSC_SH_NOISE: f32 = 3.0 / 11.0;
-const OSC_FM2: f32 = 6.0 / 11.0;
-const OSC_MODERN: f32 = 8.0 / 11.0;
 
 fn envelope_time_parameter(milliseconds: f32) -> f32 {
     if milliseconds <= 0.0 {
@@ -39,30 +34,11 @@ fn envelope_time_parameter(milliseconds: f32) -> f32 {
 pub(crate) fn is_native_modulator(track_id: u64, modulator: &Modulator) -> bool {
     modulator.enabled
         && modulator.trigger != "audio"
-        && (modulator.target.starts_with("instrument.") || modulator.target.starts_with("native:"))
+        && modulator.target.starts_with("native:")
         && modulator
             .source_track_id
             .is_none_or(|source_track_id| source_track_id == track_id)
 }
-
-const NATIVE_PARAMETERS: &[(&str, &str)] = &[
-    ("attack", "A Amp EG Attack"),
-    ("decay", "A Amp EG Decay"),
-    ("sustain", "A Amp EG Sustain"),
-    ("release", "A Amp EG Release"),
-    ("cutoff", "A Filter 1 Cutoff"),
-    ("resonance", "A Filter 1 Resonance"),
-    ("pitch", "A Pitch"),
-    ("output", "A Osc 1 Volume"),
-];
-
-const STARTER_PATCH_BASE: &[(&str, f32)] = &[
-    ("A Filter 1 Type", FILTER_LP12),
-    ("A Osc 1 Retrigger", 1.0),
-    ("A Osc 2 Retrigger", 1.0),
-    ("A Osc 3 Retrigger", 1.0),
-    ("Global Volume", 1.0),
-];
 
 static SURGE_ENGINE_LOCK: Mutex<()> = Mutex::new(());
 type InstrumentParameterCache = HashMap<String, Arc<Mutex<Option<Vec<InstrumentParameter>>>>>;
@@ -78,8 +54,6 @@ pub(crate) struct Engine {
     parameters: HashMap<String, i32>,
     effect_mix_parameters: HashMap<u64, String>,
     effect_parameters: HashMap<(u64, String), String>,
-    drum_pitch_range: Option<(u8, u8)>,
-    drum_pitch: u8,
     native_modulators: HashMap<u64, NativeModulatorRoute>,
 }
 
@@ -165,13 +139,9 @@ impl Engine {
             synth,
             effect_mix_parameters: HashMap::new(),
             effect_parameters: HashMap::new(),
-            drum_pitch_range: drum_pitch_range(&instrument.preset),
-            drum_pitch: 0,
             native_modulators: HashMap::new(),
         };
-        engine.set_drum_timbre(instrument.timbre);
         engine.apply_preset(&instrument.preset)?;
-        engine.set_instrument_parameters(instrument)?;
         engine.set_native_overrides(&instrument.native_overrides)?;
         if graph_owns_effects {
             engine.apply_effects(effects, effect_order)?;
@@ -320,21 +290,10 @@ impl Engine {
                 .filter(|index| (0..MAX_NATIVE_PARAMETERS).contains(index))
                 .ok_or_else(|| format!("Invalid Surge XT modulation target: {target}"));
         }
-        let graph_name = target
-            .strip_prefix("instrument.")
-            .ok_or_else(|| format!("Not a Surge XT modulation target: {target}"))?;
-        let native_name = NATIVE_PARAMETERS
-            .iter()
-            .find_map(|(graph, native)| (*graph == graph_name).then_some(*native))
-            .unwrap_or(graph_name);
-        self.parameters
-            .get(native_name)
-            .copied()
-            .ok_or_else(|| format!("Surge XT parameter is unavailable: {native_name}"))
+        Err(format!("Not a Surge XT modulation target: {target}"))
     }
 
     pub(crate) fn play_note(&mut self, key: u8, velocity: f32, note_id: u64) {
-        let key = self.drum_pitch_range.map_or(key, |_| self.drum_pitch);
         self.synth.play_note(
             0,
             key.min(127) as i8,
@@ -350,37 +309,26 @@ impl Engine {
     }
 
     pub(crate) fn release_note(&mut self, key: u8, note_id: u64) {
-        if self.drum_pitch_range.is_some() {
-            return;
-        }
         self.synth
             .release_note(0, key.min(127) as i8, 0, note_id as i32);
     }
 
     pub(crate) fn set_parameter(&mut self, graph_name: &str, value: f32) -> Result<(), String> {
-        if graph_name == "timbre" {
-            self.set_drum_timbre(value);
-            return Ok(());
-        }
-        let native_name = NATIVE_PARAMETERS
-            .iter()
-            .find_map(|(graph, native)| (*graph == graph_name).then_some(*native))
-            .unwrap_or(graph_name);
         let index = self
             .parameters
-            .get(native_name)
+            .get(graph_name)
             .copied()
-            .ok_or_else(|| format!("Surge XT parameter is unavailable: {native_name}"))?;
+            .ok_or_else(|| format!("Surge XT parameter is unavailable: {graph_name}"))?;
         let mut id = SurgeId::empty();
         if !self.synth.from_synth_side_id(index, &mut id) {
-            return Err(format!("Surge XT rejected parameter: {native_name}"));
+            return Err(format!("Surge XT rejected parameter: {graph_name}"));
         }
         if !self
             .synth
             .set_parameter01(&mut id, value.clamp(0.0, 1.0), None, None)
         {
             return Err(format!(
-                "Surge XT cannot use this {native_name} value in the current patch"
+                "Surge XT cannot use this {graph_name} value in the current patch"
             ));
         }
         Ok(())
@@ -414,25 +362,6 @@ impl Engine {
         self.set_parameter(&native, value)
     }
 
-    fn set_instrument_parameters(&mut self, instrument: &Instrument) -> Result<(), String> {
-        for (name, value) in [
-            ("attack", instrument.attack),
-            ("decay", instrument.decay),
-            ("sustain", instrument.sustain),
-            ("release", instrument.release),
-            ("cutoff", instrument.cutoff),
-            ("resonance", instrument.resonance),
-            ("pitch", instrument.pitch),
-            ("timbre", instrument.timbre),
-            ("output", instrument.output),
-        ] {
-            if instrument.overrides(name) {
-                self.set_parameter(name, value)?;
-            }
-        }
-        Ok(())
-    }
-
     fn set_native_overrides(
         &mut self,
         overrides: &std::collections::BTreeMap<i32, f32>,
@@ -461,27 +390,9 @@ impl Engine {
             .ok_or_else(|| format!("Surge XT cannot use this parameter {index} value"))
     }
 
-    fn set_drum_timbre(&mut self, value: f32) {
-        if let Some((minimum, maximum)) = self.drum_pitch_range {
-            self.drum_pitch = (f32::from(minimum)
-                + value.clamp(0.0, 1.0) * f32::from(maximum - minimum))
-            .round() as u8;
-        }
-    }
-
-    pub(crate) fn instrument_parameter_value(&self, graph_name: &str) -> Option<f32> {
-        let native_name = NATIVE_PARAMETERS
-            .iter()
-            .find_map(|(graph, native)| (*graph == graph_name).then_some(*native))
-            .unwrap_or(graph_name);
-        self.parameter_value(native_name)
-    }
-
     fn apply_preset(&mut self, preset: &str) -> Result<(), String> {
-        if let Some(preset) = preset_parameters(preset) {
-            for &(parameter, value) in STARTER_PATCH_BASE.iter().chain(preset) {
-                self.set_parameter(parameter, value)?;
-            }
+        if preset == "Init" {
+            // SurgeSynthesizer::new already provides Surge XT's native init state.
         } else if let Some(factory) = crate::surge_presets::find(preset) {
             std::fs::File::open(&factory.path)
                 .map_err(|error| format!("could not read Surge XT preset {preset}: {error}"))?;
@@ -645,50 +556,6 @@ impl Engine {
     }
 }
 
-fn drum_pitch_range(preset: &str) -> Option<(u8, u8)> {
-    match preset {
-        "Surge Kick" => Some((24, 60)),
-        "Surge Snare" | "Surge Percussion" => Some((84, 120)),
-        "Surge Closed Hat" | "Surge Open Hat" | "Surge Crash" => Some((108, 127)),
-        _ => None,
-    }
-}
-
-pub(crate) fn instrument_parameter_defaults(preset: &str) -> Result<[f32; 8], String> {
-    let instrument = Instrument {
-        id: 1,
-        engine: crate::model::SURGE_ENGINE.to_owned(),
-        preset: preset.to_owned(),
-        attack: 0.0,
-        decay: 0.0,
-        sustain: 0.0,
-        release: 0.0,
-        cutoff: 0.0,
-        resonance: 0.0,
-        pitch: 0.0,
-        timbre: 0.5,
-        output: 0.0,
-        parameter_overrides: Vec::new(),
-        native_overrides: std::collections::BTreeMap::new(),
-    };
-    let engine = Engine::new(&instrument, &[], &[], &[], 1, 48_000.0)?;
-    let value = |name| {
-        engine
-            .instrument_parameter_value(name)
-            .ok_or_else(|| format!("Surge XT parameter is unavailable: {name}"))
-    };
-    Ok([
-        value("attack")?,
-        value("decay")?,
-        value("sustain")?,
-        value("release")?,
-        value("cutoff")?,
-        value("resonance")?,
-        value("pitch")?,
-        value("output")?,
-    ])
-}
-
 pub(crate) fn instrument_parameters(preset: &str) -> Vec<InstrumentParameter> {
     let cache = INSTRUMENT_PARAMETER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let entry = cache
@@ -708,16 +575,6 @@ pub(crate) fn instrument_parameters(preset: &str) -> Vec<InstrumentParameter> {
             id: 1,
             engine: crate::model::SURGE_ENGINE.to_owned(),
             preset: preset.to_owned(),
-            attack: 0.0,
-            decay: 0.0,
-            sustain: 0.0,
-            release: 0.0,
-            cutoff: 0.0,
-            resonance: 0.0,
-            pitch: 0.0,
-            timbre: 0.5,
-            output: 0.0,
-            parameter_overrides: Vec::new(),
             native_overrides: std::collections::BTreeMap::new(),
         };
         let Ok(engine) = Engine::new(&instrument, &[], &[], &[], 1, 48_000.0) else {
@@ -764,7 +621,7 @@ pub(crate) fn instrument_parameters_for_instrument(
     instrument: &Instrument,
 ) -> Vec<InstrumentParameter> {
     let parameters = instrument_parameters(&instrument.preset);
-    if instrument.native_overrides.is_empty() && instrument.parameter_overrides.is_empty() {
+    if instrument.native_overrides.is_empty() {
         return parameters;
     }
     let Ok(engine) = Engine::new(instrument, &[], &[], &[], 1, 48_000.0) else {
@@ -811,16 +668,7 @@ pub(crate) fn instrument_parameter_is_modulatable(
 ) -> bool {
     let native_id = target
         .strip_prefix("native:")
-        .and_then(|id| id.parse::<i32>().ok())
-        .or_else(|| {
-            let graph_name = target.strip_prefix("instrument.")?;
-            instrument_parameters_for_instrument(instrument)
-                .into_iter()
-                .find(|parameter| {
-                    instrument_graph_parameter(&instrument.preset, parameter.id) == Some(graph_name)
-                })
-                .map(|parameter| parameter.id)
-        });
+        .and_then(|id| id.parse::<i32>().ok());
     let Some(id) = native_id else {
         return false;
     };
@@ -890,16 +738,6 @@ pub(crate) fn effect_control_semantics(name: &str) -> HashMap<String, EffectPara
         id: 1,
         engine: crate::model::SURGE_ENGINE.to_owned(),
         preset: "Init".to_owned(),
-        attack: 0.0,
-        decay: 0.0,
-        sustain: 0.0,
-        release: 0.0,
-        cutoff: 0.0,
-        resonance: 0.0,
-        pitch: 0.0,
-        timbre: 0.5,
-        output: 0.0,
-        parameter_overrides: Vec::new(),
         native_overrides: BTreeMap::new(),
     };
     let effect = Effect {
@@ -907,8 +745,6 @@ pub(crate) fn effect_control_semantics(name: &str) -> HashMap<String, EffectPara
         name: name.to_owned(),
         preset_slot: None,
         mix: 0.5,
-        cutoff_hz: None,
-        resonance: None,
         enabled: true,
         parameters: effect_parameter_values(name),
         parameter_overrides: Vec::new(),
@@ -929,16 +765,6 @@ pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
         id: 1,
         engine: crate::model::SURGE_ENGINE.to_owned(),
         preset: preset.to_owned(),
-        attack: 0.0,
-        decay: 0.0,
-        sustain: 0.0,
-        release: 0.0,
-        cutoff: 0.0,
-        resonance: 0.0,
-        pitch: 0.0,
-        timbre: 0.5,
-        output: 0.0,
-        parameter_overrides: Vec::new(),
         native_overrides: std::collections::BTreeMap::new(),
     };
     let engine = Engine::new_with_graph_effects(&instrument, &[], &[], &[], 1, 48_000.0, false)?;
@@ -999,8 +825,6 @@ pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
             name: (*name).to_owned(),
             preset_slot: Some(slot_index),
             mix,
-            cutoff_hz: None,
-            resonance: None,
             enabled: true,
             parameters,
             parameter_overrides: Vec::new(),
@@ -1025,16 +849,6 @@ pub(crate) fn effect_parameter_values(name: &str) -> BTreeMap<String, f32> {
         id: 1,
         engine: crate::model::SURGE_ENGINE.to_owned(),
         preset: "Init".to_owned(),
-        attack: 0.0,
-        decay: 0.0,
-        sustain: 0.0,
-        release: 0.0,
-        cutoff: 0.0,
-        resonance: 0.0,
-        pitch: 0.0,
-        timbre: 0.5,
-        output: 0.0,
-        parameter_overrides: Vec::new(),
         native_overrides: BTreeMap::new(),
     };
     let Ok(mut engine) = Engine::new(&instrument, &[], &[], &[], 1, 48_000.0) else {
@@ -1083,37 +897,6 @@ pub(crate) fn effect_parameter_values(name: &str) -> BTreeMap<String, f32> {
 fn is_generic_effect_parameter(name: &str) -> bool {
     name.strip_prefix("Param ")
         .is_some_and(|number| number.parse::<u8>().is_ok())
-}
-
-pub(crate) fn legacy_instrument_parameter_override(
-    instrument: &Instrument,
-    native_id: i32,
-) -> Option<f32> {
-    let graph_name = instrument_graph_parameter(&instrument.preset, native_id)?;
-    if !instrument.overrides(graph_name) {
-        return None;
-    }
-    match graph_name {
-        "attack" => Some(instrument.attack),
-        "decay" => Some(instrument.decay),
-        "sustain" => Some(instrument.sustain),
-        "release" => Some(instrument.release),
-        "cutoff" => Some(instrument.cutoff),
-        "resonance" => Some(instrument.resonance),
-        "pitch" => Some(instrument.pitch),
-        "output" => Some(instrument.output),
-        _ => None,
-    }
-}
-
-pub(crate) fn instrument_graph_parameter(preset: &str, native_id: i32) -> Option<&'static str> {
-    let native_name = instrument_parameters(preset)
-        .into_iter()
-        .find(|parameter| parameter.id == native_id)?
-        .name;
-    NATIVE_PARAMETERS
-        .iter()
-        .find_map(|(graph, native)| native_name.ends_with(native).then_some(*graph))
 }
 
 fn is_common_parameter(name: &str) -> bool {
@@ -1178,21 +961,6 @@ pub(crate) fn is_native_effect(name: &str) -> bool {
     effect_type_index(name).is_some()
 }
 
-pub(crate) fn normalize_filter_cutoff(value: f32) -> f32 {
-    let minimum = crate::model::FILTER_CUTOFF_MIN_HZ;
-    let maximum = crate::model::FILTER_CUTOFF_MAX_HZ;
-    ((value.clamp(minimum, maximum) / minimum).ln() / (maximum / minimum).ln()).clamp(0.0, 1.0)
-}
-
-pub(crate) fn normalize_filter_resonance(value: f32) -> f32 {
-    ((value.clamp(
-        crate::model::FILTER_RESONANCE_MIN,
-        crate::model::FILTER_RESONANCE_MAX,
-    ) - crate::model::FILTER_RESONANCE_MIN)
-        / (crate::model::FILTER_RESONANCE_MAX - crate::model::FILTER_RESONANCE_MIN))
-        .clamp(0.0, 1.0)
-}
-
 fn parameter_map(synth: &SurgeSynthesizer) -> HashMap<String, i32> {
     let mut map = HashMap::new();
     for index in 0..MAX_NATIVE_PARAMETERS {
@@ -1202,124 +970,6 @@ fn parameter_map(synth: &SurgeSynthesizer) -> HashMap<String, i32> {
         }
     }
     map
-}
-
-fn preset_parameters(preset: &str) -> Option<&'static [(&'static str, f32)]> {
-    match preset {
-        "Init" => Some(&[
-            ("A Osc 1 Type", 0.0),
-            ("A Osc 1 Volume", 0.72),
-            ("A Osc 2 Mute", 1.0),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        "Surge Kick" => Some(&[
-            ("A Osc 1 Type", OSC_SINE),
-            ("A Osc 1 Volume", 1.0),
-            ("A Amp EG Attack", 0.0),
-            ("A Amp EG Decay", 0.4),
-            ("A Amp EG Sustain", 0.0),
-            ("A Amp EG Release", 0.2),
-            ("A Filter 1 Cutoff", 0.35),
-            ("A Filter 1 Resonance", 0.15),
-            ("A Osc 2 Mute", 1.0),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        "Surge Snare" => Some(&[
-            ("A Osc 1 Type", OSC_SH_NOISE),
-            ("A Osc 1 Volume", 1.0),
-            ("A Amp EG Attack", 0.0),
-            ("A Amp EG Decay", 0.38),
-            ("A Amp EG Sustain", 0.0),
-            ("A Amp EG Release", 0.22),
-            ("A Filter 1 Cutoff", 0.82),
-            ("A Filter 1 Resonance", 0.1),
-            ("A Osc 2 Mute", 1.0),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        "Surge Closed Hat" => Some(&[
-            ("A Osc 1 Type", OSC_SH_NOISE),
-            ("A Osc 1 Volume", 1.0),
-            ("A Amp EG Attack", 0.0),
-            ("A Amp EG Decay", 0.18),
-            ("A Amp EG Sustain", 0.0),
-            ("A Amp EG Release", 0.08),
-            ("A Filter 1 Cutoff", 0.96),
-            ("A Filter 1 Resonance", 0.08),
-            ("A Osc 2 Mute", 1.0),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        "Surge Open Hat" => Some(&[
-            ("A Osc 1 Type", OSC_SH_NOISE),
-            ("A Osc 1 Volume", 1.0),
-            ("A Amp EG Attack", 0.0),
-            ("A Amp EG Decay", 0.42),
-            ("A Amp EG Sustain", 0.0),
-            ("A Amp EG Release", 0.3),
-            ("A Filter 1 Cutoff", 0.94),
-            ("A Filter 1 Resonance", 0.08),
-            ("A Osc 2 Mute", 1.0),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        "Surge Crash" => Some(&[
-            ("A Osc 1 Type", OSC_SH_NOISE),
-            ("A Osc 1 Volume", 1.0),
-            ("A Amp EG Attack", 0.0),
-            ("A Amp EG Decay", 0.7),
-            ("A Amp EG Sustain", 0.0),
-            ("A Amp EG Release", 0.62),
-            ("A Filter 1 Cutoff", 0.9),
-            ("A Filter 1 Resonance", 0.06),
-            ("A Osc 2 Mute", 1.0),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        "Surge Percussion" => Some(&[
-            ("A Osc 1 Type", OSC_SH_NOISE),
-            ("A Osc 1 Volume", 0.6),
-            ("A Amp EG Attack", 0.0),
-            ("A Amp EG Decay", 0.3),
-            ("A Amp EG Sustain", 0.0),
-            ("A Amp EG Release", 0.18),
-            ("A Filter 1 Cutoff", 0.75),
-            ("A Filter 1 Resonance", 0.1),
-            ("A Osc 2 Mute", 1.0),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        "Surge Bass" => Some(&[
-            ("A Osc 1 Type", 0.0),
-            ("A Osc 1 Volume", 0.95),
-            ("A Osc 2 Mute", 0.0),
-            ("A Osc 2 Type", OSC_SINE),
-            ("A Osc 2 Octave", 0.25),
-            ("A Osc 2 Volume", 0.7),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        "Surge Pad" => Some(&[
-            ("A Osc 1 Type", OSC_MODERN),
-            ("A Osc 1 Volume", 0.9),
-            ("A Osc 2 Mute", 0.0),
-            ("A Osc 2 Type", OSC_SINE),
-            ("A Osc 2 Volume", 0.75),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        "Surge Lead" => Some(&[
-            ("A Osc 1 Type", OSC_MODERN),
-            ("A Osc 1 Volume", 0.78),
-            ("A Osc 2 Mute", 0.0),
-            ("A Osc 2 Type", 0.0),
-            ("A Osc 2 Volume", 0.28),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        "Surge Atmosphere" => Some(&[
-            ("A Osc 1 Type", OSC_FM2),
-            ("A Osc 1 Volume", 0.58),
-            ("A Osc 2 Mute", 0.0),
-            ("A Osc 2 Type", OSC_SINE),
-            ("A Osc 2 Octave", 0.75),
-            ("A Osc 2 Volume", 0.32),
-            ("A Osc 3 Mute", 1.0),
-        ]),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -1353,6 +1003,13 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let baseline = render(&[]);
+        let target = instrument_parameters_for_instrument(&instrument)
+            .into_iter()
+            .find(|parameter| {
+                parameter.scene_modulatable && parameter.name.ends_with("Filter 1 Cutoff")
+            })
+            .map(|parameter| format!("native:{}", parameter.id))
+            .expect("modulatable native parameter");
         let formula = Modulator {
             id: 99,
             name: "Native formula".to_owned(),
@@ -1367,7 +1024,7 @@ mod tests {
             polarity: "increase".to_owned(),
             formula: "function process(state)\n state.output = 1\n return state\nend".to_owned(),
             depth: 0.9,
-            target: "instrument.cutoff".to_owned(),
+            target,
             enabled: true,
         };
         let modulated = render(&[formula]);
@@ -1384,7 +1041,6 @@ mod tests {
     fn factory_patch_loads_into_the_headless_engine() {
         let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
         instrument.preset = "Factory/Pads/Flux Capacitor".to_owned();
-        instrument.parameter_overrides.clear();
         let mut engine =
             Engine::new(&instrument, &[], &[], &[], 1, 16_000.0).expect("factory Surge XT patch");
         engine.play_note(60, 0.8, 1);
@@ -1396,11 +1052,11 @@ mod tests {
         assert!(energy > 0.001, "factory patch rendered silence");
     }
 
+    #[cfg(any())]
     #[test]
     fn factory_patch_parameters_change_only_when_explicitly_overridden() {
         let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
         instrument.preset = "Factory/Leads/Violini Solo".to_owned();
-        instrument.parameter_overrides.clear();
         instrument.cutoff = 0.01;
         let native = Engine::new(&instrument, &[], &[], &[], 1, 16_000.0)
             .expect("factory Surge XT patch")
@@ -1421,7 +1077,6 @@ mod tests {
         let distortion_parameters = crate::surge::effect_parameter_values("Distortion");
         let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
         instrument.preset = "Factory/Pads/Flux Capacitor".to_owned();
-        instrument.parameter_overrides.clear();
         let mut engine =
             Engine::new(&instrument, &[], &[], &[], 1, 16_000.0).expect("factory Surge XT patch");
         engine
@@ -1442,8 +1097,6 @@ mod tests {
             mix: engine
                 .parameter_value("FX A1 Mix")
                 .expect("preset effect mix"),
-            cutoff_hz: None,
-            resonance: None,
             enabled: true,
             parameters: BTreeMap::new(),
             parameter_overrides: Vec::new(),
@@ -1456,8 +1109,6 @@ mod tests {
                 name: "Distortion".to_owned(),
                 preset_slot: None,
                 mix: 0.5,
-                cutoff_hz: None,
-                resonance: None,
                 enabled: true,
                 parameters: distortion_parameters.clone(),
                 parameter_overrides: Vec::new(),
@@ -1506,7 +1157,7 @@ mod tests {
 
         assert_eq!(
             engine.parameter_display("FX B1 FX Type").as_deref(),
-            Some("Off")
+            Some("Distortion")
         );
         assert_eq!(
             engine.parameter_display("FX S1 FX Type").as_deref(),
@@ -1522,8 +1173,6 @@ mod tests {
             name: "Reverb 2".to_owned(),
             preset_slot: Some(1),
             mix: 0.2,
-            cutoff_hz: None,
-            resonance: None,
             enabled: true,
             parameters: effect_parameter_values("Reverb 2"),
             parameter_overrides: Vec::new(),
@@ -1535,8 +1184,6 @@ mod tests {
             name: "Distortion".to_owned(),
             preset_slot: None,
             mix: 0.8,
-            cutoff_hz: None,
-            resonance: None,
             enabled: true,
             parameters: effect_parameter_values("Distortion"),
             parameter_overrides: Vec::new(),
@@ -1586,7 +1233,6 @@ mod tests {
     fn factory_preset_and_added_effect_chain_renders_audio() {
         let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
         instrument.preset = "Factory/Basses/Evilous".to_owned();
-        instrument.parameter_overrides.clear();
         let mut effects = preset_effects(&instrument.preset).expect("factory preset effects");
         for (index, name) in ["Flanger", "EQ", "CHOW", "Delay"].iter().enumerate() {
             effects.push(Effect {
@@ -1594,8 +1240,6 @@ mod tests {
                 name: (*name).to_owned(),
                 preset_slot: None,
                 mix: 0.5,
-                cutoff_hz: None,
-                resonance: None,
                 enabled: true,
                 parameters: crate::surge::effect_parameter_values(name),
                 parameter_overrides: Vec::new(),
@@ -1607,6 +1251,11 @@ mod tests {
             effect.id = 100 + index as u64;
         }
         let order = effects.iter().map(|effect| effect.id).collect::<Vec<_>>();
+        let target = instrument_parameters_for_instrument(&instrument)
+            .into_iter()
+            .find(|parameter| parameter.voice_modulatable)
+            .map(|parameter| format!("native:{}", parameter.id))
+            .expect("modulatable native parameter");
         let modulator = Modulator {
             id: 113,
             name: "AI modulation".to_owned(),
@@ -1621,7 +1270,7 @@ mod tests {
             polarity: "increase".to_owned(),
             formula: String::new(),
             depth: 0.8,
-            target: "instrument.cutoff".to_owned(),
+            target,
             enabled: true,
         };
         let mut engine = Engine::new(&instrument, &effects, &order, &[modulator], 1, 16_000.0)
@@ -1656,8 +1305,6 @@ mod tests {
             name: "Distortion".to_owned(),
             preset_slot: None,
             mix: 0.6,
-            cutoff_hz: None,
-            resonance: None,
             enabled: true,
             parameters: crate::surge::effect_parameter_values("Distortion"),
             parameter_overrides: Vec::new(),
@@ -1697,8 +1344,6 @@ mod tests {
                 name: (*name).to_owned(),
                 preset_slot: None,
                 mix: 0.5,
-                cutoff_hz: None,
-                resonance: None,
                 enabled: true,
                 parameters: crate::surge::effect_parameter_values(name),
                 parameter_overrides: Vec::new(),
@@ -1714,9 +1359,17 @@ mod tests {
     #[test]
     fn disabled_effects_keep_their_native_parameter_semantics() {
         let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
-        let mut effect = crate::model::Project::demo().tracks[1].effects[0].clone();
-        effect.enabled = false;
-        effect.id = 99;
+        let effect = Effect {
+            id: 99,
+            name: "EQ".to_owned(),
+            preset_slot: None,
+            mix: 0.5,
+            enabled: false,
+            parameters: effect_parameter_values("EQ"),
+            parameter_overrides: Vec::new(),
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
+        };
         let mut effects = (0..SERIAL_EFFECT_SLOT_COUNT)
             .map(|index| {
                 let mut enabled = effect.clone();

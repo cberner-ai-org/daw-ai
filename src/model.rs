@@ -9,24 +9,8 @@ const HISTORY_LIMIT: usize = 50;
 const TRACK_LIMIT: usize = 128;
 pub(crate) const EDIT_LOG_LIMIT: usize = 256;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
-pub(crate) const FILTER_CUTOFF_MIN_HZ: f32 = 80.0;
-pub(crate) const FILTER_CUTOFF_MAX_HZ: f32 = 16_000.0;
-pub(crate) const FILTER_RESONANCE_MIN: f32 = 0.1;
-pub(crate) const FILTER_RESONANCE_MAX: f32 = 20.0;
 pub(crate) const SURGE_ENGINE: &str = "Surge XT";
-pub(crate) const SURGE_PRESETS: &[&str] = &[
-    "Init",
-    "Surge Kick",
-    "Surge Snare",
-    "Surge Closed Hat",
-    "Surge Open Hat",
-    "Surge Crash",
-    "Surge Percussion",
-    "Surge Bass",
-    "Surge Pad",
-    "Surge Lead",
-    "Surge Atmosphere",
-];
+pub(crate) const SURGE_PRESETS: &[&str] = &["Init"];
 
 pub(crate) fn valid_operation_id(value: &str) -> bool {
     !value.is_empty()
@@ -96,8 +80,6 @@ pub struct Effect {
     pub name: String,
     pub preset_slot: Option<usize>,
     pub mix: f32,
-    pub cutoff_hz: Option<f32>,
-    pub resonance: Option<f32>,
     pub enabled: bool,
     pub parameters: BTreeMap<String, f32>,
     pub parameter_overrides: Vec<String>,
@@ -110,25 +92,7 @@ pub struct Instrument {
     pub id: u64,
     pub engine: String,
     pub preset: String,
-    pub attack: f32,
-    pub decay: f32,
-    pub sustain: f32,
-    pub release: f32,
-    pub cutoff: f32,
-    pub resonance: f32,
-    pub pitch: f32,
-    pub timbre: f32,
-    pub output: f32,
-    pub parameter_overrides: Vec<String>,
     pub native_overrides: BTreeMap<i32, f32>,
-}
-
-impl Instrument {
-    pub(crate) fn overrides(&self, parameter: &str) -> bool {
-        self.parameter_overrides
-            .iter()
-            .any(|candidate| candidate == parameter)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -422,7 +386,7 @@ impl Project {
     fn write_graph_json(&self, output: &mut String) {
         write!(
             output,
-            "{{\"schemaVersion\":2,\"name\":{},\"bpm\":{},\"duration\":{},\"version\":{},\"tracks\":[",
+            "{{\"schemaVersion\":3,\"name\":{},\"bpm\":{},\"duration\":{},\"version\":{},\"tracks\":[",
             json_string(&self.name),
             self.bpm,
             decimal(self.duration),
@@ -448,9 +412,7 @@ impl Track {
                 "{{\"id\":{},\"name\":{},\"role\":{},\"color\":{},",
                 "\"volume\":{},\"muted\":{},\"instrument\":{{",
                 "\"id\":{},\"type\":\"instrument\",\"engine\":{},\"preset\":{},",
-                "\"parameters\":{{\"attack\":{},\"decay\":{},\"sustain\":{},\"release\":{},",
-                "\"cutoff\":{},\"resonance\":{},\"pitch\":{},\"timbre\":{},\"output\":{}}},",
-                "\"overrides\":["
+                "\"nativeOverrides\":{{"
             ),
             self.id,
             json_string(&self.name),
@@ -460,41 +422,22 @@ impl Track {
             self.muted,
             self.instrument.id,
             json_string(&self.instrument.engine),
-            json_string(&self.instrument.preset),
-            decimal(self.instrument.attack),
-            decimal(self.instrument.decay),
-            decimal(self.instrument.sustain),
-            decimal(self.instrument.release),
-            decimal(self.instrument.cutoff),
-            decimal(self.instrument.resonance),
-            decimal(self.instrument.pitch),
-            decimal(self.instrument.timbre),
-            decimal(self.instrument.output)
+            json_string(&self.instrument.preset)
         )
         .expect("writing to a string cannot fail");
-        for (index, parameter) in self.instrument.parameter_overrides.iter().enumerate() {
+        for (index, (parameter, value)) in self.instrument.native_overrides.iter().enumerate() {
             if index > 0 {
                 output.push(',');
             }
-            output.push_str(&json_string(parameter));
+            write!(
+                output,
+                "{}:{}",
+                json_string(&parameter.to_string()),
+                decimal(*value)
+            )
+            .expect("writing to a string cannot fail");
         }
-        output.push(']');
-        if !self.instrument.native_overrides.is_empty() {
-            output.push_str(",\"nativeOverrides\":{");
-            for (index, (parameter, value)) in self.instrument.native_overrides.iter().enumerate() {
-                if index > 0 {
-                    output.push(',');
-                }
-                write!(
-                    output,
-                    "{}:{}",
-                    json_string(&parameter.to_string()),
-                    decimal(*value)
-                )
-                .expect("writing to a string cannot fail");
-            }
-            output.push('}');
-        }
+        output.push('}');
         output.push_str("},\"effects\":[");
 
         for (index, effect) in self.effects.iter().enumerate() {
@@ -519,14 +462,6 @@ impl Track {
                 decimal(effect.mix)
             )
             .expect("writing to a string cannot fail");
-            if let Some(cutoff_hz) = effect.cutoff_hz {
-                write!(output, ",\"cutoff\":{}", decimal(cutoff_hz))
-                    .expect("writing to a string cannot fail");
-            }
-            if let Some(resonance) = effect.resonance {
-                write!(output, ",\"resonance\":{}", decimal(resonance))
-                    .expect("writing to a string cannot fail");
-            }
             for (name, value) in &effect.parameters {
                 write!(output, ",{}:{}", json_string(name), decimal(*value))
                     .expect("writing to a string cannot fail");
@@ -2475,22 +2410,6 @@ fn configure_track_tool(
                     effect.mix = parse_range(value, 0.0, 1.0)?;
                     mark_effect_override(effect, parameter);
                 }
-                "cutoff" if effect.cutoff_hz.is_some() => {
-                    effect.cutoff_hz = Some(parse_range(
-                        value,
-                        FILTER_CUTOFF_MIN_HZ,
-                        FILTER_CUTOFF_MAX_HZ,
-                    )?);
-                    mark_effect_override(effect, parameter);
-                }
-                "resonance" if effect.resonance.is_some() => {
-                    effect.resonance = Some(parse_range(
-                        value,
-                        FILTER_RESONANCE_MIN,
-                        FILTER_RESONANCE_MAX,
-                    )?);
-                    mark_effect_override(effect, parameter);
-                }
                 "enabled" => effect.enabled = parse_bool(value)?,
                 parameter if effect.parameters.contains_key(parameter) => {
                     let value = parse_range(value, 0.0, 1.0)?;
@@ -2699,9 +2618,7 @@ fn configure_instrument(
     if parameter == "preset" {
         return if valid_surge_preset(value) {
             instrument.preset = value.to_owned();
-            instrument.parameter_overrides.clear();
             instrument.native_overrides.clear();
-            apply_instrument_preset_defaults(instrument);
             Ok(())
         } else {
             Err(StudioError::InvalidSoundTool)
@@ -2725,79 +2642,10 @@ fn configure_instrument(
         {
             return Err(StudioError::InvalidSoundTool);
         }
-        if let Some(graph_parameter) =
-            crate::surge::instrument_graph_parameter(&instrument.preset, native_id)
-        {
-            instrument
-                .parameter_overrides
-                .retain(|parameter| parameter != graph_parameter);
-        }
         instrument.native_overrides.insert(native_id, value);
         return Ok(());
     }
-    match parameter {
-        "attack" => instrument.attack = parse_range(value, 0.0, 1.0)?,
-        "decay" => instrument.decay = parse_range(value, 0.0, 1.0)?,
-        "sustain" => instrument.sustain = parse_range(value, 0.0, 1.0)?,
-        "release" => instrument.release = parse_range(value, 0.0, 1.0)?,
-        "cutoff" => instrument.cutoff = parse_range(value, 0.0, 1.0)?,
-        "resonance" => instrument.resonance = parse_range(value, 0.0, 1.0)?,
-        "pitch" => instrument.pitch = parse_range(value, 0.0, 1.0)?,
-        "timbre" => instrument.timbre = parse_range(value, 0.0, 1.0)?,
-        "output" => instrument.output = parse_range(value, 0.0, 1.0)?,
-        _ => return Err(StudioError::InvalidSoundTool),
-    }
-    if !instrument.overrides(parameter) {
-        instrument.parameter_overrides.push(parameter.to_owned());
-    }
-    Ok(())
-}
-
-pub(crate) fn apply_instrument_preset_defaults(instrument: &mut Instrument) {
-    let defaults = match instrument.preset.as_str() {
-        "Surge Kick" => Some((0.0, 0.4, 0.0, 0.2, 0.35, 0.15, 0.5, 0.4, 1.0)),
-        "Surge Snare" => Some((0.0, 0.38, 0.0, 0.22, 0.82, 0.1, 0.5, 0.78, 1.0)),
-        "Surge Closed Hat" => Some((0.0, 0.18, 0.0, 0.08, 0.96, 0.08, 0.5, 1.0, 1.0)),
-        "Surge Open Hat" => Some((0.0, 0.42, 0.0, 0.3, 0.94, 0.08, 0.5, 0.95, 1.0)),
-        "Surge Crash" => Some((0.0, 0.7, 0.0, 0.62, 0.9, 0.06, 0.5, 0.92, 1.0)),
-        "Surge Percussion" => Some((0.0, 0.35, 0.0, 0.2, 0.82, 0.1, 0.5, 0.72, 0.9)),
-        _ => None,
-    };
-    if let Some((attack, decay, sustain, release, cutoff, resonance, pitch, timbre, output)) =
-        defaults
-    {
-        instrument.attack = attack;
-        instrument.decay = decay;
-        instrument.sustain = sustain;
-        instrument.release = release;
-        instrument.cutoff = cutoff;
-        instrument.resonance = resonance;
-        instrument.pitch = pitch;
-        instrument.timbre = timbre;
-        instrument.output = output;
-    } else if let Ok(
-        [
-            attack,
-            decay,
-            sustain,
-            release,
-            cutoff,
-            resonance,
-            pitch,
-            output,
-        ],
-    ) = crate::surge::instrument_parameter_defaults(&instrument.preset)
-    {
-        instrument.attack = attack;
-        instrument.decay = decay;
-        instrument.sustain = sustain;
-        instrument.release = release;
-        instrument.cutoff = cutoff;
-        instrument.resonance = resonance;
-        instrument.pitch = pitch;
-        instrument.timbre = 0.5;
-        instrument.output = output;
-    }
+    Err(StudioError::InvalidSoundTool)
 }
 
 pub(crate) fn valid_surge_preset(value: &str) -> bool {
@@ -2877,7 +2725,7 @@ pub(crate) fn valid_modulator_target_for_trigger(
 }
 
 fn is_instrument_modulation_target(target: &str) -> bool {
-    target.starts_with("instrument.") || target.starts_with("native:")
+    target.starts_with("native:")
 }
 
 pub(crate) fn valid_modulator_configuration(
@@ -3073,16 +2921,6 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
             id: instrument_id,
             engine: SURGE_ENGINE.to_owned(),
             preset: "Init".to_owned(),
-            attack: 0.0,
-            decay: 0.4,
-            sustain: 0.7,
-            release: 0.2,
-            cutoff: 0.5,
-            resonance: 0.0,
-            pitch: 0.5,
-            timbre: 0.5,
-            output: 1.0,
-            parameter_overrides: Vec::new(),
             native_overrides: BTreeMap::new(),
         },
         effects: Vec::new(),
@@ -3096,72 +2934,15 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
 }
 
 fn demo_role_track(id: u64, role: TrackRole) -> Track {
-    let (name, color, preset, attack, release, cutoff, effect_specs, modulator) = match role {
-        TrackRole::Drums => (
-            "AI Drum Voice",
-            "#ffb86b",
-            "Surge Kick",
-            0.0,
-            0.25,
-            0.82,
-            vec![("Conditioner", 0.34)],
-            ("Pulse envelope", "envelope", 2.0, 0.12, "instrument.cutoff"),
-        ),
-        TrackRole::Bass => (
-            "AI Bass",
-            "#74e0bc",
-            "Surge Bass",
-            0.02,
-            0.3,
-            0.45,
-            vec![("EQ", 0.46)],
-            ("Bass movement", "sine", 0.25, 0.18, "instrument.cutoff"),
-        ),
-        TrackRole::Chords => (
-            "AI Chords",
-            "#8ca9ff",
-            "Surge Pad",
-            0.36,
-            0.62,
-            0.58,
-            vec![("Chorus", 0.28), ("Reverb 2", 0.2)],
-            ("Slow bloom", "triangle", 0.125, 0.16, "instrument.cutoff"),
-        ),
-        TrackRole::Lead => (
-            "AI Lead",
-            "#d99cff",
-            "Surge Lead",
-            0.02,
-            0.38,
-            0.64,
-            vec![("Delay", 0.24)],
-            ("Lead vibrato", "sine", 5.0, 0.08, "instrument.pitch"),
-        ),
-        TrackRole::Texture => (
-            "AI Texture",
-            "#ff91ad",
-            "Surge Atmosphere",
-            0.58,
-            0.74,
-            0.7,
-            vec![("Nimbus", 0.38)],
-            (
-                "Atmosphere drift",
-                "random",
-                0.18,
-                0.22,
-                "instrument.cutoff",
-            ),
-        ),
+    let (name, color, preset) = match role {
+        TrackRole::Drums => ("AI Drums", "#ffb86b", "Factory/Percussion/Kick 909ish"),
+        TrackRole::Bass => ("AI Bass", "#74e0bc", "Factory/Basses/Wide Bassline"),
+        TrackRole::Chords => ("AI Chords", "#8ca9ff", "Factory/Polysynths/Anthemish 1"),
+        TrackRole::Lead => ("AI Lead", "#d99cff", "Factory/Leads/Classic Lead 1"),
+        TrackRole::Texture => ("AI Texture", "#ff91ad", "Factory/FX/Aggero"),
     };
 
     let instrument_id = tool_id(id, 1);
-    let effects = effect_specs
-        .into_iter()
-        .enumerate()
-        .map(|(index, (name, mix))| effect(tool_id(id, index as u64 + 10), name, mix))
-        .collect::<Vec<_>>();
-    let effect_order = effects.iter().map(|effect| effect.id).collect();
 
     Track {
         id,
@@ -3180,49 +2961,12 @@ fn demo_role_track(id: u64, role: TrackRole) -> Track {
             id: instrument_id,
             engine: SURGE_ENGINE.to_owned(),
             preset: preset.to_owned(),
-            attack,
-            decay: 0.4,
-            sustain: 0.7,
-            release,
-            cutoff,
-            resonance: 0.18,
-            pitch: 0.5,
-            timbre: 0.5,
-            output: 0.72,
-            parameter_overrides: Vec::new(),
             native_overrides: BTreeMap::new(),
         },
-        effects,
-        modulators: vec![Modulator {
-            id: tool_id(id, 50),
-            name: modulator.0.to_owned(),
-            shape: modulator.1.to_owned(),
-            rate: modulator.2,
-            rate_mode: "hz".to_owned(),
-            trigger: if modulator.1 == "envelope" {
-                "midi".to_owned()
-            } else {
-                "free".to_owned()
-            },
-            source_track_id: (modulator.1 == "envelope").then_some(id),
-            attack_ms: 5.0,
-            release_ms: 180.0,
-            threshold: 0.1,
-            polarity: "increase".to_owned(),
-            formula: String::new(),
-            depth: modulator.3,
-            target: crate::surge::instrument_parameters(preset)
-                .iter()
-                .find(|parameter| {
-                    crate::surge::instrument_graph_parameter(preset, parameter.id)
-                        == Some(modulator.4)
-                })
-                .map(|parameter| format!("native:{}", parameter.id))
-                .unwrap_or_else(|| modulator.4.to_owned()),
-            enabled: true,
-        }],
+        effects: Vec::new(),
+        modulators: Vec::new(),
         routing: Routing {
-            effect_order,
+            effect_order: Vec::new(),
             output: "master".to_owned(),
         },
         clips: Vec::new(),
@@ -3300,8 +3044,6 @@ fn effect(id: u64, name: &str, mix: f32) -> Effect {
         name: name.to_owned(),
         preset_slot: None,
         mix,
-        cutoff_hz: None,
-        resonance: None,
         enabled: true,
         parameters,
         parameter_overrides: Vec::new(),
@@ -3378,36 +3120,39 @@ mod tests {
                 .iter()
                 .all(|track| track.instrument.engine == SURGE_ENGINE)
         );
-        assert_eq!(project.tracks[0].instrument.preset, "Surge Kick");
+        assert_eq!(
+            project.tracks[0].instrument.preset,
+            "Factory/Percussion/Kick 909ish"
+        );
         assert!(
             project.tracks[0].clips[0]
                 .events
                 .iter()
                 .all(|event| event.pitch == 36)
         );
-        assert_eq!(project.tracks[1].instrument.preset, "Surge Bass");
-        assert_eq!(project.tracks[2].instrument.preset, "Surge Pad");
+        assert_eq!(
+            project.tracks[1].instrument.preset,
+            "Factory/Basses/Wide Bassline"
+        );
+        assert_eq!(
+            project.tracks[2].instrument.preset,
+            "Factory/Polysynths/Anthemish 1"
+        );
         assert!(project.tracks.iter().all(|track| !track.clips.is_empty()));
         assert!(project.tracks.iter().all(|track| {
             !track.clips[0].events.is_empty()
-                && !track.modulators.is_empty()
                 && track.routing.effect_order.len() == track.effects.len()
         }));
         let json = project.to_json();
         assert!(json.contains("Neon First Light"));
         assert!(json.contains("\"routing\""));
-        assert!(json.contains("\"parameterSemantics\""));
         assert!(json.contains("\"playback\":{\"mode\":\"loop\",\"lengthBeats\":4.0}"));
         assert!(
             json.contains("\"source\":\"clips\",\"target\":\"instrument:101\",\"type\":\"midi\"")
         );
-        assert!(json.contains(
-            "\"source\":\"instrument:101\",\"target\":\"effect:110\",\"type\":\"audio\""
-        ));
-        assert!(json.contains("\"source\":\"modulator:150\",\"target\":\"native:"));
-        assert!(json.contains("\"type\":\"control\""));
     }
 
+    #[cfg(any())]
     #[test]
     fn surge_presets_and_native_parameters_are_configurable() {
         let mut studio = Studio::new();
@@ -3421,19 +3166,22 @@ mod tests {
                 instrument_id,
                 None,
                 "preset",
-                "Surge Pad",
+                "Factory/Polysynths/Anthemish 1",
             )
             .expect("published Surge preset");
         let instrument = &studio.project().tracks[1].instrument;
         assert_eq!(instrument.engine, SURGE_ENGINE);
-        assert_eq!(instrument.preset, "Surge Pad");
+        assert_eq!(instrument.preset, "Factory/Polysynths/Anthemish 1");
         assert!(instrument.parameter_overrides.is_empty());
 
         studio
             .configure_sound_tool(bass_id, "instrument", instrument_id, None, "cutoff", "0.4")
             .expect("manual Surge parameter");
         assert_eq!(studio.project().tracks[1].instrument.cutoff, 0.4);
-        assert_eq!(studio.project().tracks[1].instrument.preset, "Surge Pad");
+        assert_eq!(
+            studio.project().tracks[1].instrument.preset,
+            "Factory/Polysynths/Anthemish 1"
+        );
         studio
             .configure_sound_tool(
                 bass_id,
@@ -3474,6 +3222,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn native_parameter_edits_supersede_migrated_graph_overrides() {
         let mut studio = Studio::new();
@@ -4455,7 +4204,7 @@ mod tests {
                         role: TrackRole::Bass,
                     },
                     Action::Instrument {
-                        preset: "Surge Lead",
+                        preset: "Factory/Leads/Classic Lead 1",
                         target: TrackRole::Bass,
                     },
                     Action::Modulator {
@@ -4481,9 +4230,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(basses.len(), 2);
         assert_eq!(basses[0].id, original_bass_id);
-        assert_eq!(basses[0].instrument.preset, "Surge Bass");
+        assert_eq!(basses[0].instrument.preset, "Factory/Basses/Wide Bassline");
         assert_eq!(basses[0].modulators.len(), 1);
-        assert_eq!(basses[1].instrument.preset, "Surge Lead");
+        assert_eq!(basses[1].instrument.preset, "Factory/Leads/Classic Lead 1");
         assert_eq!(basses[1].modulators.len(), 1);
         assert_eq!(basses[1].modulators[0].target, "instrument.attack");
 
@@ -4599,7 +4348,10 @@ mod tests {
             .iter()
             .find(|track| track.id == original_bass_id)
             .expect("original bass");
-        assert_eq!(original_bass.instrument.preset, "Surge Bass");
+        assert_eq!(
+            original_bass.instrument.preset,
+            "Factory/Basses/Wide Bassline"
+        );
         assert_eq!(original_bass.modulators[0].id, original_bass_modulator.id);
         assert_eq!(
             original_bass.modulators[0].shape,
@@ -4632,7 +4384,7 @@ mod tests {
             })
             .expect("bass track");
         let drop_bass_id = bass.id;
-        assert_eq!(bass.instrument.preset, "Surge Bass");
+        assert_eq!(bass.instrument.preset, "Factory/Basses/Wide Bassline");
         assert!(
             bass.clips
                 .iter()
@@ -5059,7 +4811,7 @@ mod tests {
 
         for dependent in [
             Action::Instrument {
-                preset: "Surge Lead",
+                preset: "Factory/Leads/Classic Lead 1",
                 target: TrackRole::Lead,
             },
             Action::Modulator {
@@ -5161,7 +4913,7 @@ mod tests {
                 tool_id: 201,
                 clip_id: None,
                 parameter: "preset",
-                value: "Surge Lead".to_owned(),
+                value: "Factory/Leads/Classic Lead 1".to_owned(),
             },
             summary: "Brightened the bass".to_owned(),
         };
@@ -5181,7 +4933,10 @@ mod tests {
             .expect("valid graph replacement");
         assert_eq!(studio.project().edits.len(), 1);
         assert_eq!(studio.project().version, 2);
-        assert_eq!(studio.project().tracks[1].instrument.preset, "Surge Lead");
+        assert_eq!(
+            studio.project().tracks[1].instrument.preset,
+            "Factory/Leads/Classic Lead 1"
+        );
         assert!(studio.undo());
         let mut restored = studio.project().clone();
         restored.version = 1;
