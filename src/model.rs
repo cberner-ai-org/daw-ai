@@ -516,6 +516,7 @@ impl Track {
             if index > 0 {
                 output.push(',');
             }
+            let semantics = crate::surge::effect_control_semantics(&effect.name);
             write!(
                 output,
                 concat!(
@@ -553,6 +554,44 @@ impl Track {
                 output.push_str(&json_string(parameter));
             }
             output.push(']');
+            output.push_str(",\"parameterSemantics\":{");
+            let mut semantic_index = 0;
+            for parameter in effect.parameters.keys() {
+                let Some(semantics) = semantics.get(parameter) else {
+                    continue;
+                };
+                if semantic_index > 0 {
+                    output.push(',');
+                }
+                semantic_index += 1;
+                write!(
+                    output,
+                    "{}:{{\"kind\":{},\"choices\":[",
+                    json_string(parameter),
+                    json_string(if semantics.boolean {
+                        "boolean"
+                    } else if semantics.discrete || !semantics.choices.is_empty() {
+                        "selection"
+                    } else {
+                        "continuous"
+                    })
+                )
+                .expect("writing to a string cannot fail");
+                for (choice_index, (value, display)) in semantics.choices.iter().enumerate() {
+                    if choice_index > 0 {
+                        output.push(',');
+                    }
+                    write!(
+                        output,
+                        "{{\"value\":{},\"display\":{}}}",
+                        decimal(*value),
+                        json_string(display)
+                    )
+                    .expect("writing to a string cannot fail");
+                }
+                output.push_str("]}");
+            }
+            output.push('}');
             if let Some(slot) = effect.preset_slot {
                 write!(output, ",\"presetSlot\":{}", slot + 1)
                     .expect("writing to a string cannot fail");
@@ -3576,6 +3615,7 @@ mod tests {
         let json = project.to_json();
         assert!(json.contains("Neon First Light"));
         assert!(json.contains("\"routing\""));
+        assert!(json.contains("\"parameterSemantics\""));
         assert!(json.contains("\"playback\":{\"mode\":\"loop\",\"lengthBeats\":4.0}"));
         assert!(
             json.contains("\"source\":\"clips\",\"target\":\"instrument:101\",\"type\":\"midi\"")
@@ -4569,6 +4609,11 @@ mod tests {
         let effect_id = studio
             .create_effect(track_id, &effect_name, 0.5)
             .expect("effect with selection");
+        let json = studio.to_json();
+        assert!(json.contains(&format!(
+            "{}:{{\"kind\":\"selection\",\"choices\":[{{",
+            json_string(&parameter)
+        )));
 
         assert_eq!(
             studio
