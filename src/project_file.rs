@@ -272,7 +272,7 @@ fn parse_effect(
     }
     let parameters = object(field(effect, "parameters")?, "effect parameters")?;
     let native_parameters = crate::surge::effect_parameter_values(&name);
-    let mut extra_parameters = std::collections::BTreeMap::new();
+    let mut serialized_parameters = std::collections::BTreeMap::new();
     for (parameter, value) in parameters {
         if parameter == "mix" {
             continue;
@@ -289,10 +289,7 @@ fn parse_effect(
                 "effect parameter {parameter} must be between 0 and 1"
             )));
         }
-        extra_parameters.insert(parameter.to_owned(), value);
-    }
-    for (name, value) in native_parameters {
-        extra_parameters.entry(name).or_insert(value);
+        serialized_parameters.insert(parameter.to_owned(), value);
     }
     let override_values = effect
         .get("overrides")
@@ -308,12 +305,16 @@ fn parse_effect(
                 Ok(name) => name,
                 Err(error) => return Some(Err(error)),
             };
-            if parameter != "mix" && !extra_parameters.contains_key(parameter) {
+            if parameter != "mix" && !serialized_parameters.contains_key(parameter) {
                 return None;
             }
             Some(Ok(parameter.to_owned()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let extra_parameters = serialized_parameters
+        .into_iter()
+        .filter(|(parameter, _)| parameter_overrides.contains(parameter))
+        .collect();
     let preset_slot = effect
         .contains_key("presetSlot")
         .then(|| {
@@ -1084,6 +1085,7 @@ fn required_target(target: Option<TrackRole>, action: &str) -> Result<TrackRole,
 
 fn parse_role(value: &str) -> Result<TrackRole, ProjectFileError> {
     match value {
+        "neutral" => Ok(TrackRole::Neutral),
         "drums" => Ok(TrackRole::Drums),
         "bass" => Ok(TrackRole::Bass),
         "chords" => Ok(TrackRole::Chords),
@@ -1503,7 +1505,10 @@ mod tests {
             })
             .expect("native effect selection");
         track.effects = vec![effect];
-        track.effects[0].parameters.insert(parameter, 0.123_456);
+        track.effects[0]
+            .parameters
+            .insert(parameter.clone(), 0.123_456);
+        track.effects[0].parameter_overrides.push(parameter);
         track.routing.effect_order = vec![99_002];
 
         let error = parse_project(&project.to_json()).expect_err("in-between native choice");

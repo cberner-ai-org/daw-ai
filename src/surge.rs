@@ -12,10 +12,6 @@ pub(crate) const SERIAL_EFFECT_SLOT_COUNT: usize = 8;
 const SERIAL_EFFECT_SLOTS: [&str; SERIAL_EFFECT_SLOT_COUNT] = [
     "FX A1", "FX A2", "FX A3", "FX A4", "FX G1", "FX G2", "FX G3", "FX G4",
 ];
-const ALL_EFFECT_SLOTS: [&str; 16] = [
-    "FX A1", "FX A2", "FX A3", "FX A4", "FX B1", "FX B2", "FX B3", "FX B4", "FX S1", "FX S2",
-    "FX S3", "FX S4", "FX G1", "FX G2", "FX G3", "FX G4",
-];
 
 // The alpha binding does not expose Surge's parameter count. This comfortably
 // covers the current engine while from_synth_side_id rejects unused indices.
@@ -54,16 +50,6 @@ pub(crate) struct Engine {
     parameters: HashMap<String, i32>,
     effect_mix_parameters: HashMap<u64, String>,
     effect_parameters: HashMap<(u64, String), String>,
-    native_modulators: HashMap<u64, NativeModulatorRoute>,
-}
-
-#[derive(Clone, Copy)]
-struct NativeModulatorRoute {
-    lfo: i32,
-    target: i32,
-    source: i32,
-    direction: f32,
-    tempo_sync: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -139,7 +125,6 @@ impl Engine {
             synth,
             effect_mix_parameters: HashMap::new(),
             effect_parameters: HashMap::new(),
-            native_modulators: HashMap::new(),
         };
         engine.apply_preset(&instrument.preset)?;
         engine.set_native_overrides(&instrument.native_overrides)?;
@@ -240,44 +225,6 @@ impl Engine {
                     modulator.target
                 ));
             }
-            self.native_modulators.insert(
-                modulator.id,
-                NativeModulatorRoute {
-                    lfo: if voice { slot } else { slot + 6 },
-                    target,
-                    source,
-                    direction,
-                    tempo_sync: modulator.rate_mode == "tempo",
-                },
-            );
-        }
-        Ok(())
-    }
-
-    pub(crate) fn set_native_modulator_controls(
-        &mut self,
-        id: u64,
-        rate: f32,
-        depth: f32,
-    ) -> Result<(), String> {
-        let route = self
-            .native_modulators
-            .get(&id)
-            .copied()
-            .ok_or_else(|| format!("Surge XT native modulator {id} is unavailable"))?;
-        let native_rate = if route.tempo_sync { rate * 2.0 } else { rate };
-        let normalized_rate =
-            ((native_rate.max(f32::MIN_POSITIVE).log2() + 8.0) / 18.0).clamp(0.0, 1.0);
-        if !self
-            .synth
-            .set_lfo_rate(0, route.lfo, normalized_rate, route.tempo_sync)
-            || !self
-                .synth
-                .set_modulation(route.target, route.source, 0, route.direction * depth)
-        {
-            return Err(format!(
-                "Surge XT rejected runtime controls for native modulator {id}"
-            ));
         }
         Ok(())
     }
@@ -339,29 +286,6 @@ impl Engine {
         self.synth.pull_buffer()
     }
 
-    pub(crate) fn set_effect_mix(&mut self, effect_id: u64, value: f32) -> Result<(), String> {
-        let Some(parameter) = self.effect_mix_parameters.get(&effect_id).cloned() else {
-            return Ok(());
-        };
-        self.set_parameter(&parameter, value)
-    }
-
-    pub(crate) fn set_effect_parameter(
-        &mut self,
-        effect_id: u64,
-        parameter: &str,
-        value: f32,
-    ) -> Result<(), String> {
-        let Some(native) = self
-            .effect_parameters
-            .get(&(effect_id, parameter.to_owned()))
-            .cloned()
-        else {
-            return Ok(());
-        };
-        self.set_parameter(&native, value)
-    }
-
     fn set_native_overrides(
         &mut self,
         overrides: &std::collections::BTreeMap<i32, f32>,
@@ -377,17 +301,6 @@ impl Engine {
                 .set_parameter01(&mut id, value.clamp(0.0, 1.0), None, None);
         }
         Ok(())
-    }
-
-    pub(crate) fn set_native_parameter(&mut self, index: i32, value: f32) -> Result<(), String> {
-        let mut id = SurgeId::empty();
-        if !self.synth.from_synth_side_id(index, &mut id) {
-            return Err(format!("Surge XT parameter is unavailable: {index}"));
-        }
-        self.synth
-            .set_parameter01(&mut id, value.clamp(0.0, 1.0), None, None)
-            .then_some(())
-            .ok_or_else(|| format!("Surge XT cannot use this parameter {index} value"))
     }
 
     fn apply_preset(&mut self, preset: &str) -> Result<(), String> {
@@ -421,40 +334,69 @@ impl Engine {
                 "Surge XT supports at most {SERIAL_EFFECT_SLOT_COUNT} enabled track effects"
             ));
         }
-        // preset_slot is provenance; effect_order owns the runtime serial order.
         self.effect_mix_parameters.clear();
         self.effect_parameters.clear();
-        for slot in ALL_EFFECT_SLOTS {
-            let parameter = format!("{slot} FX Type");
-            if self
-                .parameter_value(&parameter)
-                .is_some_and(|value| value >= 0.02)
+        let mut assigned = HashMap::new();
+        let mut occupied = [false; SERIAL_EFFECT_SLOT_COUNT];
+        for effect in effects.iter().filter(|effect| effect.enabled) {
+            if let Some(slot) = effect
+                .preset_slot
+                .filter(|slot| *slot < SERIAL_EFFECT_SLOT_COUNT)
             {
-                self.set_parameter(&parameter, 0.0)?;
+                assigned.insert(effect.id, slot);
+                occupied[slot] = true;
+            }
+        }
+        for effect_id in effect_order {
+            if !effects
+                .iter()
+                .any(|effect| effect.id == *effect_id && effect.enabled)
+            {
+                continue;
+            }
+            if assigned.contains_key(effect_id) {
+                continue;
+            }
+            let slot = occupied
+                .iter()
+                .position(|occupied| !occupied)
+                .ok_or_else(|| {
+                    format!(
+                        "Surge XT supports at most {SERIAL_EFFECT_SLOT_COUNT} enabled track effects"
+                    )
+                })?;
+            occupied[slot] = true;
+            assigned.insert(*effect_id, slot);
+        }
+        for (slot_index, slot) in SERIAL_EFFECT_SLOTS.iter().enumerate() {
+            if !occupied[slot_index]
+                && self
+                    .parameter_value(&format!("{slot} FX Type"))
+                    .is_some_and(|value| value >= 0.02)
+            {
+                self.set_parameter(&format!("{slot} FX Type"), 0.0)?;
                 self.synth.process();
                 self.parameters = parameter_map(&self.synth);
             }
         }
-        let mut available = SERIAL_EFFECT_SLOTS.into_iter();
         for effect_id in effect_order {
             let Some(effect) = effects.iter().find(|effect| {
                 effect.id == *effect_id && effect.enabled && is_native_effect(&effect.name)
             }) else {
                 continue;
             };
+            let slot = SERIAL_EFFECT_SLOTS[assigned[effect_id]];
             let type_index = effect_type_index(&effect.name)
                 .ok_or_else(|| format!("unsupported Surge XT effect: {}", effect.name))?;
-            let slot = available.next().ok_or_else(|| {
-                format!(
-                    "Surge XT supports at most {SERIAL_EFFECT_SLOT_COUNT} enabled track effects"
-                )
-            })?;
-            self.set_parameter(
-                &format!("{slot} FX Type"),
-                type_index as f32 / (SURGE_EFFECT_TYPES.len() - 1) as f32,
-            )?;
-            self.synth.process();
-            self.parameters = parameter_map(&self.synth);
+            let desired_type = type_index as f32 / (SURGE_EFFECT_TYPES.len() - 1) as f32;
+            if self
+                .parameter_value(&format!("{slot} FX Type"))
+                .is_none_or(|current| (current - desired_type).abs() > 0.000_01)
+            {
+                self.set_parameter(&format!("{slot} FX Type"), desired_type)?;
+                self.synth.process();
+                self.parameters = parameter_map(&self.synth);
+            }
             for native in self.parameters.keys() {
                 if let Some(parameter) =
                     native
@@ -470,10 +412,13 @@ impl Engine {
                 }
             }
             let mix_parameter = format!("{slot} Mix");
-            if self.parameters.contains_key(&mix_parameter) {
+            if self.parameters.contains_key(&mix_parameter)
+                && (effect.preset_slot.is_none()
+                    || effect.parameter_overrides.iter().any(|item| item == "mix"))
+            {
                 self.set_parameter(&mix_parameter, effect.mix)?;
-                self.effect_mix_parameters.insert(effect.id, mix_parameter);
             }
+            self.effect_mix_parameters.insert(effect.id, mix_parameter);
             for (parameter, value) in &effect.parameters {
                 let native = format!("{slot} {parameter}");
                 if self.parameters.contains_key(&native) {
@@ -746,7 +691,7 @@ pub(crate) fn effect_control_semantics(name: &str) -> HashMap<String, EffectPara
         preset_slot: None,
         mix: 0.5,
         enabled: true,
-        parameters: effect_parameter_values(name),
+        parameters: BTreeMap::new(),
         parameter_overrides: Vec::new(),
         tempo_sync_parameters: Vec::new(),
         deactivated_parameters: Vec::new(),
@@ -783,53 +728,16 @@ pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
         let mix = engine
             .parameter_value(&format!("{slot} Mix"))
             .unwrap_or(1.0);
-        let parameters: BTreeMap<String, f32> = engine
-            .parameters
-            .keys()
-            .filter_map(|native| {
-                native
-                    .strip_prefix(&format!("{slot} "))
-                    .filter(|name| {
-                        *name != "FX Type" && *name != "Mix" && !is_generic_effect_parameter(name)
-                    })
-                    .and_then(|name| {
-                        engine
-                            .parameter_value(native)
-                            .map(|value| (name.to_owned(), value))
-                    })
-            })
-            .collect();
-        let tempo_sync_parameters = parameters
-            .keys()
-            .filter(|name| {
-                let Some(index) = engine.parameters.get(&format!("{slot} {name}")) else {
-                    return false;
-                };
-                let mut id = SurgeId::empty();
-                engine.synth.from_synth_side_id(*index, &mut id)
-                    && engine.synth.parameter_is_temposync(&id)
-            })
-            .cloned()
-            .collect();
-        let deactivated_parameters = parameters
-            .keys()
-            .filter(|name| {
-                engine
-                    .parameter_semantics(&format!("{slot} {name}"))
-                    .is_some_and(|semantics| semantics.can_deactivate && semantics.deactivated)
-            })
-            .cloned()
-            .collect();
         effects.push(Effect {
             id: 0,
             name: (*name).to_owned(),
             preset_slot: Some(slot_index),
             mix,
             enabled: true,
-            parameters,
+            parameters: BTreeMap::new(),
             parameter_overrides: Vec::new(),
-            tempo_sync_parameters,
-            deactivated_parameters,
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
         });
     }
     Ok(effects)
@@ -1140,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_effect_rebuild_clears_unsupported_scene_and_send_slots() {
+    fn graph_effect_orchestration_preserves_native_send_slots() {
         let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
         let mut engine =
             Engine::new_with_graph_effects(&instrument, &[], &[], &[], 1, 16_000.0, false)
@@ -1157,16 +1065,16 @@ mod tests {
 
         assert_eq!(
             engine.parameter_display("FX B1 FX Type").as_deref(),
-            Some("Distortion")
+            Some("Off")
         );
-        assert_eq!(
+        assert_ne!(
             engine.parameter_display("FX S1 FX Type").as_deref(),
             Some("Off")
         );
     }
 
     #[test]
-    fn routing_order_rebuilds_gapped_preset_and_added_effect_slots() {
+    fn preset_effect_slots_stay_native_while_added_effects_use_open_slots() {
         let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
         let preset = Effect {
             id: 90,
@@ -1202,11 +1110,11 @@ mod tests {
         .expect("preset then added");
         assert_eq!(
             first.parameter_display("FX A1 FX Type").as_deref(),
-            Some("Reverb 2")
+            Some("Distortion")
         );
         assert_eq!(
             first.parameter_display("FX A2 FX Type").as_deref(),
-            Some("Distortion")
+            Some("Reverb 2")
         );
         drop(first);
 
@@ -1277,14 +1185,6 @@ mod tests {
             .expect("mixed preset and added effect chain");
         engine.play_note(41, 0.95, 1);
         for _ in 0..3_500 {
-            engine
-                .set_native_modulator_controls(113, 4.0, 0.8)
-                .expect("runtime modulation controls");
-            for effect in &effects {
-                engine
-                    .set_effect_mix(effect.id, effect.mix)
-                    .expect("runtime effect mix");
-            }
             engine.process();
         }
         drop(engine);
@@ -1300,13 +1200,14 @@ mod tests {
     #[test]
     fn graph_effect_uses_native_surge_defaults() {
         let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
+        let expected = crate::surge::effect_parameter_values("Distortion");
         let effect = Effect {
             id: 77,
             name: "Distortion".to_owned(),
             preset_slot: None,
             mix: 0.6,
             enabled: true,
-            parameters: crate::surge::effect_parameter_values("Distortion"),
+            parameters: BTreeMap::new(),
             parameter_overrides: Vec::new(),
             tempo_sync_parameters: Vec::new(),
             deactivated_parameters: Vec::new(),
@@ -1320,7 +1221,7 @@ mod tests {
             16_000.0,
         )
         .expect("graph effect defaults");
-        for (parameter, expected) in &effect.parameters {
+        for (parameter, expected) in &expected {
             let actual = engine
                 .effect_parameter_value(effect.id, parameter)
                 .unwrap_or_else(|| panic!("missing native {parameter} parameter"));

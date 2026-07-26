@@ -535,6 +535,7 @@ fn midi_rest(track_id: u64, role: TrackRole, label: &str) -> Action {
 
 fn midi_clip_for_role(track_id: u64, role: TrackRole, label: &str, start: f32, end: f32) -> Action {
     let notes = match role {
+        TrackRole::Neutral => Vec::new(),
         TrackRole::Drums => midi_notes(&[
             (0.0, 0.25, 36, 0.92),
             (1.0, 0.25, 38, 0.78),

@@ -1345,9 +1345,9 @@ pub(crate) fn list_sound_tool_parameters(
                 serde_json::json!({"parameter":"mix","name":"Mix","value":effect.mix,"minimum":0,"maximum":1}),
             ];
             let mut discovered = crate::surge::effect_parameter_values(&effect.name);
-            for (parameter, value) in &effect.parameters {
-                if discovered.contains_key(parameter) {
-                    discovered.insert(parameter.clone(), *value);
+            for (parameter, value) in &mut discovered {
+                if let Some(current) = semantics.get(parameter) {
+                    *value = current.value;
                 }
             }
             values.extend(discovered.iter().map(|(parameter, value)| {
@@ -1496,7 +1496,7 @@ pub(crate) fn apply_agent_mutation(
     let summary = match name {
         "new_track" => {
             let id = studio
-                .add_empty_channel(TrackRole::Texture)
+                .add_empty_channel(TrackRole::Neutral)
                 .map_err(studio_error_message)?;
             result_id = Some(id);
             format!("Created track {id}")
@@ -3286,6 +3286,8 @@ mod tests {
             .find(|track| track.id == track_id)
             .expect("created track");
         assert!(track.clips.is_empty());
+        assert_eq!(track.role, TrackRole::Neutral);
+        assert_eq!(track.name, "Track");
         assert_eq!(track.volume, 1.0);
         assert_eq!(track.instrument.preset, "Init");
         assert!(track.effects.is_empty());
