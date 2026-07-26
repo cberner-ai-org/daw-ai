@@ -13,6 +13,10 @@ pub(crate) const AUDIO_INPUT_EFFECT_SLOT_COUNT: usize = 1;
 const SERIAL_EFFECT_SLOTS: [&str; SERIAL_EFFECT_SLOT_COUNT] = [
     "FX A1", "FX A2", "FX A3", "FX A4", "FX G1", "FX G2", "FX G3", "FX G4",
 ];
+const ALL_EFFECT_SLOTS: [&str; 16] = [
+    "FX A1", "FX A2", "FX A3", "FX A4", "FX B1", "FX B2", "FX B3", "FX B4", "FX S1", "FX S2",
+    "FX S3", "FX S4", "FX G1", "FX G2", "FX G3", "FX G4",
+];
 
 // The alpha binding does not expose Surge's parameter count. This comfortably
 // covers the current engine while from_synth_side_id rejects unused indices.
@@ -96,6 +100,7 @@ pub(crate) struct InstrumentParameter {
     pub(crate) id: i32,
     pub(crate) name: String,
     pub(crate) value: f32,
+    pub(crate) preset_value: f32,
     pub(crate) display: String,
     pub(crate) common: bool,
     pub(crate) boolean: bool,
@@ -130,6 +135,27 @@ impl Engine {
         track_id: u64,
         sample_rate: f32,
     ) -> Result<Self, String> {
+        Self::new_with_graph_effects(
+            instrument,
+            effects,
+            effect_order,
+            modulators,
+            track_id,
+            sample_rate,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_graph_effects(
+        instrument: &Instrument,
+        effects: &[Effect],
+        effect_order: &[u64],
+        modulators: &[Modulator],
+        track_id: u64,
+        sample_rate: f32,
+        graph_owns_effects: bool,
+    ) -> Result<Self, String> {
         #[cfg(test)]
         ENGINE_CREATIONS.set(ENGINE_CREATIONS.get() + 1);
         let guard = SURGE_ENGINE_LOCK
@@ -151,7 +177,7 @@ impl Engine {
         engine.apply_preset(&instrument.preset)?;
         engine.set_instrument_parameters(instrument)?;
         engine.set_native_overrides(&instrument.native_overrides)?;
-        if !effects.is_empty() {
+        if graph_owns_effects {
             engine.apply_effects(effects, effect_order)?;
         }
         engine.apply_native_modulators(modulators, track_id)?;
@@ -458,6 +484,8 @@ impl Engine {
                 self.set_parameter(parameter, value)?;
             }
         } else if let Some(factory) = crate::surge_presets::find(preset) {
+            std::fs::File::open(&factory.path)
+                .map_err(|error| format!("could not read Surge XT preset {preset}: {error}"))?;
             self.synth
                 .load_patch_by_path(&factory.path, -1, preset, false);
         } else {
@@ -486,11 +514,17 @@ impl Engine {
         // preset_slot is provenance; effect_order owns the runtime serial order.
         self.effect_mix_parameters.clear();
         self.effect_parameters.clear();
-        for slot in SERIAL_EFFECT_SLOTS {
-            self.set_parameter(&format!("{slot} FX Type"), 0.0)?;
+        for slot in ALL_EFFECT_SLOTS {
+            let parameter = format!("{slot} FX Type");
+            if self
+                .parameter_value(&parameter)
+                .is_some_and(|value| value >= 0.02)
+            {
+                self.set_parameter(&parameter, 0.0)?;
+                self.synth.process();
+                self.parameters = parameter_map(&self.synth);
+            }
         }
-        self.synth.process();
-        self.parameters = parameter_map(&self.synth);
         let mut available = SERIAL_EFFECT_SLOTS.into_iter();
         for effect_id in effect_order {
             let Some(effect) = effects.iter().find(|effect| {
@@ -678,6 +712,7 @@ pub(crate) fn instrument_parameters(preset: &str) -> Vec<InstrumentParameter> {
                             id: index,
                             name,
                             value: engine.synth.get_parameter01(&mut id),
+                            preset_value: engine.synth.get_parameter01(&mut id),
                             display: engine.synth.get_parameter_display(&mut id),
                             common,
                             boolean: engine.synth.parameter_is_boolean(&id),
@@ -801,7 +836,7 @@ pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
         parameter_overrides: Vec::new(),
         native_overrides: std::collections::BTreeMap::new(),
     };
-    let engine = Engine::new(&instrument, &[], &[], &[], 1, 48_000.0)?;
+    let engine = Engine::new_with_graph_effects(&instrument, &[], &[], &[], 1, 48_000.0, false)?;
     let mut effects = Vec::new();
     for (slot_index, slot) in SERIAL_EFFECT_SLOTS.iter().enumerate() {
         let Some(kind) = engine.parameter_value(&format!("{slot} FX Type")) else {
@@ -1332,6 +1367,32 @@ mod tests {
     }
 
     #[test]
+    fn graph_effect_rebuild_clears_unsupported_scene_and_send_slots() {
+        let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
+        let mut engine =
+            Engine::new_with_graph_effects(&instrument, &[], &[], &[], 1, 16_000.0, false)
+                .expect("raw preset engine");
+        let distortion = effect_type_index("Distortion").expect("distortion type") as f32
+            / (SURGE_EFFECT_TYPES.len() - 1) as f32;
+        engine
+            .set_parameter("FX B1 FX Type", distortion)
+            .expect("Scene B effect");
+        engine
+            .set_parameter("FX S1 FX Type", distortion)
+            .expect("send effect");
+        engine.apply_effects(&[], &[]).expect("empty graph chain");
+
+        assert_eq!(
+            engine.parameter_display("FX B1 FX Type").as_deref(),
+            Some("Off")
+        );
+        assert_eq!(
+            engine.parameter_display("FX S1 FX Type").as_deref(),
+            Some("Off")
+        );
+    }
+
+    #[test]
     fn routing_order_rebuilds_gapped_preset_and_added_effect_slots() {
         let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
         let preset = Effect {
@@ -1547,5 +1608,22 @@ mod tests {
         let mut engine = Engine::new(&instrument, &[], &[], &[], 1, 16_000.0).expect("safe engine");
         engine.play_note(36, 1.0, 1);
         engine.process();
+    }
+
+    #[test]
+    fn overridden_parameter_keeps_its_cached_preset_value() {
+        let mut instrument = crate::model::Project::demo().tracks[1].instrument.clone();
+        let parameter = instrument_parameters(&instrument.preset)
+            .into_iter()
+            .find(|parameter| parameter.name.ends_with("Osc 1 Mute"))
+            .expect("oscillator mute");
+        instrument.native_overrides.insert(parameter.id, 1.0);
+
+        let current = instrument_parameters_for_instrument(&instrument)
+            .into_iter()
+            .find(|candidate| candidate.id == parameter.id)
+            .expect("current oscillator mute");
+        assert_eq!(current.value, 1.0);
+        assert_eq!(current.preset_value, parameter.preset_value);
     }
 }

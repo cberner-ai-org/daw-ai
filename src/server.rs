@@ -1885,51 +1885,51 @@ impl Router {
             "advanced" => false,
             _ => return Response::json(422, error_json("parameter group is invalid")),
         };
-        let mut body = String::from("{\"parameters\":[");
-        let mut first = true;
-        for parameter in crate::surge::instrument_parameters(&track.instrument.preset)
+        let parameters = crate::surge::instrument_parameters_for_instrument(&track.instrument)
             .into_iter()
             .filter(|parameter| parameter.common == common)
-        {
-            if !first {
-                body.push(',');
-            }
-            first = false;
-            let legacy_override =
-                crate::surge::legacy_instrument_parameter_override(&track.instrument, parameter.id);
-            let value = track
-                .instrument
-                .native_overrides
-                .get(&parameter.id)
-                .copied()
-                .or(legacy_override)
-                .unwrap_or(parameter.value);
-            let overridden = track
-                .instrument
-                .native_overrides
-                .contains_key(&parameter.id)
-                || legacy_override.is_some();
-            let graph_parameter =
-                crate::surge::instrument_graph_parameter(&track.instrument.preset, parameter.id)
-                    .map_or_else(|| "null".to_owned(), json_string);
-            write!(
-                body,
-                concat!(
-                    "{{\"parameter\":{},\"graphParameter\":{},\"name\":{},\"value\":{},\"presetValue\":{},",
-                    "\"display\":{},\"overridden\":{}}}"
-                ),
-                json_string(&format!("native:{}", parameter.id)),
-                graph_parameter,
-                json_string(&parameter.name),
-                value,
-                parameter.value,
-                json_string(&parameter.display),
-                overridden
-            )
-            .expect("writing to a string cannot fail");
-        }
-        body.push_str("]}");
-        Response::json(200, body)
+            .map(|parameter| {
+                let legacy_override = crate::surge::legacy_instrument_parameter_override(
+                    &track.instrument,
+                    parameter.id,
+                );
+                let overridden = track
+                    .instrument
+                    .native_overrides
+                    .contains_key(&parameter.id)
+                    || legacy_override.is_some();
+                serde_json::json!({
+                    "parameter": format!("native:{}", parameter.id),
+                    "graphParameter": crate::surge::instrument_graph_parameter(
+                        &track.instrument.preset,
+                        parameter.id
+                    ),
+                    "name": parameter.name,
+                    "value": parameter.value,
+                    "presetValue": parameter.preset_value,
+                    "display": parameter.display,
+                    "overridden": overridden,
+                    "kind": if parameter.boolean {
+                        "boolean"
+                    } else if !parameter.choices.is_empty() || parameter.discrete {
+                        "selection"
+                    } else {
+                        "continuous"
+                    },
+                    "choices": parameter.choices.into_iter().map(|(value, display)| {
+                        serde_json::json!({"value": value, "display": display})
+                    }).collect::<Vec<_>>(),
+                    "modulation": {
+                        "free": parameter.scene_modulatable,
+                        "midi": parameter.voice_modulatable
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        Response::json(
+            200,
+            serde_json::json!({"parameters": parameters}).to_string(),
+        )
     }
 
     fn commit(
@@ -2983,7 +2983,27 @@ mod tests {
             .find(|parameter| parameter["graphParameter"] == "cutoff")
             .expect("cutoff parameter");
         assert!((cutoff["value"].as_f64().expect("cutoff value") - 0.123).abs() < 0.000_001);
+        assert_ne!(cutoff["presetValue"], cutoff["value"]);
         assert_eq!(cutoff["overridden"], true);
+
+        let advanced = router.handle(&request("GET", "/api/instrument-parameters/2/advanced", ""));
+        assert_eq!(advanced.status, 200);
+        let advanced: serde_json::Value =
+            serde_json::from_str(&advanced.body).expect("advanced instrument parameters");
+        let mute = advanced["parameters"]
+            .as_array()
+            .expect("advanced parameter list")
+            .iter()
+            .find(|parameter| {
+                parameter["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with("Osc 1 Mute"))
+            })
+            .expect("oscillator mute");
+        assert_eq!(mute["kind"], "boolean");
+        assert!(!mute["choices"].as_array().expect("mute choices").is_empty());
+        assert_eq!(mute["modulation"]["free"], false);
+        assert_eq!(mute["modulation"]["midi"], false);
     }
 
     #[test]

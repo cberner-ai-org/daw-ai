@@ -892,7 +892,7 @@ pub(crate) fn list_instrument_parameters(
                 ),
                 "name": parameter.name,
                 "value": value,
-                "presetValue": parameter.value,
+                "presetValue": parameter.preset_value,
                 "display": parameter.display,
                 "overridden": overridden,
                 "kind": if parameter.boolean {
