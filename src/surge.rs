@@ -472,8 +472,9 @@ impl Engine {
             return Err(format!("Surge XT parameter is unavailable: {index}"));
         }
         self.synth
-            .set_parameter01(&mut id, value.clamp(0.0, 1.0), None, None);
-        Ok(())
+            .set_parameter01(&mut id, value.clamp(0.0, 1.0), None, None)
+            .then_some(())
+            .ok_or_else(|| format!("Surge XT cannot use this parameter {index} value"))
     }
 
     fn set_drum_timbre(&mut self, value: f32) {
@@ -584,15 +585,19 @@ impl Engine {
                     self.set_parameter(&native, *value)?;
                     let index = self.parameters[&native];
                     let mut id = SurgeId::empty();
-                    if self.synth.from_synth_side_id(index, &mut id) {
-                        self.synth.set_parameter_temposync(
-                            &id,
-                            effect.tempo_sync_parameters.contains(parameter),
-                        );
-                        self.synth.set_parameter_deactivated(
-                            &id,
-                            effect.deactivated_parameters.contains(parameter),
-                        );
+                    if !self.synth.from_synth_side_id(index, &mut id) {
+                        return Err(format!(
+                            "Surge XT effect parameter is unavailable: {parameter}"
+                        ));
+                    }
+                    if !self.synth.set_parameter_temposync(
+                        &id,
+                        effect.tempo_sync_parameters.contains(parameter),
+                    ) || !self.synth.set_parameter_deactivated(
+                        &id,
+                        effect.deactivated_parameters.contains(parameter),
+                    ) {
+                        return Err(format!("Surge XT rejected {parameter} effect state"));
                     }
                     self.effect_parameters
                         .insert((effect.id, parameter.clone()), native);

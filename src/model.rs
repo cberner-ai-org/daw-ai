@@ -1599,9 +1599,9 @@ impl Studio {
             Action::Automation {
                 track_id,
                 parameter,
+                curve,
                 points,
                 target,
-                ..
             } => {
                 let track = self
                     .project
@@ -1613,14 +1613,12 @@ impl Studio {
                             && valid_automation_target(track, parameter)
                     })
                     .ok_or(StudioError::UnknownSoundTool)?;
-                let target = automation_targets(track)
-                    .into_iter()
-                    .find(|target| target.id == *parameter)
-                    .expect("validated automation target exists");
-                if points
-                    .iter()
-                    .any(|point| !(target.minimum..=target.maximum).contains(&point.value))
-                {
+                let (minimum, maximum) = automation_target_range(track, parameter)
+                    .ok_or(StudioError::UnknownSoundTool)?;
+                if points.iter().any(|point| {
+                    !(minimum..=maximum).contains(&point.value)
+                        || !valid_automation_value(track, parameter, curve, point.value)
+                }) {
                     return Err(StudioError::InvalidSoundTool);
                 }
                 Ok(())
@@ -2612,6 +2610,11 @@ fn configure_track_preset(
     let valid_automation_targets = automation_targets(track)
         .into_iter()
         .map(|target| target.id)
+        .chain(
+            crate::surge::instrument_parameters_for_instrument(&track.instrument)
+                .into_iter()
+                .map(|parameter| format!("native:{}", parameter.id)),
+        )
         .collect::<std::collections::HashSet<_>>();
     project.edits.retain_mut(|edit| {
         edit.action
@@ -3239,19 +3242,47 @@ pub(crate) fn valid_automation_target(track: &Track, value: &str) -> bool {
 }
 
 pub(crate) fn automation_target_range(track: &Track, value: &str) -> Option<(f32, f32)> {
-    if let Some(id) = value
+    let native_id = value
         .strip_prefix("native:")
-        .and_then(|id| id.parse::<i32>().ok())
-        && crate::surge::instrument_parameters_for_instrument(&track.instrument)
+        .and_then(|id| id.parse::<i32>().ok());
+    if native_id.is_some_and(|id| {
+        crate::surge::instrument_parameters_for_instrument(&track.instrument)
             .iter()
             .any(|parameter| parameter.id == id)
-    {
+    }) {
         return Some((0.0, 1.0));
     }
     automation_targets(track)
         .into_iter()
         .find(|target| target.id == value)
         .map(|target| (target.minimum, target.maximum))
+}
+
+pub(crate) fn valid_automation_value(track: &Track, target: &str, curve: &str, value: f32) -> bool {
+    let Some(id) = target
+        .strip_prefix("native:")
+        .and_then(|id| id.parse::<i32>().ok())
+    else {
+        return true;
+    };
+    let Some(parameter) = crate::surge::instrument_parameters_for_instrument(&track.instrument)
+        .into_iter()
+        .find(|parameter| parameter.id == id)
+    else {
+        return false;
+    };
+    if !parameter.boolean && !parameter.discrete && parameter.choices.is_empty() {
+        return true;
+    }
+    curve == "hold"
+        && if parameter.choices.is_empty() {
+            value == 0.0 || value == 1.0
+        } else {
+            parameter
+                .choices
+                .iter()
+                .any(|(choice, _)| (*choice - value).abs() < 0.000_01)
+        }
 }
 
 fn role_action_track_index(
@@ -4247,6 +4278,38 @@ mod tests {
         studio
             .apply_plan(0.0, 8.0, "raise the bass through the transition", valid)
             .expect("published automation target");
+        let native_parameter = crate::surge::instrument_parameters_for_instrument(
+            &studio.project.tracks[1].instrument,
+        )
+        .into_iter()
+        .find(|parameter| !parameter.boolean && !parameter.discrete && parameter.choices.is_empty())
+        .expect("continuous native parameter");
+        studio
+            .apply_plan(
+                0.0,
+                8.0,
+                "automate a native control",
+                crate::prompt::EditPlan {
+                    summary: "Automated a native control".to_owned(),
+                    action: Action::Automation {
+                        track_id: bass_id,
+                        parameter: format!("native:{}", native_parameter.id),
+                        curve: "linear",
+                        points: vec![
+                            crate::prompt::AutomationPoint {
+                                time: 0.0,
+                                value: 0.25,
+                            },
+                            crate::prompt::AutomationPoint {
+                                time: 1.0,
+                                value: 0.75,
+                            },
+                        ],
+                        target: TrackRole::Bass,
+                    },
+                },
+            )
+            .expect("published native automation target");
         let saved = studio.project().to_json();
         assert!(saved.contains("\"type\":\"timed\""));
         assert!(saved.contains("\"type\":\"automation\""));
@@ -4539,6 +4602,38 @@ mod tests {
             },
         });
 
+        let native_target = crate::surge::instrument_parameters_for_instrument(
+            &studio.project.tracks[1].instrument,
+        )
+        .into_iter()
+        .find(|parameter| !parameter.boolean && !parameter.discrete && parameter.choices.is_empty())
+        .map(|parameter| format!("native:{}", parameter.id))
+        .expect("native parameter");
+        studio.project.edits.push(Edit {
+            id: 9_803,
+            operation_id: None,
+            start: 0.0,
+            end: 4.0,
+            prompt: "Automate a native parameter".to_owned(),
+            summary: "Automated a native parameter".to_owned(),
+            action: Action::Automation {
+                track_id,
+                parameter: native_target.clone(),
+                curve: "hold",
+                points: vec![
+                    crate::prompt::AutomationPoint {
+                        time: 0.0,
+                        value: 0.5,
+                    },
+                    crate::prompt::AutomationPoint {
+                        time: 1.0,
+                        value: 0.5,
+                    },
+                ],
+                target: TrackRole::Bass,
+            },
+        });
+
         studio
             .apply_plan(
                 0.0,
@@ -4579,6 +4674,7 @@ mod tests {
                 .any(|modulator| modulator.target == effect_target)
         );
         assert!(studio.to_json().contains(&effect_target));
+        assert!(studio.to_json().contains(&native_target));
         crate::project_file::parse_project(&studio.to_json()).expect("reopen refreshed preset");
 
         studio

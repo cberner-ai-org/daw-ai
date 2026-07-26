@@ -695,7 +695,13 @@ fn render_track(
                 parameters
                     .iter()
                     .find(|parameter| parameter.id == id)
-                    .map(|parameter| (id, parameter.value))
+                    .map(|parameter| {
+                        (
+                            id,
+                            parameter.value,
+                            crate::surge::instrument_graph_parameter(&track.instrument.preset, id),
+                        )
+                    })
             })
             .collect()
     };
@@ -747,10 +753,14 @@ fn render_track(
             {
                 engine.set_parameter(name, value)?;
                 applied_instrument_parameters.insert(name.to_owned(), value);
+                applied_native_parameters.clear();
             }
         }
-        for &(id, base) in &native_automation {
+        for &(id, base, graph_name) in &native_automation {
             let target = format!("native:{id}");
+            if !render_state.automation.active_at(&target, time) {
+                continue;
+            }
             let value = parameter_at(project, track, render_state, &target, base, time);
             if applied_native_parameters
                 .get(&id)
@@ -758,6 +768,9 @@ fn render_track(
             {
                 engine.set_native_parameter(id, value)?;
                 applied_native_parameters.insert(id, value);
+                if let Some(graph_name) = graph_name {
+                    applied_instrument_parameters.remove(graph_name);
+                }
             }
         }
         set_surge_native_modulator_controls(&mut engine, track, render_state, time)?;
@@ -1209,6 +1222,12 @@ impl<'a> AutomationIndex<'a> {
             .keys()
             .filter_map(|target| target.strip_prefix("native:")?.parse().ok())
             .collect()
+    }
+
+    fn active_at(&self, target: &str, time: f64) -> bool {
+        self.lanes
+            .get(target)
+            .is_some_and(|spans| spans.iter().any(|span| span.value_at(time).is_some()))
     }
 
     fn maximum_value(&self, target: &str, base: f32) -> f32 {
@@ -1744,7 +1763,7 @@ fn apply_regional_filter(
 
 fn removes_filter(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
-    matches!(normalized.as_str(), "effect" | "effects" | "fx")
+    matches!(normalized.as_str(), "effect" | "effects" | "fx" | "eq")
         || normalized.contains("low-pass")
         || normalized.contains("low pass")
         || normalized.contains("filter")
@@ -2577,6 +2596,7 @@ mod tests {
         });
 
         assert!(regional_filter_amount(&project, TrackRole::Chords, 1.0) < 0.0);
+        assert!(removes_filter("EQ"));
         assert!(regional_rhythm(&project, TrackRole::Chords, 1.0) > 0.15);
         let active = render_region(&project, &[track_id], 0.0, 2.0).expect("regional render");
         assert!(active.event_count > baseline.event_count);

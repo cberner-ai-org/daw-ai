@@ -901,6 +901,9 @@ pub(crate) fn list_instrument_parameters(
                 "mutationTool":"set_parameter"
             });
             value["automationTarget"] = serde_json::json!(format!("native:{}", parameter.id));
+            if parameter.boolean || parameter.discrete || !parameter.choices.is_empty() {
+                value["automationCurve"] = JsonValue::String("hold".to_owned());
+            }
             if parameter.voice_modulatable || parameter.scene_modulatable {
                 value["modulationTarget"] = serde_json::json!(format!("native:{}", parameter.id));
                 value["modulation"] = serde_json::json!({
@@ -2928,6 +2931,17 @@ mod tests {
                 .expect("oscillator parameters")
                 .iter()
                 .all(|parameter| parameter["automationTarget"] == parameter["parameter"])
+        );
+        assert!(
+            oscillator["parameters"]
+                .as_array()
+                .expect("oscillator parameters")
+                .iter()
+                .filter(|parameter| matches!(
+                    parameter["kind"].as_str(),
+                    Some("boolean" | "selection")
+                ))
+                .all(|parameter| parameter["automationCurve"] == "hold")
         );
         assert_eq!(
             oscillator["parameters"]
