@@ -12,26 +12,6 @@ const FFT_HOP: usize = 256;
 const MEL_BANDS: usize = 64;
 const AUTOMATION_SAMPLES: usize = SAMPLE_RATE as usize / 400;
 
-#[derive(Default)]
-struct AudioAssetCache {
-    decoded: HashMap<String, Vec<f32>>,
-}
-
-impl AudioAssetCache {
-    fn samples(&mut self, asset: &str) -> Result<&[f32], String> {
-        if !self.decoded.contains_key(asset) {
-            let bytes = std::fs::read(asset)
-                .map_err(|error| format!("could not read audio clip {asset}: {error}"))?;
-            self.decoded
-                .insert(asset.to_owned(), decode_pcm16_wav(&bytes)?);
-        }
-        Ok(self
-            .decoded
-            .get(asset)
-            .expect("decoded asset was inserted above"))
-    }
-}
-
 #[derive(Clone, Copy)]
 struct AutomationFrame {
     gain: f32,
@@ -267,7 +247,6 @@ fn render_tracks_with_stems_samples(
         track_ids,
         preroll_sample,
         end_sample,
-        true,
         cancelled,
     )?;
     let sample_start = start_sample - preroll_sample;
@@ -337,15 +316,16 @@ fn render_audio_samples(
     start_sample: usize,
     end_sample: usize,
 ) -> Result<AudioRegion, String> {
-    Ok(render_audio_samples_with_tracks(
-        project,
-        track_ids,
-        start_sample,
-        end_sample,
-        true,
-        &mut || false,
-    )?
-    .mix)
+    Ok(
+        render_audio_samples_with_tracks(
+            project,
+            track_ids,
+            start_sample,
+            end_sample,
+            &mut || false,
+        )?
+        .mix,
+    )
 }
 
 fn render_audio_samples_with_tracks(
@@ -353,7 +333,6 @@ fn render_audio_samples_with_tracks(
     track_ids: &[u64],
     start_sample: usize,
     end_sample: usize,
-    resolve_audio_inputs: bool,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<AudioRegions, String> {
     if cancelled() {
@@ -371,8 +350,6 @@ fn render_audio_samples_with_tracks(
     let mut mix = vec![0.0; sample_count.max(1) * CHANNEL_COUNT];
     let mut event_onsets = Vec::new();
     let mut tracks = Vec::with_capacity(track_ids.len());
-    let mut audio_assets = AudioAssetCache::default();
-    let _ = resolve_audio_inputs;
     for &track_id in track_ids {
         if cancelled() {
             return Err("audio render interrupted".to_owned());
@@ -395,15 +372,12 @@ fn render_audio_samples_with_tracks(
             ));
             continue;
         }
-        let mut audio_input = vec![0.0; mix.len()];
-        mix_audio_clips(track, start_sample, &mut audio_input, &mut audio_assets)?;
         let render_state = TrackRenderState::new(project, track, start, end);
         render_track(
             project,
             track,
             &render_state,
             start_sample,
-            &audio_input,
             &mut rendered,
             &mut track_event_onsets,
         )?;
@@ -433,82 +407,6 @@ fn render_audio_samples_with_tracks(
 fn sum_samples(output: &mut [f32], input: &[f32]) {
     for (output, input) in output.iter_mut().zip(input) {
         *output += input;
-    }
-}
-
-fn mix_audio_clips(
-    track: &Track,
-    render_start_sample: usize,
-    output: &mut [f32],
-    audio_assets: &mut AudioAssetCache,
-) -> Result<(), String> {
-    for clip in &track.audio_clips {
-        let clip_start = playback_start_sample(clip.start);
-        let source_count = playback_sample_count(0.0, clip.source_duration);
-        let clip_end = clip_start.saturating_add(source_count);
-        let render_end = render_start_sample.saturating_add(output.len().div_euclid(CHANNEL_COUNT));
-        if clip_end <= render_start_sample || clip_start >= render_end {
-            continue;
-        }
-        let samples = audio_assets.samples(&clip.asset)?;
-        let source_start = playback_start_sample(clip.source_offset)
-            .saturating_mul(CHANNEL_COUNT)
-            .min(samples.len());
-        for source_index in 0..source_count {
-            let project_sample = clip_start.saturating_add(source_index);
-            if project_sample < render_start_sample {
-                continue;
-            }
-            let output_index = (project_sample - render_start_sample) * CHANNEL_COUNT;
-            if output_index + 1 >= output.len() {
-                break;
-            }
-            let relative = if clip.reversed {
-                source_count.saturating_sub(source_index + 1)
-            } else {
-                source_index
-            };
-            let source_index = source_start.saturating_add(relative * CHANNEL_COUNT);
-            if let Some(frame) = samples.get(source_index..source_index + CHANNEL_COUNT) {
-                output[output_index] += frame[0] * clip.gain;
-                output[output_index + 1] += frame[1] * clip.gain;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn decode_pcm16_wav(bytes: &[u8]) -> Result<Vec<f32>, String> {
-    let channels = bytes
-        .get(22..24)
-        .map(|value| u16::from_le_bytes([value[0], value[1]]))
-        .unwrap_or_default();
-    if bytes.len() < 44
-        || &bytes[0..4] != b"RIFF"
-        || &bytes[8..12] != b"WAVE"
-        || u16::from_le_bytes([bytes[20], bytes[21]]) != 1
-        || !matches!(channels, 1 | 2)
-        || u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) != SAMPLE_RATE
-        || u16::from_le_bytes([bytes[34], bytes[35]]) != 16
-        || &bytes[36..40] != b"data"
-    {
-        return Err("audio clip must be a DAW-AI mono or stereo 16-bit WAV asset".to_owned());
-    }
-    let declared = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
-    let data = bytes
-        .get(44..44_usize.saturating_add(declared))
-        .ok_or_else(|| "audio clip WAV data is truncated".to_owned())?;
-    let decoded = data
-        .chunks_exact(2)
-        .map(|sample| f32::from(i16::from_le_bytes([sample[0], sample[1]])) / f32::from(i16::MAX))
-        .collect::<Vec<_>>();
-    if channels == 2 {
-        Ok(decoded)
-    } else {
-        Ok(decoded
-            .into_iter()
-            .flat_map(|sample| [sample, sample])
-            .collect())
     }
 }
 
@@ -552,7 +450,6 @@ fn render_track(
     track: &Track,
     render_state: &TrackRenderState<'_>,
     start_sample: usize,
-    audio_input: &[f32],
     output: &mut [f32],
     event_onsets: &mut Vec<f32>,
 ) -> Result<(), String> {
@@ -589,34 +486,10 @@ fn render_track(
     }
     midi.sort_by_key(|event| (event.sample, event.note_on));
 
-    let process_audio_through_effects =
-        !track.audio_clips.is_empty() && track.effects.iter().any(|effect| effect.enabled);
-    let mut effects = track.effects.clone();
-    let mut effect_order = track.routing.effect_order.clone();
-    if process_audio_through_effects {
-        let input_id = u64::MAX;
-        effects.insert(
-            0,
-            crate::model::Effect {
-                id: input_id,
-                name: "Audio Input".to_owned(),
-                preset_slot: None,
-                mix: 1.0,
-                cutoff_hz: None,
-                resonance: None,
-                enabled: true,
-                parameters: std::collections::BTreeMap::new(),
-                parameter_overrides: Vec::new(),
-                tempo_sync_parameters: Vec::new(),
-                deactivated_parameters: Vec::new(),
-            },
-        );
-        effect_order.insert(0, input_id);
-    }
     let mut engine = crate::surge::Engine::new(
         &track.instrument,
-        &effects,
-        &effect_order,
+        &track.effects,
+        &track.routing.effect_order,
         &track.modulators,
         track.id,
         SAMPLE_RATE as f32,
@@ -727,25 +600,11 @@ fn render_track(
         }
         set_surge_native_modulator_controls(&mut engine, track, render_state, time)?;
         set_surge_effect_controls(&mut engine, project, track, render_state, time)?;
-        let block = if process_audio_through_effects {
-            let mut input = [[0.0; crate::surge::BLOCK_SIZE]; 2];
-            for index in 0..count {
-                input[0][index] = audio_input[(output_frame + index) * CHANNEL_COUNT];
-                input[1][index] = audio_input[(output_frame + index) * CHANNEL_COUNT + 1];
-            }
-            engine.process_with_input(input)
-        } else {
-            engine.process()
-        };
+        let block = engine.process();
         for index in 0..count {
             let output_index = (output_frame + index) * CHANNEL_COUNT;
-            let dry_audio = if process_audio_through_effects {
-                [0.0, 0.0]
-            } else {
-                [audio_input[output_index], audio_input[output_index + 1]]
-            };
-            output[output_index] = block[0][index] + dry_audio[0];
-            output[output_index + 1] = block[1][index] + dry_audio[1];
+            output[output_index] = block[0][index];
+            output[output_index + 1] = block[1][index];
         }
         output_frame += count;
     }
@@ -1158,11 +1017,7 @@ fn automation_at(
     let clip_active = track
         .clips
         .iter()
-        .any(|clip| time >= f64::from(clip.start) && time < f64::from(clip.end))
-        || track
-            .audio_clips
-            .iter()
-            .any(|clip| time >= f64::from(clip.start) && time < f64::from(clip.end));
+        .any(|clip| time >= f64::from(clip.start) && time < f64::from(clip.end));
     let gain = if clip_active {
         parameter_at(
             project,
@@ -1473,79 +1328,13 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AudioClip, Edit, Modulator, TrackRole};
+    use crate::model::{Edit, Modulator, TrackRole};
     use crate::prompt::AutomationPoint;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static AUDIO_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn automation_frame_at(project: &Project, track: &Track, time: f32) -> AutomationFrame {
         let time = f64::from(time);
         let render_state = TrackRenderState::new(project, track, time, time + 0.000_01);
         automation_at(project, track, &render_state, time)
-    }
-
-    fn audio_clip_project() -> (Project, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "daw-ai-audio-clip-routing-{}-{}.wav",
-            std::process::id(),
-            AUDIO_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let samples = (0..SAMPLE_RATE)
-            .map(|index| (2.0 * PI * 220.0 * index as f32 / SAMPLE_RATE as f32).sin() * 0.25)
-            .flat_map(|sample| [sample, sample])
-            .collect::<Vec<_>>();
-        std::fs::write(&path, wav_bytes(&samples)).expect("audio clip fixture");
-        let mut project = Project::initial();
-        project.duration = 2.0;
-        project.tracks[0].volume = 1.0;
-        project.tracks[0].audio_clips.push(AudioClip {
-            id: 9_100,
-            label: "Resample".to_owned(),
-            start: 0.0,
-            end: 1.0,
-            asset: path.to_string_lossy().into_owned(),
-            source_offset: 0.0,
-            source_duration: 1.0,
-            gain: 1.0,
-            reversed: false,
-        });
-        (project, path)
-    }
-
-    #[test]
-    fn audio_asset_cache_reuses_decoded_samples_for_shared_slices() {
-        let (project, path) = audio_clip_project();
-        let asset = &project.tracks[0].audio_clips[0].asset;
-        let mut cache = AudioAssetCache::default();
-        assert_eq!(
-            cache.samples(asset).expect("initial decode").len(),
-            SAMPLE_RATE as usize * CHANNEL_COUNT
-        );
-        std::fs::remove_file(path).expect("remove cached audio fixture");
-        assert_eq!(
-            cache.samples(asset).expect("cached decode").len(),
-            SAMPLE_RATE as usize * CHANNEL_COUNT
-        );
-    }
-
-    #[test]
-    fn offscreen_audio_clips_do_not_load_assets() {
-        let mut project = Project::initial();
-        project.tracks[0].audio_clips.push(AudioClip {
-            id: 9_101,
-            label: "Offscreen".to_owned(),
-            start: 4.0,
-            end: 5.0,
-            asset: "/tmp/daw-ai-intentionally-missing.wav".to_owned(),
-            source_offset: 0.0,
-            source_duration: 1.0,
-            gain: 1.0,
-            reversed: false,
-        });
-        let region = render_region(&project, &[project.tracks[0].id], 0.0, 1.0)
-            .expect("offscreen clip render");
-        assert_eq!(region.samples.len(), SAMPLE_RATE as usize * CHANNEL_COUNT);
     }
 
     #[test]
@@ -1661,7 +1450,6 @@ mod tests {
             &track_ids,
             0,
             SAMPLE_RATE as usize,
-            true,
             &mut cancelled,
         )
         .expect("track and mix render");
@@ -2326,120 +2114,6 @@ mod tests {
         let surge_bypassed =
             render_region(&project, &[track_id], 0.0, 2.0).expect("bypassed Surge render");
         assert_eq!(surge_bypassed.samples, surge_baseline.samples);
-    }
-
-    #[test]
-    fn audio_clips_follow_track_volume_and_surge_effects() {
-        let (mut project, path) = audio_clip_project();
-        let track_id = project.tracks[0].id;
-        let render = |project: &Project| {
-            render_region(project, &[track_id], 0.0, 1.0).expect("audio clip render")
-        };
-
-        project.tracks[0].volume = 1.0;
-        project.tracks[0].effects.clear();
-        project.tracks[0].routing.effect_order.clear();
-        let full = render(&project);
-        project.tracks[0].volume = 0.25;
-        let quiet = render(&project);
-        assert!(
-            analyze(&quiet).rms < analyze(&full).rms * 0.4,
-            "track volume must attenuate audio clips"
-        );
-
-        project.tracks[0].volume = 1.0;
-        project.edits.push(Edit {
-            id: 9_102,
-            operation_id: None,
-            start: 0.0,
-            end: 1.0,
-            prompt: "Fade the resample".to_owned(),
-            summary: "Automated the resample level".to_owned(),
-            action: Action::Automation {
-                track_id,
-                parameter: "track.volume".to_owned(),
-                curve: "hold",
-                points: vec![AutomationPoint {
-                    time: 0.0,
-                    value: 0.1,
-                }],
-                target: project.tracks[0].role,
-            },
-        });
-        let automated = render(&project);
-        assert!(
-            analyze(&automated).rms < analyze(&full).rms * 0.2,
-            "track volume automation must attenuate audio clips"
-        );
-        project.edits.clear();
-
-        project.tracks[0].effects.push(crate::model::Effect {
-            id: 9_101,
-            name: "Distortion".to_owned(),
-            preset_slot: None,
-            mix: 1.0,
-            cutoff_hz: None,
-            resonance: None,
-            enabled: true,
-            parameters: crate::surge::effect_parameter_values("Distortion"),
-            parameter_overrides: Vec::new(),
-            tempo_sync_parameters: Vec::new(),
-            deactivated_parameters: Vec::new(),
-        });
-        project.tracks[0].routing.effect_order.push(9_101);
-        let effected = render(&project);
-        assert!(
-            sample_difference(&effected.samples, &full.samples) > 0.001,
-            "Surge effects must process audio clips"
-        );
-        std::fs::remove_file(path).expect("remove audio clip fixture");
-    }
-
-    #[test]
-    fn surge_midi_and_audio_share_one_track_engine() {
-        let (mut project, path) = audio_clip_project();
-        let track_id = project.tracks[0].id;
-        project.tracks[0].clips.push(Clip {
-            id: 9_110,
-            label: "MIDI layer".to_owned(),
-            start: 0.0,
-            end: 1.0,
-            source_start: 0.0,
-            style: "test".to_owned(),
-            playback_mode: "once".to_owned(),
-            loop_beats: 1.0,
-            events: vec![ClipEvent {
-                id: 9_111,
-                kind: "note".to_owned(),
-                time: 0.0,
-                duration: 0.8,
-                pitch: 57,
-                velocity: 1.0,
-            }],
-        });
-        project.tracks[0].effects.push(crate::model::Effect {
-            id: 9_112,
-            name: "Distortion".to_owned(),
-            preset_slot: None,
-            mix: 1.0,
-            cutoff_hz: None,
-            resonance: None,
-            enabled: true,
-            parameters: crate::surge::effect_parameter_values("Distortion"),
-            parameter_overrides: Vec::new(),
-            tempo_sync_parameters: Vec::new(),
-            deactivated_parameters: Vec::new(),
-        });
-        project.tracks[0].routing.effect_order.push(9_112);
-
-        crate::surge::reset_engine_creation_count();
-        render_region(&project, &[track_id], 0.0, 1.0).expect("combined track render");
-        assert_eq!(
-            crate::surge::engine_creation_count(),
-            1,
-            "MIDI and audio clips on one track must share one Surge effect instance"
-        );
-        std::fs::remove_file(path).expect("remove audio clip fixture");
     }
 
     #[test]

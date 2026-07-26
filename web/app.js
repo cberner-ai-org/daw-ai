@@ -541,17 +541,7 @@
             </div>`;
           })
           .join("");
-        const audioClips = (track.audioClips || [])
-          .map((clip) => {
-            const left = (clip.start / duration) * 100;
-            const width = ((clip.end - clip.start) / duration) * 100;
-            return `<div class="clip audio-clip ${track.muted ? "is-muted" : ""}" style="left:${left}%;width:${width}%;--track-color:${track.color}">
-              <span class="clip-name">${escapeHtml(clip.label)}${clip.reversed ? " (reversed)" : ""}</span>
-              <span class="audio-waveform" aria-hidden="true">${Array.from({ length: 24 }, (_, index) => `<i style="--wave-height:${25 + ((index * 37 + clip.id) % 70)}%"></i>`).join("")}</span>
-            </div>`;
-          })
-          .join("");
-        const clips = `${midiClips}${audioClips}`;
+        const clips = midiClips;
         const markers = state.project.edits
           .filter((edit) => editAppliesToTrack(edit, track))
           .map((edit) => {
@@ -676,8 +666,7 @@
               <div class="sound-tool clips-tool">
                 <div class="tool-heading"><div><span>MIDI Clips</span><strong>Piano roll and event editor</strong></div></div>
                 ${track.clips.map((clip) => renderClipTimeline(track, clip)).join("")}
-                ${(track.audioClips || []).map((clip) => renderAudioClipTimeline(track, clip)).join("")}
-                ${track.clips.length === 0 && (track.audioClips || []).length === 0 ? '<span class="effect-pill">No clips</span>' : ""}
+                ${track.clips.length === 0 ? '<span class="effect-pill">No clips</span>' : ""}
               </div>
             </div>
             <aside class="node-inspector-column" aria-label="${escapeHtml(`${track.name} selected node parameters`)}">
@@ -1075,11 +1064,6 @@
     const selectedId = state.midiEventSelection[clipKey];
     const selected = clip.events.find((event) => event.id === selectedId);
     return `<details class="clip-editor" data-clip-key="${clipKey}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${playback}</b></summary>${renderPianoRoll(track, clip, selectedId)}${selected ? renderMidiNoteInspector(track, clip, selected) : ""}</details>`;
-  }
-
-  function renderAudioClipTimeline(track, clip) {
-    const flags = [clip.reversed ? "reversed" : null, `${clip.gain}x gain`].filter(Boolean).join(" / ");
-    return `<div class="clip-editor audio-clip-editor"><div class="audio-clip-summary"><span>${escapeHtml(clip.label)}</span><b>${clip.sourceDuration.toFixed(2)}s / ${flags}</b></div><div class="advanced-audio-waveform" aria-label="${escapeHtml(`${track.name} ${clip.label} audio clip`)}">${Array.from({ length: 64 }, (_, index) => `<i style="--wave-height:${20 + ((index * 43 + clip.id) % 78)}%"></i>`).join("")}</div></div>`;
   }
 
   function renderPianoRoll(track, clip, selectedId) {

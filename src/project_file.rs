@@ -282,17 +282,6 @@ fn parse_track(
         .iter()
         .map(|value| parse_clip(value, project_duration, ids, event_ids))
         .collect::<Result<Vec<_>, _>>()?;
-    let audio_clip_values = array(track, "audioClips")?;
-    if audio_clip_values.len() > MAX_CLIPS_PER_TRACK {
-        return Err(invalid(format!(
-            "{context} supports at most {MAX_CLIPS_PER_TRACK} audio clips"
-        )));
-    }
-    let audio_clips = audio_clip_values
-        .iter()
-        .map(|value| parse_audio_clip(value, project_duration, ids))
-        .collect::<Result<Vec<_>, _>>()?;
-
     let parsed = Track {
         id,
         name,
@@ -308,52 +297,13 @@ fn parse_track(
             output,
         },
         clips,
-        audio_clips,
     };
-    if !crate::model::track_effects_fit(&parsed, !parsed.audio_clips.is_empty()) {
+    if !crate::model::track_effects_fit(&parsed) {
         return Err(invalid(format!(
             "{context} exceeds Surge XT's serial effect capacity"
         )));
     }
     Ok(parsed)
-}
-
-fn parse_audio_clip(
-    value: &JsonValue,
-    project_duration: f32,
-    ids: &mut HashSet<u64>,
-) -> Result<crate::model::AudioClip, ProjectFileError> {
-    let clip = object(value, "audio clip")?;
-    let start = range(clip, "start", 0.0, project_duration)?;
-    let end = range(clip, "end", 0.0, project_duration)?;
-    if end <= start {
-        return Err(invalid("audio clip end must be after its start"));
-    }
-    let asset = limited_string(clip, "asset", 1, 1_024)?;
-    if !std::path::Path::new(&asset).is_absolute() || !asset.ends_with(".wav") {
-        return Err(invalid("audio clip asset must be an absolute WAV path"));
-    }
-    let source_duration = range(clip, "sourceDuration", 0.001, 16.0)?;
-    if (end - (start + source_duration)).abs() > 0.000_1 {
-        return Err(invalid(
-            "audio clip end must equal start plus sourceDuration",
-        ));
-    }
-    let source_offset = range(clip, "sourceOffset", 0.0, 16.0)?;
-    if source_offset + source_duration > 16.001 {
-        return Err(invalid("audio clip source range exceeds its asset"));
-    }
-    Ok(crate::model::AudioClip {
-        id: unique_id(clip, "id", ids, "audio clip")?,
-        label: limited_string(clip, "label", 1, 64)?,
-        start,
-        end,
-        asset,
-        source_offset,
-        source_duration,
-        gain: range(clip, "gain", 0.0, 2.0)?,
-        reversed: boolean(clip, "reversed")?,
-    })
 }
 
 fn parse_effect(
@@ -1501,7 +1451,6 @@ mod tests {
     fn rejects_projects_missing_current_schema_fields() {
         for pointer in [
             "/channelOperations",
-            "/tracks/0/audioClips",
             "/tracks/0/instrument/overrides",
             "/tracks/0/instrument/parameters/decay",
             "/tracks/1/effects/0/overrides",
@@ -1735,27 +1684,6 @@ mod tests {
 
         let parsed = parse_project(&source).expect("valid retained clip slices");
         assert_eq!(parsed.to_json(), source);
-    }
-
-    #[test]
-    fn rejects_audio_clip_timing_that_disagrees_with_its_source_duration() {
-        let mut project = Project::initial();
-        project.tracks[0].audio_clips.push(crate::model::AudioClip {
-            id: 9_900,
-            label: "Slice".to_owned(),
-            start: 0.25,
-            end: 1.25,
-            asset: "/tmp/daw-ai-persisted-slice.wav".to_owned(),
-            source_offset: 0.0,
-            source_duration: 1.0,
-            gain: 1.0,
-            reversed: false,
-        });
-        let source = project.to_json();
-        parse_project(&source).expect("consistent audio clip timing");
-
-        let inconsistent = source.replacen("\"end\":1.25", "\"end\":0.75", 1);
-        assert!(parse_project(&inconsistent).is_err());
     }
 
     #[cfg(any())]

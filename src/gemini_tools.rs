@@ -11,8 +11,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::audio_analysis::{self, MAX_REGION_SECONDS};
 use crate::model::{
-    AudioClip, AudioClipSliceSpec, MidiClipSpec, ModulatorSpec, Project, Studio, StudioError,
-    TrackRole, json_string,
+    MidiClipSpec, ModulatorSpec, Project, Studio, StudioError, TrackRole, json_string,
 };
 use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
 use crate::storage::{ProjectStore, replace_text_file};
@@ -38,9 +37,6 @@ pub(crate) const MUTATION_TOOL_NAMES: &[&str] = &[
     "add_midi_clip",
     "update_midi_clip",
     "delete_midi_clip",
-    "resample_audio_region",
-    "slice_audio_clip",
-    "delete_audio_clip",
     "add_effect",
     "update_effect",
     "delete_effect",
@@ -534,65 +530,8 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             ),
         ),
         function(
-            "resample_audio_region",
-            "Render selected tracks into a new immutable WAV asset and place it as an audio clip. Use this before slicing, reversing, or rearranging generated material. A track containing audio clips reserves one of Surge XT's eight serial effect slots; preset and added effects share the remaining capacity.",
-            object_schema(
-                serde_json::json!({
-                    "sourceTracks":{"oneOf":[{"type":"string","enum":["all"]},{"type":"array","items":id(),"minItems":1,"maxItems":32,"uniqueItems":true}]},
-                    "sourceStart":{"type":"number","minimum":0},
-                    "sourceEnd":{"type":"number","exclusiveMinimum":0},
-                    "targetTrackId":id(),
-                    "destinationStart":{"type":"number","minimum":0},
-                    "label":{"type":"string","minLength":1,"maxLength":64},
-                    "gain":{"type":"number","minimum":0,"maximum":2},
-                    "reversed":{"type":"boolean"}
-                }),
-                &[
-                    "sourceTracks",
-                    "sourceStart",
-                    "sourceEnd",
-                    "targetTrackId",
-                    "destinationStart",
-                    "label",
-                    "gain",
-                    "reversed",
-                ],
-            ),
-        ),
-        function(
-            "slice_audio_clip",
-            "Create a nondestructive slice from an existing audio clip, optionally reversed, and place it at a new project time.",
-            object_schema(
-                serde_json::json!({
-                    "trackId":id(),"clipId":id(),
-                    "sourceStart":{"type":"number","minimum":0},
-                    "sourceEnd":{"type":"number","exclusiveMinimum":0},
-                    "destinationStart":{"type":"number","minimum":0},
-                    "label":{"type":"string","minLength":1,"maxLength":64},
-                    "reversed":{"type":"boolean"}
-                }),
-                &[
-                    "trackId",
-                    "clipId",
-                    "sourceStart",
-                    "sourceEnd",
-                    "destinationStart",
-                    "label",
-                    "reversed",
-                ],
-            ),
-        ),
-        function(
-            "delete_audio_clip",
-            "Delete one audio clip inside the selected edit region without deleting its immutable source asset. The entire clip placement must be inside the selection.",
-            object_schema(
-                serde_json::json!({"trackId":id(),"clipId":id()}),
-                &["trackId", "clipId"],
-            ),
-        ),
-        function(
             "add_effect",
-            "Append a named effect after the preset's visible embedded effects and set its mix. Surge XT has eight serial slots shared by preset effects and added effects; a track containing resampled audio also reserves one slot for Audio Input. Returns the stable effect ID; use list_sound_tool_parameters to list all of its controls.",
+            "Append a named effect after the preset's visible embedded effects and set its mix. Surge XT has eight serial slots shared by preset effects and added effects. Returns the stable effect ID; use list_sound_tool_parameters to list all of its controls.",
             object_schema(
                 serde_json::json!({"trackId":id(),"name":{"type":"string","enum":["Delay","Reverb 1","Phaser","Rotary Speaker","Distortion","EQ","Frequency Shifter","Conditioner","Chorus","Vocoder","Reverb 2","Flanger","Ring Modulator","Airwindows","Neuron","Graphic EQ","Resonator","CHOW","Exciter","Ensemble","Combulator","Nimbus","Tape","Treemonster","Waveshaper","Mid-Side Tool","Spring Reverb","Bonsai","Floaty Delay","Convolution"]},"mix":{"type":"number","minimum":0,"maximum":1}}),
                 &["trackId", "name", "mix"],
@@ -1485,79 +1424,6 @@ pub(crate) fn apply_agent_mutation(
                 .map_err(studio_error_message)?;
             format!("Deleted MIDI clip {clip_id} from track {track_id}")
         }
-        "resample_audio_region" => {
-            let track_id = required_id(object, "targetTrackId")?;
-            let label = required_string(object, "label")?;
-            let start = required_number(object, "destinationStart")? as f32;
-            let duration = required_number(object, "sourceDuration")? as f32;
-            if start < selection_start || start + duration > selection_end {
-                return Err(
-                    "resampled audio clip must fit inside the selected edit region".to_owned(),
-                );
-            }
-            let gain = required_number(object, "gain")? as f32;
-            let reversed = object
-                .get("reversed")
-                .and_then(JsonValue::as_bool)
-                .ok_or_else(|| "reversed must be a boolean".to_owned())?;
-            let asset = required_string(object, "asset")?;
-            let id = studio
-                .create_audio_clip(
-                    track_id,
-                    AudioClip {
-                        id: 0,
-                        label: label.to_owned(),
-                        start,
-                        end: 0.0,
-                        asset: asset.to_owned(),
-                        source_offset: 0.0,
-                        source_duration: duration,
-                        gain,
-                        reversed,
-                    },
-                )
-                .map_err(studio_error_message)?;
-            result_id = Some(id);
-            format!("Resampled audio clip {id} onto track {track_id}")
-        }
-        "slice_audio_clip" => {
-            let track_id = required_id(object, "trackId")?;
-            let clip_id = required_id(object, "clipId")?;
-            let source_start = required_number(object, "sourceStart")? as f32;
-            let source_end = required_number(object, "sourceEnd")? as f32;
-            let destination_start = required_number(object, "destinationStart")? as f32;
-            if destination_start < selection_start
-                || destination_start + (source_end - source_start) > selection_end
-            {
-                return Err("audio slice must fit inside the selected edit region".to_owned());
-            }
-            let id = studio
-                .slice_audio_clip(
-                    track_id,
-                    clip_id,
-                    AudioClipSliceSpec {
-                        label: required_string(object, "label")?,
-                        source_start,
-                        source_end,
-                        destination_start,
-                        reversed: object
-                            .get("reversed")
-                            .and_then(JsonValue::as_bool)
-                            .ok_or_else(|| "reversed must be a boolean".to_owned())?,
-                    },
-                )
-                .map_err(studio_error_message)?;
-            result_id = Some(id);
-            format!("Created audio slice {id} from clip {clip_id}")
-        }
-        "delete_audio_clip" => {
-            let track_id = required_id(object, "trackId")?;
-            let clip_id = required_id(object, "clipId")?;
-            studio
-                .delete_audio_clip(track_id, clip_id, selection_start, selection_end)
-                .map_err(studio_error_message)?;
-            format!("Deleted audio clip {clip_id} from track {track_id}")
-        }
         "add_effect" => {
             let track_id = required_id(object, "trackId")?;
             let effect_name = required_string(object, "name")?;
@@ -2269,9 +2135,6 @@ fn sound_tool_inventory(project: &Project) -> Vec<JsonValue> {
                     })
                 }).collect::<Vec<_>>(),
                 "clips": track.clips.iter().map(|clip| {
-                    serde_json::json!({"id": clip.id, "label": clip.label})
-                }).collect::<Vec<_>>(),
-                "audioClips": track.audio_clips.iter().map(|clip| {
                     serde_json::json!({"id": clip.id, "label": clip.label})
                 }).collect::<Vec<_>>()
             })
@@ -3238,49 +3101,6 @@ mod tests {
             }),
         )
         .expect("multiple pitches are valid");
-    }
-
-    #[test]
-    fn resampled_audio_can_be_sliced_reversed_and_rendered() {
-        let original = Project::demo();
-        let session =
-            EditSession::create(&original, "glitch the drums", 0.0, 8.0).expect("edit session");
-        let rendered = render_audio(
-            session.path(),
-            &serde_json::json!({"tracks":[1],"start":0,"end":2}),
-        )
-        .expect("source render");
-        let name = session
-            .record_audio(99, &rendered.wav)
-            .expect("source asset");
-        let asset = session.path().join(name).to_string_lossy().into_owned();
-        let response = apply_agent_mutation(
-            session.path(),
-            "resample_audio_region",
-            &serde_json::json!({
-                "targetTrackId":1,"destinationStart":0,"label":"Drum resample",
-                "gain":1,"reversed":false,"sourceDuration":2,"asset":asset
-            }),
-        )
-        .expect("resample");
-        let response: JsonValue = serde_json::from_str(&response).unwrap();
-        let clip_id = response["id"].as_u64().expect("audio clip ID");
-        session.take_update().unwrap().expect("resample update");
-        apply_agent_mutation(
-            session.path(),
-            "slice_audio_clip",
-            &serde_json::json!({
-                "trackId":1,"clipId":clip_id,"sourceStart":0.5,"sourceEnd":1,
-                "destinationStart":3,"label":"Reverse pull","reversed":true
-            }),
-        )
-        .expect("slice");
-        let (_, project) = session.take_update().unwrap().expect("slice update");
-        assert_eq!(project.tracks[0].audio_clips.len(), 2);
-        assert!(project.tracks[0].audio_clips[1].reversed);
-        let audio =
-            audio_analysis::render_region(&project, &[1], 0.0, 4.0).expect("audio clips render");
-        assert!(audio.samples.iter().any(|sample| sample.abs() > 0.001));
     }
 
     #[test]

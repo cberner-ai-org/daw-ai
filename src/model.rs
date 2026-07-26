@@ -154,27 +154,6 @@ pub struct Clip {
     pub events: Vec<ClipEvent>,
 }
 
-#[derive(Clone, Debug)]
-pub struct AudioClip {
-    pub id: u64,
-    pub label: String,
-    pub start: f32,
-    pub end: f32,
-    pub asset: String,
-    pub source_offset: f32,
-    pub source_duration: f32,
-    pub gain: f32,
-    pub reversed: bool,
-}
-
-pub(crate) struct AudioClipSliceSpec<'a> {
-    pub(crate) label: &'a str,
-    pub(crate) source_start: f32,
-    pub(crate) source_end: f32,
-    pub(crate) destination_start: f32,
-    pub(crate) reversed: bool,
-}
-
 pub(crate) struct ModulatorSpec<'a> {
     pub target: &'a str,
     pub shape: &'a str,
@@ -228,7 +207,6 @@ pub struct Track {
     pub modulators: Vec<Modulator>,
     pub routing: Routing,
     pub clips: Vec<Clip>,
-    pub audio_clips: Vec<AudioClip>,
 }
 
 #[derive(Clone, Debug)]
@@ -384,9 +362,6 @@ impl Project {
                 for event in &clip.events {
                     highest = highest.max(event.id);
                 }
-            }
-            for clip in &track.audio_clips {
-                highest = highest.max(clip.id);
             }
         }
         highest
@@ -833,29 +808,6 @@ impl Track {
                 .expect("writing to a string cannot fail");
             }
             output.push_str("]}");
-        }
-        output.push_str("],\"audioClips\":[");
-        for (index, clip) in self.audio_clips.iter().enumerate() {
-            if index > 0 {
-                output.push(',');
-            }
-            write!(
-                output,
-                concat!(
-                    "{{\"id\":{},\"label\":{},\"start\":{},\"end\":{},\"asset\":{},",
-                    "\"sourceOffset\":{},\"sourceDuration\":{},\"gain\":{},\"reversed\":{}}}"
-                ),
-                clip.id,
-                json_string(&clip.label),
-                decimal(clip.start),
-                decimal(clip.end),
-                json_string(&clip.asset),
-                decimal(clip.source_offset),
-                decimal(clip.source_duration),
-                decimal(clip.gain),
-                clip.reversed
-            )
-            .expect("writing to a string cannot fail");
         }
         output.push_str("]}");
     }
@@ -1855,126 +1807,6 @@ impl Studio {
         Ok(clip_id)
     }
 
-    pub(crate) fn create_audio_clip(
-        &mut self,
-        track_id: u64,
-        mut clip: AudioClip,
-    ) -> Result<u64, StudioError> {
-        clip.end = clip.start + clip.source_duration;
-        if clip.label.trim().is_empty()
-            || clip.label.chars().count() > 64
-            || !clip.start.is_finite()
-            || !clip.source_offset.is_finite()
-            || !clip.source_duration.is_finite()
-            || !clip.gain.is_finite()
-            || clip.start < 0.0
-            || clip.source_offset < 0.0
-            || !(0.001..=16.0).contains(&clip.source_duration)
-            || clip.end > self.project.duration
-            || !(0.0..=2.0).contains(&clip.gain)
-            || !std::path::Path::new(&clip.asset).is_absolute()
-            || !clip.asset.ends_with(".wav")
-        {
-            return Err(StudioError::InvalidSoundTool);
-        }
-        let track_index = self
-            .project
-            .tracks
-            .iter()
-            .position(|track| track.id == track_id)
-            .ok_or(StudioError::UnknownTrack)?;
-        if !track_effects_fit(&self.project.tracks[track_index], true) {
-            return Err(StudioError::EffectCapacity);
-        }
-        let id = self.take_id();
-        clip.id = id;
-        clip.label = clip.label.trim().to_owned();
-        self.remember();
-        self.project.tracks[track_index].audio_clips.push(clip);
-        self.project.tracks[track_index]
-            .audio_clips
-            .sort_by(|left, right| left.start.total_cmp(&right.start));
-        self.project.version += 1;
-        Ok(id)
-    }
-
-    pub(crate) fn delete_audio_clip(
-        &mut self,
-        track_id: u64,
-        clip_id: u64,
-        selection_start: f32,
-        selection_end: f32,
-    ) -> Result<(), StudioError> {
-        if selection_end <= selection_start {
-            return Err(StudioError::InvalidSelection);
-        }
-        let track_index = self
-            .project
-            .tracks
-            .iter()
-            .position(|track| track.id == track_id)
-            .ok_or(StudioError::UnknownTrack)?;
-        let clip_index = self.project.tracks[track_index]
-            .audio_clips
-            .iter()
-            .position(|clip| clip.id == clip_id)
-            .ok_or(StudioError::UnknownSoundTool)?;
-        let clip = &self.project.tracks[track_index].audio_clips[clip_index];
-        if clip.start < selection_start || clip.end > selection_end {
-            return Err(StudioError::InvalidSelection);
-        }
-        self.remember();
-        self.project.tracks[track_index]
-            .audio_clips
-            .remove(clip_index);
-        self.project.version += 1;
-        Ok(())
-    }
-
-    pub(crate) fn slice_audio_clip(
-        &mut self,
-        track_id: u64,
-        clip_id: u64,
-        spec: AudioClipSliceSpec<'_>,
-    ) -> Result<u64, StudioError> {
-        let source = self
-            .project
-            .tracks
-            .iter()
-            .find(|track| track.id == track_id)
-            .ok_or(StudioError::UnknownTrack)?
-            .audio_clips
-            .iter()
-            .find(|clip| clip.id == clip_id)
-            .ok_or(StudioError::UnknownSoundTool)?
-            .clone();
-        if spec.source_start < 0.0
-            || spec.source_end <= spec.source_start
-            || spec.source_end > source.source_duration
-        {
-            return Err(StudioError::InvalidSoundTool);
-        }
-        let source_offset = if source.reversed {
-            source.source_offset + source.source_duration - spec.source_end
-        } else {
-            source.source_offset + spec.source_start
-        };
-        self.create_audio_clip(
-            track_id,
-            AudioClip {
-                id: 0,
-                label: spec.label.to_owned(),
-                start: spec.destination_start,
-                end: 0.0,
-                asset: source.asset,
-                source_offset,
-                source_duration: spec.source_end - spec.source_start,
-                gain: source.gain,
-                reversed: spec.reversed ^ source.reversed,
-            },
-        )
-    }
-
     pub(crate) fn replace_midi_clip(
         &mut self,
         track_id: u64,
@@ -2579,7 +2411,7 @@ fn configure_track_preset(
         .filter(|effect_id| !track.routing.effect_order.contains(effect_id))
         .collect::<Vec<_>>();
     track.routing.effect_order.extend(missing_added);
-    if !track_effects_fit(track, !track.audio_clips.is_empty()) {
+    if !track_effects_fit(track) {
         return Err(StudioError::EffectCapacity);
     }
     let available_modulation_targets = modulation_targets(track)
@@ -2693,7 +2525,7 @@ fn configure_track_tool(
                 }
                 _ => return Err(StudioError::InvalidSoundTool),
             }
-            if track_effects_fit(track, !track.audio_clips.is_empty()) {
+            if track_effects_fit(track) {
                 Ok(())
             } else {
                 Err(StudioError::EffectCapacity)
@@ -2808,18 +2640,14 @@ fn mark_effect_override(effect: &mut Effect, parameter: &str) {
     }
 }
 
-pub(crate) fn track_effects_fit(track: &Track, has_audio_input: bool) -> bool {
+pub(crate) fn track_effects_fit(track: &Track) -> bool {
     let enabled = track.effects.iter().filter(|effect| effect.enabled).count();
-    let input_slots =
-        usize::from(has_audio_input && enabled > 0) * crate::surge::AUDIO_INPUT_EFFECT_SLOT_COUNT;
-    enabled + input_slots <= crate::surge::SERIAL_EFFECT_SLOT_COUNT
+    enabled <= crate::surge::SERIAL_EFFECT_SLOT_COUNT
 }
 
 fn track_effects_fit_with_added_effect(track: &Track) -> bool {
     let enabled = track.effects.iter().filter(|effect| effect.enabled).count() + 1;
-    let input_slots =
-        usize::from(!track.audio_clips.is_empty()) * crate::surge::AUDIO_INPUT_EFFECT_SLOT_COUNT;
-    enabled + input_slots <= crate::surge::SERIAL_EFFECT_SLOT_COUNT
+    enabled <= crate::surge::SERIAL_EFFECT_SLOT_COUNT
 }
 
 fn validate_clip_fields(
@@ -2970,23 +2798,6 @@ pub(crate) fn apply_instrument_preset_defaults(instrument: &mut Instrument) {
         instrument.timbre = 0.5;
         instrument.output = output;
     }
-}
-
-pub(crate) fn instrument_parameter_names() -> Vec<String> {
-    [
-        "attack",
-        "decay",
-        "sustain",
-        "release",
-        "cutoff",
-        "resonance",
-        "pitch",
-        "timbre",
-        "output",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
 }
 
 pub(crate) fn valid_surge_preset(value: &str) -> bool {
@@ -3281,7 +3092,6 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
             output: "master".to_owned(),
         },
         clips: Vec::new(),
-        audio_clips: Vec::new(),
     }
 }
 
@@ -3416,7 +3226,6 @@ fn demo_role_track(id: u64, role: TrackRole) -> Track {
             output: "master".to_owned(),
         },
         clips: Vec::new(),
-        audio_clips: Vec::new(),
     }
 }
 
@@ -3707,32 +3516,6 @@ mod tests {
     }
 
     #[test]
-    fn audio_clip_deletion_cannot_escape_the_selection() {
-        let mut studio = Studio::new();
-        let track_id = studio.project.tracks[0].id;
-        studio.project.tracks[0].audio_clips.push(AudioClip {
-            id: 9_001,
-            label: "Region".to_owned(),
-            start: 1.0,
-            end: 3.0,
-            asset: "/tmp/unused.wav".to_owned(),
-            source_offset: 0.0,
-            source_duration: 2.0,
-            gain: 1.0,
-            reversed: false,
-        });
-
-        assert_eq!(
-            studio.delete_audio_clip(track_id, 9_001, 1.5, 2.5),
-            Err(StudioError::InvalidSelection)
-        );
-        studio
-            .delete_audio_clip(track_id, 9_001, 1.0, 3.0)
-            .expect("selected audio clip deletion");
-        assert!(studio.project.tracks[0].audio_clips.is_empty());
-    }
-
-    #[test]
     fn advanced_channels_are_playable_undoable_and_keep_one_output_path() {
         let mut studio = Studio::new();
         let original = studio.project().to_json();
@@ -3964,116 +3747,6 @@ mod tests {
             studio.create_effect(track_id, "Distortion", 0.5),
             Err(StudioError::EffectCapacity)
         );
-        assert_eq!(
-            studio.create_audio_clip(
-                track_id,
-                AudioClip {
-                    id: 0,
-                    label: "Needs input slot".to_owned(),
-                    start: 0.0,
-                    end: 0.0,
-                    asset: "/tmp/effect-capacity.wav".to_owned(),
-                    source_offset: 0.0,
-                    source_duration: 1.0,
-                    gain: 1.0,
-                    reversed: false,
-                },
-            ),
-            Err(StudioError::EffectCapacity)
-        );
-
-        studio
-            .configure_sound_tool(
-                track_id,
-                "effect",
-                studio.project().tracks[0].effects[0].id,
-                None,
-                "enabled",
-                "false",
-            )
-            .expect("release one slot");
-        studio
-            .create_audio_clip(
-                track_id,
-                AudioClip {
-                    id: 0,
-                    label: "Fits reserved input".to_owned(),
-                    start: 0.0,
-                    end: 0.0,
-                    asset: "/tmp/effect-capacity.wav".to_owned(),
-                    source_offset: 0.0,
-                    source_duration: 1.0,
-                    gain: 1.0,
-                    reversed: false,
-                },
-            )
-            .expect("audio input reservation");
-        let disabled_id = studio.project().tracks[0].effects[0].id;
-        assert_eq!(
-            studio.configure_sound_tool(track_id, "effect", disabled_id, None, "enabled", "true",),
-            Err(StudioError::EffectCapacity)
-        );
-    }
-
-    #[test]
-    fn slicing_reversed_audio_uses_playback_relative_coordinates() {
-        let sample_rate = crate::audio_analysis::SAMPLE_RATE as usize;
-        let path =
-            std::env::temp_dir().join(format!("daw-ai-reversed-slice-{}.wav", std::process::id()));
-        let samples = (0..sample_rate)
-            .map(|index| index as f32 / sample_rate as f32 * 0.8 - 0.4)
-            .collect::<Vec<_>>();
-        std::fs::write(&path, crate::audio_analysis::wav_bytes(&samples))
-            .expect("reversed slice fixture");
-
-        let mut studio = Studio::from_project(Project::initial());
-        let track_id = studio.project().tracks[0].id;
-        studio.project.tracks[0].volume = 1.0;
-        let source_id = studio
-            .create_audio_clip(
-                track_id,
-                AudioClip {
-                    id: 0,
-                    label: "Reversed source".to_owned(),
-                    start: 0.0,
-                    end: 0.0,
-                    asset: path.to_string_lossy().into_owned(),
-                    source_offset: 0.0,
-                    source_duration: 1.0,
-                    gain: 1.0,
-                    reversed: true,
-                },
-            )
-            .expect("source clip");
-        studio
-            .slice_audio_clip(
-                track_id,
-                source_id,
-                AudioClipSliceSpec {
-                    label: "Audible beginning",
-                    source_start: 0.0,
-                    source_end: 0.25,
-                    destination_start: 1.0,
-                    reversed: false,
-                },
-            )
-            .expect("reversed slice");
-
-        let sliced = &studio.project().tracks[0].audio_clips[1];
-        assert!((sliced.source_offset - 0.75).abs() < 0.000_01);
-        assert!(sliced.reversed);
-        let rendered =
-            crate::audio_analysis::render_region(studio.project(), &[track_id], 0.0, 1.25)
-                .expect("reversed clips render");
-        let quarter = sample_rate / 4;
-        assert_eq!(
-            crate::audio_analysis::pcm_bytes(&rendered.samples[..quarter * 2]),
-            crate::audio_analysis::pcm_bytes(
-                &rendered.samples[sample_rate * 2..sample_rate * 2 + quarter * 2]
-            )
-        );
-
-        std::fs::remove_file(path).expect("remove reversed slice fixture");
     }
 
     #[cfg(any())]
