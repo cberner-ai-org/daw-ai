@@ -472,12 +472,7 @@ fn render_audio_samples_with_tracks(
         )?;
         apply_track_gain(project, track, &render_state, start_sample, &mut rendered);
         event_onsets.extend(track_event_onsets.iter().copied());
-        for (output, sample) in mix.iter_mut().zip(&rendered) {
-            *output += *sample;
-        }
-        for sample in &mut rendered {
-            *sample = (*sample * 0.58).tanh();
-        }
+        sum_samples(&mut mix, &rendered);
         tracks.push((
             track_id,
             AudioRegion {
@@ -486,9 +481,6 @@ fn render_audio_samples_with_tracks(
                 event_onsets: track_event_onsets,
             },
         ));
-    }
-    for sample in &mut mix {
-        *sample = (*sample * 0.58).tanh();
     }
     let event_count = event_onsets.len();
     Ok(AudioRegions {
@@ -499,6 +491,12 @@ fn render_audio_samples_with_tracks(
         },
         tracks,
     })
+}
+
+fn sum_samples(output: &mut [f32], input: &[f32]) {
+    for (output, input) in output.iter_mut().zip(input) {
+        *output += input;
+    }
 }
 
 fn mix_audio_clips(
@@ -2237,6 +2235,42 @@ mod tests {
         assert!(spectrogram.png.len() > 1_000);
         assert_eq!(spectrogram.height, 256);
         assert!(spectrogram.maximum_db > spectrogram.minimum_db);
+    }
+
+    #[test]
+    fn mix_is_the_transparent_sum_of_surge_track_outputs() {
+        let project = Project::demo();
+        let track_ids = project
+            .tracks
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>();
+        let mut cancelled = || false;
+        let regions = render_audio_samples_with_tracks(
+            &project,
+            &track_ids,
+            0,
+            SAMPLE_RATE as usize,
+            true,
+            &mut cancelled,
+        )
+        .expect("track and mix render");
+        let mut expected = vec![0.0; SAMPLE_RATE as usize];
+        for track_id in &track_ids {
+            let samples = &regions
+                .tracks
+                .iter()
+                .find(|(candidate, _)| candidate == track_id)
+                .expect("rendered track")
+                .1
+                .samples;
+            sum_samples(&mut expected, samples);
+        }
+        assert_eq!(regions.mix.samples, expected);
+
+        let mut above_full_scale = vec![0.8];
+        sum_samples(&mut above_full_scale, &[0.8]);
+        assert_eq!(above_full_scale, [1.6]);
     }
 
     #[test]
