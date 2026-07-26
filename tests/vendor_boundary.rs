@@ -33,7 +33,13 @@ fn vendored_surge_boundary_keeps_pins_and_patched_api() {
         "opaque Surge IDs must cross the C boundary through pointers"
     );
     assert!(
-        read(root, "vendor/surge-sys/src/hell_ffi.rs").contains("q: *mut SurgeSynthesizer_ID"),
+        read(root, "vendor/surge-sys/src/hell_ffi.rs").contains(concat!(
+            "pub fn idForParameter(\n",
+            "        surge: *const SurgeSynthesizer,\n",
+            "        p: *const Parameter,\n",
+            "        q: *mut SurgeSynthesizer_ID,\n",
+            "    );"
+        )),
         "the Rust declaration must match the pointer-based C wrapper"
     );
 
