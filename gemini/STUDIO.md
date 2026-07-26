@@ -42,13 +42,13 @@ Clip placement is in beats. Convert seconds to beats with `seconds * bpm / 60`. 
 
 ## Modulation
 
-One modulation object describes the source behavior and target route.
+One modulation object configures a native Surge XT modulation source and target route on the same track.
 
 - `target` is copied from graph or instrument discovery.
 - `shape` is `sine`, `triangle`, `square`, `random`, `envelope`, or `formula`.
 - `rateMode` is `hz` or tempo-synced cycles per beat.
 - `trigger` is `free`, `midi`, or `audio`.
-- Audio-triggered modulation may use `sourceTrackId`, threshold, attack, release, and polarity.
+- Free-running and MIDI-triggered modulation use native Surge XT modulation sources.
 - Formula modulation supplies Surge Formula source in `formula`.
 
 Same-track native targets execute inside Surge XT. Cross-track sources and DAW-owned targets such as `track.volume` execute in DAW-AI. Use the target IDs and controls returned by discovery.

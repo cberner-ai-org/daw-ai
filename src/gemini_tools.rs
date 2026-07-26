@@ -613,11 +613,20 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "add_modulator",
-            "Add modulation and return its stable ID. Copy target from sound-graph modulationTargets or an instrument leaf's modulationTarget field; never copy its parameter field. Same-track native targets run inside Surge XT. Formula is native-only.",
+            "Add a native Surge XT modulator and return its stable ID. Copy target from sound-graph modulationTargets or an instrument leaf's modulationTarget field; never copy its parameter field.",
             object_schema(
-                serde_json::json!({"trackId":id(),"target":{"type":"string","minLength":1,"maxLength":96},"shape":{"type":"string","enum":["sine","triangle","square","random","envelope","formula"]},"formula":{"type":"string","minLength":1,"maxLength":8192},"rate":{"type":"number","minimum":0.01,"maximum":20},"rateMode":{"type":"string","enum":["hz","tempo"]},"depth":{"type":"number","minimum":0,"maximum":1},"trigger":{"type":"string","enum":["free","midi","audio"]},"sourceTrackId":id(),"attackMs":{"type":"number","minimum":0,"maximum":1000},"releaseMs":{"type":"number","minimum":1,"maximum":5000},"threshold":{"type":"number","minimum":0,"maximum":1},"polarity":{"type":"string","enum":["increase","decrease"]}}),
+                serde_json::json!({"trackId":id(),"target":{"type":"string","pattern":"^native:[0-9]+$","maxLength":96},"shape":{"type":"string","enum":["sine","triangle","square","random","envelope","formula"]},"formula":{"type":"string","minLength":1,"maxLength":8192},"rate":{"type":"number","minimum":0.01,"maximum":20},"rateMode":{"type":"string","enum":["hz","tempo"]},"depth":{"type":"number","minimum":0,"maximum":1},"trigger":{"type":"string","enum":["free","midi"]},"attackMs":{"type":"number","minimum":0,"maximum":1000},"releaseMs":{"type":"number","minimum":1,"maximum":5000},"polarity":{"type":"string","enum":["increase","decrease"]}}),
                 &[
-                    "trackId", "target", "shape", "rate", "rateMode", "depth", "trigger",
+                    "trackId",
+                    "target",
+                    "shape",
+                    "rate",
+                    "rateMode",
+                    "depth",
+                    "trigger",
+                    "attackMs",
+                    "releaseMs",
+                    "polarity",
                 ],
             ),
         ),
@@ -1288,17 +1297,11 @@ pub(crate) fn list_sound_tool_parameters(
                 serde_json::json!({"parameter":"rate","name":"Rate","value":modulator.rate,"minimum":0.01,"maximum":20}),
                 serde_json::json!({"parameter":"rateMode","name":"Rate mode","value":modulator.rate_mode,"choices":["hz","tempo"]}),
                 serde_json::json!({"parameter":"depth","name":"Depth","value":modulator.depth,"minimum":0,"maximum":1}),
-                serde_json::json!({"parameter":"trigger","name":"Trigger","value":modulator.trigger,"choices":["free","midi","audio"]}),
+                serde_json::json!({"parameter":"trigger","name":"Trigger","value":modulator.trigger,"choices":["free","midi"]}),
                 serde_json::json!({"parameter":"polarity","name":"Polarity","value":modulator.polarity,"choices":["increase","decrease"]}),
+                serde_json::json!({"parameter":"attackMs","name":"Attack","value":modulator.attack_ms,"minimum":0,"maximum":1000,"unit":"ms"}),
+                serde_json::json!({"parameter":"releaseMs","name":"Release","value":modulator.release_ms,"minimum":1,"maximum":5000,"unit":"ms"}),
             ];
-            if modulator.trigger == "audio" {
-                values.extend([
-                    serde_json::json!({"parameter":"sourceTrackId","name":"Source track ID","value":modulator.source_track_id}),
-                    serde_json::json!({"parameter":"threshold","name":"Threshold","value":modulator.threshold,"minimum":0,"maximum":1}),
-                    serde_json::json!({"parameter":"attackMs","name":"Attack","value":modulator.attack_ms,"minimum":0,"maximum":1000,"unit":"ms"}),
-                    serde_json::json!({"parameter":"releaseMs","name":"Release","value":modulator.release_ms,"minimum":1,"maximum":5000,"unit":"ms"}),
-                ]);
-            }
             if modulator.shape == "formula" {
                 values.push(serde_json::json!({"parameter":"formula","name":"Surge Formula (Lua)","value":modulator.formula,"maximumLength":8192}));
             }
@@ -1590,17 +1593,12 @@ pub(crate) fn apply_agent_mutation(
             let rate_mode = required_string(object, "rateMode")?;
             let depth = required_number(object, "depth")? as f32;
             let trigger = required_string(object, "trigger")?;
-            if !matches!(trigger, "free" | "midi" | "audio") {
-                return Err("trigger must be free, midi, or audio".to_owned());
+            if !matches!(trigger, "free" | "midi") {
+                return Err("trigger must be free or midi".to_owned());
             }
-            let source_track_id = object.get("sourceTrackId").and_then(JsonValue::as_u64);
-            let attack_ms = optional_number(object, "attackMs", 5.0)? as f32;
-            let release_ms = optional_number(object, "releaseMs", 180.0)? as f32;
-            let threshold = optional_number(object, "threshold", 0.1)? as f32;
-            let polarity = object
-                .get("polarity")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("increase");
+            let attack_ms = required_number(object, "attackMs")? as f32;
+            let release_ms = required_number(object, "releaseMs")? as f32;
+            let polarity = required_string(object, "polarity")?;
             let formula = object
                 .get("formula")
                 .and_then(JsonValue::as_str)
@@ -1615,10 +1613,10 @@ pub(crate) fn apply_agent_mutation(
                         rate_mode,
                         depth,
                         trigger,
-                        source_track_id,
+                        source_track_id: None,
                         attack_ms,
                         release_ms,
-                        threshold,
+                        threshold: 0.0,
                         polarity,
                         formula,
                     },
@@ -1821,19 +1819,6 @@ fn required_number(object: &Map<String, JsonValue>, name: &str) -> Result<f64, S
         .and_then(JsonValue::as_f64)
         .filter(|value| value.is_finite())
         .ok_or_else(|| format!("{name} must be a finite number"))
-}
-
-fn optional_number(
-    object: &Map<String, JsonValue>,
-    name: &str,
-    default: f64,
-) -> Result<f64, String> {
-    object.get(name).map_or(Ok(default), |value| {
-        value
-            .as_f64()
-            .filter(|value| value.is_finite())
-            .ok_or_else(|| format!("{name} must be a finite number"))
-    })
 }
 
 fn required_string<'a>(object: &'a Map<String, JsonValue>, name: &str) -> Result<&'a str, String> {
@@ -2081,7 +2066,7 @@ fn audio_measurements(
     serde_json::json!({
         "renderer": backend,
         "sampleRateHz": audio_analysis::SAMPLE_RATE,
-        "channelCount": 1,
+        "channelCount": audio_analysis::CHANNEL_COUNT,
         "startSeconds": seconds(request.start),
         "endSeconds": seconds(request.end),
         "durationSeconds": seconds(request.end - request.start),
@@ -2111,7 +2096,7 @@ fn region_measurements(region: &audio_analysis::AudioRegion) -> JsonValue {
     };
     let time_series = region
         .samples
-        .chunks(audio_analysis::SAMPLE_RATE as usize)
+        .chunks(audio_analysis::SAMPLE_RATE as usize * audio_analysis::CHANNEL_COUNT)
         .enumerate()
         .map(|(index, samples)| {
             let peak = samples.iter().copied().map(f32::abs).fold(0.0, f32::max);
@@ -2123,14 +2108,15 @@ fn region_measurements(region: &audio_analysis::AudioRegion) -> JsonValue {
             };
             serde_json::json!({
                 "startOffsetSeconds": index,
-                "durationSeconds": samples.len() as f32 / audio_analysis::SAMPLE_RATE as f32,
+                "durationSeconds": samples.len() as f32
+                    / (audio_analysis::SAMPLE_RATE as f32 * audio_analysis::CHANNEL_COUNT as f32),
                 "peakDbfs": amplitude_dbfs(peak),
                 "rmsDbfs": amplitude_dbfs(rms)
             })
         })
         .collect::<Vec<_>>();
     serde_json::json!({
-        "sampleCount": region.samples.len(),
+        "sampleCount": region.samples.len() / audio_analysis::CHANNEL_COUNT,
         "eventCount": region.event_count,
         "peakAmplitude": analysis.peak,
         "peakDbfs": amplitude_dbfs(analysis.peak),
@@ -2684,8 +2670,7 @@ mod tests {
 
     #[test]
     fn sound_graph_hides_legacy_convenience_parameters() {
-        let mut project = Project::demo();
-        project.tracks[1].modulators[0].target = "instrument.cutoff".to_owned();
+        let project = Project::demo();
         let session =
             EditSession::create(&project, "inspect migrated controls", 0.0, 1.0).expect("session");
         let response = read_sound_graph(session.path()).expect("sound graph");
@@ -3041,12 +3026,15 @@ mod tests {
             "add_modulator",
             &serde_json::json!({
                 "trackId":track.id,
-                "target":"instrument.cutoff",
+                "target":track.modulators[0].target,
                 "shape":"sine",
                 "rate":2,
                 "rateMode":"tempo",
                 "depth":0.5,
-                "trigger":"free"
+                "trigger":"free",
+                "attackMs":5,
+                "releaseMs":180,
+                "polarity":"increase"
             }),
         )
         .expect("tempo-synced modulator");
@@ -3671,7 +3659,7 @@ mod tests {
         assert!(surge.description.contains("Surge XT rendering engine"));
         assert!(!surge.description.contains("custom Rust audio engine"));
         assert_eq!(surge.measurements["sampleRateHz"], 16_000);
-        assert_eq!(surge.measurements["channelCount"], 1);
+        assert_eq!(surge.measurements["channelCount"], 2);
         assert_eq!(surge.measurements["startSeconds"], 0.0);
         assert_eq!(surge.measurements["endSeconds"], 0.1);
         assert_eq!(
