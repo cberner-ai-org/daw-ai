@@ -123,9 +123,11 @@ DO NOT include extra code to support legacy project files
 
 The interface should be a local webserver with no authentication required. It should run on port 8888 by default.
 
-The backend is written in Rust and the sound engine primarily relies on Surge XT, and should minimize the amount
-of custom audio code in DAW AI. The client code should be responsive and the UI should work on mobile or a desktop
-browser.
+The backend is written in Rust and the sound engine uses Surge XT. Minimize the amount of custom audio code in DAW AI.
+DAW AI's sound engine should be a thin orchestration layer on top of Surge XT, and it should NOT override defaults,
+or implement its own processing effects. The only exception is when Surge XT is not well suited to handle the task,
+such as the final mixing of tracks, exporting of .wav files...etc.
+The client code should be responsive and the UI should work on mobile or a desktop browser.
 
 The AI used is Gemini 3.6 Flash. The user must provide an API key in ~/gemini_creds.txt or a similar file.
 It can also be specified as an environment variable.
