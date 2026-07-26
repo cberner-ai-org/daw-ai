@@ -1429,9 +1429,9 @@ fn validate_loaded_automation(
         Action::Automation {
             track_id,
             parameter,
+            curve,
             points,
             target,
-            ..
         } => {
             let track = if *track_id == 0 {
                 tracks.iter().rev().find(|track| {
@@ -1448,13 +1448,11 @@ fn validate_loaded_automation(
             *track_id = track.id;
             let (minimum, maximum) = automation_target_range(track, parameter)
                 .expect("validated automation target exists");
-            if points
-                .iter()
-                .any(|point| !(minimum..=maximum).contains(&point.value))
-            {
-                return Err(invalid(
-                    "automation point value is outside its target's published range",
-                ));
+            if points.iter().any(|point| {
+                !(minimum..=maximum).contains(&point.value)
+                    || !crate::model::valid_automation_value(track, parameter, curve, point.value)
+            }) {
+                return Err(invalid("automation value or curve is invalid"));
             }
         }
         _ => {}

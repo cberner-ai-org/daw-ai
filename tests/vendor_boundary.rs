@@ -26,6 +26,14 @@ fn vendored_surge_boundary_keeps_pins_and_patched_api() {
     let binding = read(root, "vendor/surge-rs/src/glue/synthesizer.rs");
     assert!(binding.contains("pub fn set_input_buffer"));
     assert!(binding.contains("pub fn pull_buffer"));
+    for patched_api in [
+        "pub fn parameter_choices",
+        "pub fn is_valid_modulation",
+        "pub fn set_parameter_temposync",
+        "pub fn set_parameter_deactivated",
+    ] {
+        assert!(binding.contains(patched_api));
+    }
 
     let service = read(root, "deploy/daw-ai.service");
     assert!(service.contains("DynamicUser=yes"));
