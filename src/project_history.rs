@@ -136,25 +136,12 @@ fn history_value(history: &ProjectHistory) -> serde_json::Value {
     .expect("project history serializes to JSON")
 }
 
-pub(crate) fn history_path(project_path: &Path) -> PathBuf {
-    let file_name = project_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("sound-graph.json");
-    project_path.with_file_name(format!("{file_name}.history.json"))
-}
-
 pub(crate) fn save_project_state(
     store: &ProjectStore,
     project: &Project,
     history: &ProjectHistory,
 ) -> io::Result<()> {
-    store.save_source(&project_document(project, history))?;
-    let legacy_history = history_path(store.path());
-    if legacy_history.is_file() {
-        let _ = fs::remove_file(legacy_history);
-    }
-    Ok(())
+    store.save_source(&project_document(project, history))
 }
 
 pub(crate) fn open_project_with_history(
@@ -173,34 +160,18 @@ pub(crate) fn open_project_with_history(
         }
         Err(error) => return Err(error),
     };
-    let separate_history = history_path(store.path());
     let source = store.read_source()?;
     let has_embedded_history = serde_json::from_str::<serde_json::Value>(&source)
         .ok()
         .and_then(|value| value.get("history").cloned())
         .is_some();
-    let loaded_history = if has_embedded_history {
-        load_project_history(store.path(), studio.project())
-    } else if separate_history.is_file() {
-        load_project_history(&separate_history, studio.project())
-    } else {
-        load_project_history(store.path(), studio.project())
-    };
+    let loaded_history = load_project_history(store.path(), studio.project());
     let history = match loaded_history {
         Ok(history) => history,
         Err(error) if error.kind() == io::ErrorKind::InvalidData && has_embedded_history => {
             eprintln!(
                 "warning: discarded invalid embedded project history in {}: {error}",
                 store.path().display()
-            );
-            ProjectHistory::new(studio.project().clone())
-        }
-        Err(error) if error.kind() == io::ErrorKind::InvalidData && separate_history.is_file() => {
-            let quarantine = quarantine_invalid_file(&separate_history)?;
-            eprintln!(
-                "warning: quarantined invalid project history {} as {}: {error}",
-                separate_history.display(),
-                quarantine.display()
             );
             ProjectHistory::new(studio.project().clone())
         }
@@ -242,7 +213,6 @@ mod tests {
         let mut history = ProjectHistory::new(studio.project().clone());
         history.push(project.clone());
 
-        fs::create_dir(history_path(&path)).expect("unwritable legacy history destination");
         save_project_state(&store, &project, &history).expect("single-file state commit");
 
         assert_eq!(
