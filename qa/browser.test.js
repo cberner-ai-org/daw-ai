@@ -281,6 +281,7 @@ async function run() {
   }
 
   const appPort = await reservePort();
+  const advancedAppPort = await reservePort();
   const debugPort = await reservePort();
   const attackerPort = await reservePort();
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "daw-ai-browser-"));
@@ -312,6 +313,8 @@ async function run() {
     { stdio: ["ignore", "ignore", "pipe"] },
   );
   let attacker;
+  let advancedApp;
+  let advancedAppErrors = "";
   let cdp;
   let appErrors = "";
   let chromeErrors = "";
@@ -2205,6 +2208,186 @@ async function run() {
       },
       "the demo graph must expose only exact Surge preset and native instrument state",
     );
+    const advancedDirectory = path.join(profile, "advanced-fixture");
+    fs.mkdirSync(advancedDirectory);
+    const startAdvancedApp = () => {
+      advancedApp = spawn(
+        path.join(root, "target", "debug", "daw-ai"),
+        ["--port", String(advancedAppPort)],
+        {
+          cwd: root,
+          env: {
+            ...appEnvironment,
+            DAW_AI_PROJECT_PATH: path.join(advancedDirectory, "sound-graph.json"),
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      advancedApp.stderr.on("data", (chunk) => {
+        advancedAppErrors += chunk;
+      });
+    };
+    startAdvancedApp();
+    await waitFor(
+      async () => fetch(`http://127.0.0.1:${advancedAppPort}/api/health`).then((response) => response.ok),
+      "Advanced fixture server",
+    );
+    const advancedSession = await openPage(cdp, `http://localhost:${advancedAppPort}`);
+    await waitFor(
+      async () => evaluate(cdp, advancedSession, "document.querySelectorAll('.track-row').length === 3"),
+      "Advanced fixture seed project",
+    );
+    const advancedFixture = await evaluate(
+      cdp,
+      advancedSession,
+      "fetch('/api/project').then((response) => response.json())",
+    );
+    const fixtureTrack = advancedFixture.tracks[0];
+    fixtureTrack.effects = [
+      {
+        id: 110, type: "effect", name: "EQ", source: "added", enabled: true,
+        parameters: { mix: 0.5 }, overrides: [], tempoSync: [], deactivated: [],
+      },
+      {
+        id: 111, type: "effect", name: "Reverb 2", source: "added", enabled: true,
+        parameters: { mix: 0.35 }, overrides: [], tempoSync: [], deactivated: [],
+      },
+    ];
+    fixtureTrack.modulators = [{
+      id: 150,
+      type: "modulator",
+      name: "QA movement",
+      shape: "triangle",
+      enabled: true,
+      target: fixtureTrack.modulationTargets[0].id,
+      rateMode: "hz",
+      trigger: "free",
+      sourceTrackId: null,
+      polarity: "increase",
+      formula: "",
+      parameters: { rate: 2, depth: 0.4, attackMs: 5, releaseMs: 180, threshold: 0 },
+    }];
+    fixtureTrack.routing = {
+      audio: ["clips", `instrument:${fixtureTrack.instrument.id}`, "effect:110", "effect:111", "master"],
+      control: [{ source: "modulator:150", target: fixtureTrack.modulators[0].target }],
+      output: "master",
+      edges: [
+        { source: "clips", target: `instrument:${fixtureTrack.instrument.id}`, type: "midi" },
+        { source: `instrument:${fixtureTrack.instrument.id}`, target: "effect:110", type: "audio" },
+        { source: "effect:110", target: "effect:111", type: "audio" },
+        { source: "effect:111", target: "master", type: "audio" },
+        { source: "modulator:150", target: fixtureTrack.modulators[0].target, type: "control" },
+      ],
+    };
+    advancedFixture.version += 1;
+    delete advancedFixture.canUndo;
+    await terminate(advancedApp);
+    advancedApp = null;
+    const userDirectories = fs.readdirSync(path.join(advancedDirectory, "users"));
+    assert.equal(userDirectories.length, 1, "the Advanced fixture server must create one user project");
+    fs.writeFileSync(
+      path.join(advancedDirectory, "users", userDirectories[0], "sound-graph.json"),
+      JSON.stringify(advancedFixture),
+    );
+    startAdvancedApp();
+    await waitFor(
+      async () => fetch(`http://127.0.0.1:${advancedAppPort}/api/health`).then((response) => response.ok),
+      "populated Advanced fixture server",
+    );
+    await cdp.send("Page.reload", {}, advancedSession);
+    await waitFor(
+      async () => evaluate(cdp, advancedSession, `fetch('/api/project')
+        .then((response) => response.json())
+        .then((project) => project.tracks[0].effects.length === 2 && project.tracks[0].modulators.length === 1)`),
+      "populated Advanced fixture project",
+    );
+    await evaluate(cdp, advancedSession, "document.querySelector('#advanced-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, advancedSession, "!document.querySelector('#advanced-drawer').hidden"),
+      "Advanced fixture controls",
+    );
+    await waitFor(
+      async () => evaluate(cdp, advancedSession, `
+        document.querySelectorAll('[data-graph-node^="effect:"]').length === 2 &&
+        document.querySelectorAll('[data-graph-node^="modulator:"]').length === 1
+      `),
+      "Advanced fixture effect and modulator nodes",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, advancedSession, `({
+        effects: document.querySelectorAll('[data-graph-node^="effect:"]').length,
+        modulators: document.querySelectorAll('[data-graph-node^="modulator:"]').length,
+      })`),
+      { effects: 2, modulators: 1 },
+      "the Advanced QA fixture must exercise effect and modulator nodes",
+    );
+
+    await evaluate(cdp, advancedSession, "document.querySelector('[data-graph-node=\"effect:110\"]').click()");
+    assert.equal(
+      await evaluate(cdp, advancedSession, "document.activeElement.dataset.graphNode"),
+      "effect:110",
+      "an effect graph node must be selectable and focused",
+    );
+    await evaluate(cdp, advancedSession, `(() => {
+      const mix = document.querySelector(
+        '[data-sound-tool="effect"][data-tool-id="110"][data-parameter="mix"]',
+      );
+      mix.value = '0.2';
+      mix.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => evaluate(cdp, advancedSession, `fetch('/api/project')
+      .then((response) => response.json())
+      .then((project) => project.tracks[0].effects[0].parameters.mix === 0.2)`), "Advanced effect edit");
+    await evaluate(cdp, advancedSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => evaluate(cdp, advancedSession, `fetch('/api/project')
+      .then((response) => response.json())
+      .then((project) => project.tracks[0].effects[0].parameters.mix === 0.5)`), "Advanced effect edit undo");
+
+    await evaluate(cdp, advancedSession, "document.querySelector('[data-graph-node=\"modulator:150\"]').click()");
+    assert.equal(
+      await evaluate(cdp, advancedSession, "document.activeElement.dataset.graphNode"),
+      "modulator:150",
+      "a modulator graph node must be selectable and focused",
+    );
+    await evaluate(cdp, advancedSession, `(() => {
+      const depth = document.querySelector(
+        '[data-sound-tool="modulator"][data-tool-id="150"][data-parameter="depth"]',
+      );
+      depth.value = '0.7';
+      depth.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await waitFor(async () => evaluate(cdp, advancedSession, `fetch('/api/project')
+      .then((response) => response.json())
+      .then((project) => project.tracks[0].modulators[0].parameters.depth === 0.7)`), "Advanced modulator edit");
+    await evaluate(cdp, advancedSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => evaluate(cdp, advancedSession, `fetch('/api/project')
+      .then((response) => response.json())
+      .then((project) => project.tracks[0].modulators[0].parameters.depth === 0.4)`), "Advanced modulator edit undo");
+
+    await evaluate(cdp, advancedSession,
+      "document.querySelector('[data-sound-tool=\"modulator\"][data-tool-id=\"150\"][data-parameter=\"enabled\"]').click()");
+    await waitFor(async () => evaluate(cdp, advancedSession, `fetch('/api/project')
+      .then((response) => response.json())
+      .then((project) => !project.tracks[0].modulators[0].enabled)`), "Advanced modulator toggle");
+    await evaluate(cdp, advancedSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => evaluate(cdp, advancedSession, `fetch('/api/project')
+      .then((response) => response.json())
+      .then((project) => project.tracks[0].modulators[0].enabled)`), "Advanced modulator toggle undo");
+
+    await evaluate(cdp, advancedSession,
+      "document.querySelector('[data-sound-tool=\"routing\"][data-tool-id=\"111\"][data-sound-value=\"0\"]').click()");
+    await waitFor(async () => evaluate(cdp, advancedSession, `fetch('/api/project')
+      .then((response) => response.json())
+      .then((project) => project.tracks[0].routing.audio[2] === 'effect:111')`), "Advanced effect reorder");
+    await evaluate(cdp, advancedSession, "document.querySelector('#undo-button').click()");
+    await waitFor(async () => evaluate(cdp, advancedSession, `fetch('/api/project')
+      .then((response) => response.json())
+      .then((project) => project.tracks[0].routing.audio[2] === 'effect:110')`), "Advanced effect reorder undo");
+    await cdp.send("Target.closeTarget", {
+      targetId: (await cdp.send("Target.getTargetInfo", {}, advancedSession)).targetInfo.targetId,
+    });
+    await terminate(advancedApp);
+    advancedApp = null;
     if (await evaluate(cdp, appSession, "Boolean(document.querySelector('.clip-event-list'))")) {
     const projectBeforeClipUiMutation = await evaluate(
       cdp,
@@ -2942,12 +3125,14 @@ async function run() {
     );
   } finally {
     if (attacker) await new Promise((resolve) => attacker.close(resolve));
+    if (advancedApp) await terminate(advancedApp);
     await closeBrowser(cdp, chrome);
     await terminate(app);
     await removeBrowserProfile(profile);
   }
 
   if (appErrors) process.stderr.write(appErrors);
+  if (advancedAppErrors) process.stderr.write(advancedAppErrors);
   if (chrome.exitCode && chromeErrors) process.stderr.write(chromeErrors);
 }
 
