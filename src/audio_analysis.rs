@@ -2,7 +2,7 @@ use std::{collections::HashMap, f32::consts::PI};
 
 use crate::model::{
     Clip, ClipEvent, FILTER_CUTOFF_MAX_HZ, FILTER_CUTOFF_MIN_HZ, FILTER_RESONANCE_MAX,
-    FILTER_RESONANCE_MIN, Project, Track, TrackRole,
+    FILTER_RESONANCE_MIN, Project, Track,
 };
 use crate::prompt::{Action, AutomationPoint};
 
@@ -37,15 +37,6 @@ impl AudioAssetCache {
 #[derive(Clone, Copy)]
 struct AutomationFrame {
     gain: f32,
-}
-
-struct PatternEvent<'a> {
-    event: &'a ClipEvent,
-    time: f32,
-    duration: f32,
-    velocity: f32,
-    onset_index: usize,
-    density_event: bool,
 }
 
 struct ClipOccurrence<'a> {
@@ -741,10 +732,7 @@ fn render_track(
                     .flatten()
                     .unwrap_or(graph_base)
             };
-            let mut value = parameter_at(project, track, render_state, target, base, time);
-            if name == "cutoff" {
-                value += regional_filter_amount(project, track.role, time) * 0.25;
-            }
+            let value = parameter_at(project, track, render_state, target, base, time);
             if applied_instrument_parameters
                 .get(name)
                 .is_none_or(|applied| (*applied - value).abs() > f32::EPSILON)
@@ -909,62 +897,9 @@ fn scheduled_midi_events_before<'a>(
     &midi[start..*event_index]
 }
 
-fn clip_pattern(clip: &Clip) -> (Vec<f32>, Vec<PatternEvent<'_>>) {
-    let mut onsets = clip
-        .events
-        .iter()
-        .map(|event| event.time)
-        .collect::<Vec<_>>();
-    onsets.sort_by(f32::total_cmp);
-    onsets.dedup();
-    let mut pattern = clip
-        .events
-        .iter()
-        .map(|event| PatternEvent {
-            event,
-            time: event.time,
-            duration: event.duration,
-            velocity: event.velocity,
-            onset_index: onsets
-                .iter()
-                .position(|onset| *onset == event.time)
-                .expect("event onset came from this clip"),
-            density_event: false,
-        })
-        .collect::<Vec<_>>();
-    for (onset_index, previous) in onsets.iter().copied().enumerate() {
-        let next = onsets
-            .get(onset_index + 1)
-            .copied()
-            .unwrap_or(onsets[0] + clip.loop_beats);
-        let gap = next - previous;
-        if gap < 0.5 {
-            continue;
-        }
-        let midpoint = (previous + gap / 2.0) % clip.loop_beats;
-        if onsets
-            .iter()
-            .any(|onset| (*onset - midpoint).abs() < 0.000_001)
-        {
-            continue;
-        }
-        for event in clip.events.iter().filter(|event| event.time == previous) {
-            pattern.push(PatternEvent {
-                event,
-                time: midpoint,
-                duration: (event.duration * 0.7).max(0.0625),
-                velocity: (event.velocity * 0.82).max(0.01),
-                onset_index,
-                density_event: true,
-            });
-        }
-    }
-    (onsets, pattern)
-}
-
 fn clip_events_in_window<'a>(
     project: &Project,
-    track: &Track,
+    _track: &Track,
     clip: &'a Clip,
     window_start: f64,
     window_end: f64,
@@ -974,8 +909,7 @@ fn clip_events_in_window<'a>(
     if loop_duration <= 0.0 || window_end <= window_start {
         return Vec::new();
     }
-    let (onsets, pattern) = clip_pattern(clip);
-    if onsets.is_empty() {
+    if clip.events.is_empty() {
         return Vec::new();
     }
     let first_cycle = if clip.playback_mode == "once" {
@@ -991,31 +925,21 @@ fn clip_events_in_window<'a>(
     };
     let mut occurrences = Vec::new();
     for cycle in first_cycle..=last_cycle {
-        for candidate in &pattern {
+        for event in &clip.events {
             let time = f64::from(clip.source_start)
                 + cycle as f64 * loop_duration
-                + f64::from(candidate.time) * beat_duration;
+                + f64::from(event.time) * beat_duration;
             if time < f64::from(clip.start) || time >= f64::from(clip.end) {
                 continue;
             }
             if time < window_start - 0.000_001 || time >= window_end - 0.000_001 {
                 continue;
             }
-            let rhythm = regional_rhythm(project, track.role, time);
-            if candidate.density_event && rhythm <= 0.15 {
-                continue;
-            }
-            if !candidate.density_event
-                && rhythm < -0.15
-                && (cycle as usize * onsets.len() + candidate.onset_index) % 2 != 0
-            {
-                continue;
-            }
             occurrences.push(ClipOccurrence {
-                event: candidate.event,
+                event,
                 time,
-                duration: candidate.duration,
-                velocity: candidate.velocity,
+                duration: event.duration,
+                velocity: event.velocity,
             });
         }
     }
@@ -1438,56 +1362,6 @@ fn project_sample_time(region_start_sample: usize, index: usize) -> f64 {
     project_sample_index(region_start_sample, index) as f64 / f64::from(SAMPLE_RATE)
 }
 
-fn regional_rhythm(project: &Project, role: TrackRole, time: f64) -> f32 {
-    let mut rhythm = 0.0;
-    for edit in &project.edits {
-        if time >= f64::from(edit.start) && time < f64::from(edit.end) {
-            apply_regional_rhythm(
-                &edit.action,
-                role,
-                time,
-                f64::from(edit.start),
-                f64::from(edit.end),
-                &mut rhythm,
-            );
-        }
-    }
-    rhythm
-}
-
-fn apply_regional_rhythm(
-    action: &Action,
-    role: TrackRole,
-    time: f64,
-    start: f64,
-    end: f64,
-    rhythm: &mut f32,
-) {
-    match action {
-        Action::Compound { actions } => {
-            for action in actions {
-                apply_regional_rhythm(action, role, time, start, end, rhythm);
-            }
-        }
-        Action::Timed {
-            start: relative_start,
-            end: relative_end,
-            action,
-        } => {
-            let duration = end - start;
-            let scoped_start = start + duration * f64::from(*relative_start);
-            let scoped_end = start + duration * f64::from(*relative_end);
-            if time >= scoped_start && time < scoped_end {
-                apply_regional_rhythm(action, role, time, scoped_start, scoped_end, rhythm);
-            }
-        }
-        Action::Rhythm { amount, target } if target_matches(*target, role) => {
-            *rhythm += *amount;
-        }
-        _ => {}
-    }
-}
-
 fn parameter_at(
     project: &Project,
     track: &Track,
@@ -1638,7 +1512,7 @@ fn automation_at(
             .audio_clips
             .iter()
             .any(|clip| time >= f64::from(clip.start) && time < f64::from(clip.end));
-    let mut gain = if clip_active {
+    let gain = if clip_active {
         parameter_at(
             project,
             track,
@@ -1650,121 +1524,7 @@ fn automation_at(
     } else {
         0.0
     };
-    for edit in &project.edits {
-        if time >= f64::from(edit.start) && time < f64::from(edit.end) {
-            apply_regional_gain(
-                &edit.action,
-                track.role,
-                time,
-                f64::from(edit.start),
-                f64::from(edit.end),
-                &mut gain,
-            );
-        }
-    }
     AutomationFrame { gain }
-}
-
-fn apply_regional_gain(
-    action: &Action,
-    role: TrackRole,
-    time: f64,
-    start: f64,
-    end: f64,
-    gain: &mut f32,
-) {
-    match action {
-        Action::Compound { actions } => {
-            for action in actions {
-                apply_regional_gain(action, role, time, start, end, gain);
-            }
-        }
-        Action::Timed {
-            start: relative_start,
-            end: relative_end,
-            action,
-        } => {
-            let duration = end - start;
-            let scoped_start = start + duration * f64::from(*relative_start);
-            let scoped_end = start + duration * f64::from(*relative_end);
-            if time >= scoped_start && time < scoped_end {
-                apply_regional_gain(action, role, time, scoped_start, scoped_end, gain);
-            }
-        }
-        Action::Gain { amount, target } if target_matches(*target, role) => {
-            *gain *= *amount;
-        }
-        Action::Mute { target } if target_matches(*target, role) => *gain = 0.0,
-        _ => {}
-    }
-}
-
-fn target_matches(target: Option<TrackRole>, role: TrackRole) -> bool {
-    target.is_none_or(|target| target == role)
-}
-
-fn regional_filter_amount(project: &Project, role: TrackRole, time: f64) -> f32 {
-    let mut amount = 0.0;
-    for edit in &project.edits {
-        if time >= f64::from(edit.start) && time < f64::from(edit.end) {
-            apply_regional_filter(
-                &edit.action,
-                role,
-                time,
-                f64::from(edit.start),
-                f64::from(edit.end),
-                &mut amount,
-            );
-        }
-    }
-    amount
-}
-
-fn apply_regional_filter(
-    action: &Action,
-    role: TrackRole,
-    time: f64,
-    start: f64,
-    end: f64,
-    amount: &mut f32,
-) {
-    match action {
-        Action::Compound { actions } => {
-            for action in actions {
-                apply_regional_filter(action, role, time, start, end, amount);
-            }
-        }
-        Action::Timed {
-            start: relative_start,
-            end: relative_end,
-            action,
-        } => {
-            let duration = end - start;
-            let scoped_start = start + duration * f64::from(*relative_start);
-            let scoped_end = start + duration * f64::from(*relative_end);
-            if time >= scoped_start && time < scoped_end {
-                apply_regional_filter(action, role, time, scoped_start, scoped_end, amount);
-            }
-        }
-        Action::Filter {
-            amount: adjustment,
-            target,
-        } if target_matches(*target, role) => *amount += *adjustment,
-        Action::RemoveEffect { name, target }
-            if target_matches(*target, role) && removes_filter(name) =>
-        {
-            *amount = 0.0;
-        }
-        _ => {}
-    }
-}
-
-fn removes_filter(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase();
-    matches!(normalized.as_str(), "effect" | "effects" | "fx" | "eq")
-        || normalized.contains("low-pass")
-        || normalized.contains("low pass")
-        || normalized.contains("filter")
 }
 
 pub(crate) fn analyze(region: &AudioRegion) -> RegionAnalysis {
@@ -2054,7 +1814,7 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AudioClip, Edit, Modulator};
+    use crate::model::{AudioClip, Edit, Modulator, TrackRole};
     use crate::prompt::AutomationPoint;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2590,55 +2350,40 @@ mod tests {
     }
 
     #[test]
-    fn regional_actions_shape_the_listening_render() {
+    fn legacy_regional_actions_do_not_change_rendered_audio() {
         let mut project = Project::demo();
-        let track_index = project
-            .tracks
-            .iter()
-            .position(|track| track.role == TrackRole::Chords)
-            .expect("demo chords");
-        let track_id = project.tracks[track_index].id;
+        let track_id = project.tracks[2].id;
         let baseline = render_region(&project, &[track_id], 0.0, 2.0).expect("baseline render");
         project.edits.push(Edit {
             id: 9_001,
             operation_id: None,
             start: 0.0,
             end: 2.0,
-            prompt: "Regional listening regression".to_owned(),
-            summary: "Applied regional sound and rhythm".to_owned(),
+            prompt: "Legacy regional edit".to_owned(),
+            summary: "Legacy regional edit".to_owned(),
             action: Action::Compound {
                 actions: vec![
                     Action::Filter {
-                        amount: -0.5,
-                        target: Some(TrackRole::Chords),
-                    },
-                    Action::Effect {
-                        name: "Delay",
-                        mix: 0.8,
-                        target: Some(TrackRole::Chords),
-                    },
-                    Action::RemoveEffect {
-                        name: "Reverb 2",
+                        amount: -0.8,
                         target: Some(TrackRole::Chords),
                     },
                     Action::Rhythm {
                         amount: 0.8,
                         target: Some(TrackRole::Chords),
                     },
+                    Action::Gain {
+                        amount: 0.1,
+                        target: Some(TrackRole::Chords),
+                    },
+                    Action::Mute {
+                        target: Some(TrackRole::Chords),
+                    },
                 ],
             },
         });
-
-        assert!(regional_filter_amount(&project, TrackRole::Chords, 1.0) < 0.0);
-        assert!(removes_filter("EQ"));
-        assert!(regional_rhythm(&project, TrackRole::Chords, 1.0) > 0.15);
-        let active = render_region(&project, &[track_id], 0.0, 2.0).expect("regional render");
-        assert!(active.event_count > baseline.event_count);
-        let difference = sample_difference(&active.samples, &baseline.samples);
-        assert!(
-            difference > 0.000_2,
-            "regional render difference was {difference}"
-        );
+        let rendered = render_region(&project, &[track_id], 0.0, 2.0).expect("legacy render");
+        assert_eq!(rendered.samples, baseline.samples);
+        assert_eq!(rendered.event_count, baseline.event_count);
     }
 
     #[test]
@@ -3299,85 +3044,6 @@ mod tests {
         assert!(midi_at_first_beat.abs() < 0.000_01);
         assert!(sample_difference(&tempo_render.samples, &midi_render.samples) > 0.000_01);
 
-        let mut busy_project = midi_project.clone();
-        busy_project.edits.push(Edit {
-            id: 9_004,
-            operation_id: None,
-            start: 0.0,
-            end: 2.0,
-            prompt: "Make the bass busy".to_owned(),
-            summary: "Added bass movement".to_owned(),
-            action: Action::Rhythm {
-                amount: 0.8,
-                target: Some(TrackRole::Bass),
-            },
-        });
-        let half_beat = first_beat / 2.0;
-        assert!(
-            (midi_onset_at(&busy_project, &busy_project.tracks[track_index], half_beat)
-                .expect("busy midpoint onset")
-                - half_beat)
-                .abs()
-                < 0.000_01
-        );
-        assert!(
-            first_modulator_value_at(&busy_project, &busy_project.tracks[track_index], half_beat,)
-                .abs()
-                < 0.000_01
-        );
-        let mut busy_unmodulated = busy_project.clone();
-        busy_unmodulated.tracks[track_index].modulators.clear();
-
-        let mut sparse_project = midi_project.clone();
-        sparse_project.edits.push(Edit {
-            id: 9_005,
-            operation_id: None,
-            start: 0.0,
-            end: 2.0,
-            prompt: "Make the bass sparse".to_owned(),
-            summary: "Reduced bass movement".to_owned(),
-            action: Action::Rhythm {
-                amount: -0.8,
-                target: Some(TrackRole::Bass),
-            },
-        });
-        assert!(
-            midi_onset_at(
-                &sparse_project,
-                &sparse_project.tracks[track_index],
-                first_beat,
-            )
-            .expect("previous sparse onset")
-            .abs()
-                < 0.000_01
-        );
-        assert!(
-            (first_modulator_value_at(
-                &sparse_project,
-                &sparse_project.tracks[track_index],
-                first_beat,
-            ) - 0.8)
-                .abs()
-                < 0.000_01
-        );
-        let mut sparse_unmodulated = sparse_project.clone();
-        sparse_unmodulated.tracks[track_index].modulators.clear();
-
-        let busy_render =
-            render_region(&busy_project, &[track_id], 0.0, 2.0).expect("busy MIDI render");
-        let busy_unmodulated_render = render_region(&busy_unmodulated, &[track_id], 0.0, 2.0)
-            .expect("busy unmodulated render");
-        let sparse_render =
-            render_region(&sparse_project, &[track_id], 0.0, 2.0).expect("sparse MIDI render");
-        let sparse_unmodulated_render = render_region(&sparse_unmodulated, &[track_id], 0.0, 2.0)
-            .expect("sparse unmodulated render");
-        assert!(
-            sample_difference(&busy_render.samples, &busy_unmodulated_render.samples) > 0.000_01
-        );
-        assert!(
-            sample_difference(&sparse_render.samples, &sparse_unmodulated_render.samples)
-                > 0.000_01
-        );
     }
 
     #[test]
