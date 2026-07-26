@@ -679,50 +679,6 @@ main {
   box-shadow: none;
 }
 
-.audio-clip {
-  border-color: color-mix(in srgb, var(--track-color), white 35%);
-  background: color-mix(in srgb, var(--track-color), transparent 78%);
-}
-
-.audio-waveform,
-.advanced-audio-waveform {
-  position: absolute;
-  right: 7px;
-  bottom: 6px;
-  left: 7px;
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  height: 25px;
-}
-
-.audio-waveform i,
-.advanced-audio-waveform i {
-  flex: 1;
-  height: var(--wave-height);
-  min-width: 1px;
-  border-radius: 1px;
-  background: var(--track-color);
-  opacity: 0.72;
-}
-
-.audio-clip-editor {
-  padding: 10px;
-}
-
-.audio-clip-summary {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.advanced-audio-waveform {
-  position: relative;
-  inset: auto;
-  margin-top: 8px;
-  height: 72px;
-}
-
 .edit-marker {
   position: absolute;
   z-index: 1;

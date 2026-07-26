@@ -9,7 +9,6 @@ use crate::model::{Effect, Instrument, Modulator};
 
 pub(crate) const BLOCK_SIZE: usize = 32;
 pub(crate) const SERIAL_EFFECT_SLOT_COUNT: usize = 8;
-pub(crate) const AUDIO_INPUT_EFFECT_SLOT_COUNT: usize = 1;
 const SERIAL_EFFECT_SLOTS: [&str; SERIAL_EFFECT_SLOT_COUNT] = [
     "FX A1", "FX A2", "FX A3", "FX A4", "FX G1", "FX G2", "FX G3", "FX G4",
 ];
@@ -73,11 +72,6 @@ static EFFECT_PARAMETER_CACHE: OnceLock<Mutex<HashMap<String, BTreeMap<String, f
 static EFFECT_CONTROL_SEMANTICS_CACHE: OnceLock<
     Mutex<HashMap<String, HashMap<String, EffectParameterSemantics>>>,
 > = OnceLock::new();
-#[cfg(test)]
-thread_local! {
-    static ENGINE_CREATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 pub(crate) struct Engine {
     synth: SurgeSynthesizer,
     _guard: MutexGuard<'static, ()>,
@@ -160,8 +154,6 @@ impl Engine {
         sample_rate: f32,
         graph_owns_effects: bool,
     ) -> Result<Self, String> {
-        #[cfg(test)]
-        ENGINE_CREATIONS.set(ENGINE_CREATIONS.get() + 1);
         let guard = SURGE_ENGINE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -397,14 +389,6 @@ impl Engine {
     pub(crate) fn process(&mut self) -> [[f32; BLOCK_SIZE]; 2] {
         self.synth.process();
         self.synth.pull_buffer()
-    }
-
-    pub(crate) fn process_with_input(
-        &mut self,
-        input: [[f32; BLOCK_SIZE]; 2],
-    ) -> [[f32; BLOCK_SIZE]; 2] {
-        self.synth.set_input_buffer(input);
-        self.process()
     }
 
     pub(crate) fn set_effect_mix(&mut self, effect_id: u64, value: f32) -> Result<(), String> {
@@ -1146,16 +1130,6 @@ fn is_common_parameter(name: &str) -> bool {
     ]
     .iter()
     .any(|candidate| name.contains(candidate))
-}
-
-#[cfg(test)]
-pub(crate) fn reset_engine_creation_count() {
-    ENGINE_CREATIONS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn engine_creation_count() -> usize {
-    ENGINE_CREATIONS.get()
 }
 
 pub(crate) const SURGE_EFFECT_TYPES: &[&str] = &[

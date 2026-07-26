@@ -49,7 +49,6 @@ fn vendored_surge_boundary_keeps_pins_and_patched_api() {
     );
 
     let binding = read(root, "vendor/surge-rs/src/glue/synthesizer.rs");
-    assert!(binding.contains("pub fn set_input_buffer"));
     assert!(binding.contains("pub fn pull_buffer"));
     for patched_api in [
         "pub fn parameter_choices",

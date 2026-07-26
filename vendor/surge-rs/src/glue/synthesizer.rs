@@ -49,13 +49,6 @@ impl SurgeSynthesizer {
         unsafe { (*self.ptr).output }
     }
 
-    pub fn set_input_buffer(&mut self, input: [[f32; 32]; 2]) {
-        unsafe {
-            (*self.ptr).input = input;
-            (*self.ptr).process_input = true;
-        }
-    }
-
     pub fn load_patch_by_path(
         &mut self,
         fxp_path: &Path,

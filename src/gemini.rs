@@ -417,54 +417,6 @@ fn execute_tool(
             list_sound_tool_parameters(session.path(), &call.arguments)
                 .unwrap_or_else(|error| format!("Tool error: {error}")),
         )),
-        "resample_audio_region" => {
-            let object = call
-                .arguments
-                .as_object()
-                .ok_or_else(|| invalid("resample arguments must be an object"))?;
-            let render_arguments = serde_json::json!({
-                "tracks": object.get("sourceTracks").cloned().unwrap_or(JsonValue::String("all".to_owned())),
-                "start": object.get("sourceStart").cloned().unwrap_or(JsonValue::Null),
-                "end": object.get("sourceEnd").cloned().unwrap_or(JsonValue::Null)
-            });
-            let output = match prepare_audio_render(session.path(), &render_arguments)
-                .and_then(render_audio)
-            {
-                Ok(audio) => {
-                    state.audio_artifacts += 1;
-                    let name = session
-                        .record_audio(sequence * 1_000_000 + state.audio_artifacts, &audio.wav)
-                        .map_err(PlannerError::Io)?;
-                    let mut arguments = call.arguments.clone();
-                    let arguments_object = arguments
-                        .as_object_mut()
-                        .expect("validated resample arguments object");
-                    arguments_object.insert(
-                        "asset".to_owned(),
-                        JsonValue::String(
-                            session.path().join(&name).to_string_lossy().into_owned(),
-                        ),
-                    );
-                    let duration = object
-                        .get("sourceEnd")
-                        .and_then(JsonValue::as_f64)
-                        .zip(object.get("sourceStart").and_then(JsonValue::as_f64))
-                        .map(|(end, start)| end - start)
-                        .ok_or_else(|| invalid("resample source times must be numbers"))?;
-                    arguments_object
-                        .insert("sourceDuration".to_owned(), serde_json::json!(duration));
-                    apply_and_commit_mutation(
-                        session,
-                        &arguments,
-                        "resample_audio_region",
-                        state,
-                        on_update,
-                    )?
-                }
-                Err(error) => format!("Tool error: {error}"),
-            };
-            Ok(ToolOutput::text(output))
-        }
         name if is_mutation_tool(name) || name == "set_parameter" => Ok(ToolOutput::text(
             apply_and_commit_mutation(session, &call.arguments, name, state, on_update)?,
         )),
@@ -1522,55 +1474,6 @@ mod tests {
         )
         .expect("edited audio");
         assert_eq!(state.audio_listens, 2);
-    }
-
-    #[test]
-    fn multiple_resamples_in_one_interaction_get_unique_artifacts() {
-        let mut project = Project::initial();
-        project.duration = 4.0;
-        let session =
-            EditSession::create(&project, "make two resamples", 0.0, 4.0).expect("session");
-        let mut state = LoopState::default();
-        let mut render_audio = |_: AudioRenderRequest| {
-            Ok(AudioRender {
-                wav: crate::audio_analysis::wav_bytes(&vec![0.1; 16_000]),
-                description: "Rendered one second".to_owned(),
-                measurements: serde_json::json!({}),
-            })
-        };
-        for (index, destination) in [0.0, 1.0].into_iter().enumerate() {
-            let resample = FunctionCall {
-                id: format!("resample-{index}"),
-                name: "resample_audio_region".to_owned(),
-                arguments: serde_json::json!({
-                    "sourceTracks": "all",
-                    "sourceStart": 0.0,
-                    "sourceEnd": 1.0,
-                    "targetTrackId": 1,
-                    "destinationStart": destination,
-                    "label": format!("Slice {}", index + 1),
-                    "gain": 1.0,
-                    "reversed": false
-                }),
-            };
-            execute_tool(
-                &session,
-                2,
-                &resample,
-                &mut state,
-                &mut render_audio,
-                &mut |edit| Ok(edit.project),
-            )
-            .expect("same-interaction resample");
-        }
-
-        let artifacts = std::fs::read_dir(session.path())
-            .expect("session artifacts")
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("audio-"))
-            .count();
-        assert_eq!(artifacts, 2);
-        assert_eq!(state.audio_artifacts, 2);
     }
 
     #[test]
