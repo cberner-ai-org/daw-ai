@@ -374,7 +374,7 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "type": "function",
             "name": READ_TOOL_NAME,
-            "description": "Read the latest DAW-AI sound graph with stable channel, clip, event, instrument, effect, modulator, automation-target, and routing IDs. Call this before editing and again whenever an edit creates IDs needed by a later batch.",
+            "description": "Read the latest DAW-AI sound graph with stable channel, clip, event, instrument, effect, modulator, automation-target, and routing IDs. Call this before editing and after a create call when its returned IDs are needed.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -399,19 +399,18 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             INSTRUMENT_PARAMETER_TOOL_NAME,
-            "Discover exact native Surge XT controls for one track. Use common for concise musical controls and advanced to search all remaining controls. Set a result with set_parameter using its exact parameter value, such as native:123.",
+            "Browse Surge XT by module. Start with only trackId, then copy one module ID into the next call. At a leaf copy parameter into set_parameter, or modulationTarget into add_modulator.target.",
             object_schema(
                 serde_json::json!({
                     "trackId":{"type":"integer","minimum":1},
-                    "group":{"type":"string","enum":["common","advanced"]},
-                    "query":{"type":"string","maxLength":64}
+                    "module":{"type":"string","maxLength":48,"description":"Exact module ID returned by the previous call. Omit to list top-level modules."}
                 }),
-                &["trackId", "group"],
+                &["trackId"],
             ),
         ),
         function(
             SOUND_TOOL_PARAMETER_TOOL_NAME,
-            "Discover the editable controls for one effect or modulator. Use common for the primary musical controls and advanced for routing, envelope, formula, and secondary controls. Apply ordinary results with set_parameter; apply modulator formula source with update_modulator so the full 8192-character value is accepted.",
+            "List editable controls for one effect or modulator. Use common first, advanced for secondary controls. Returned parameter IDs are for update_effect/update_modulator, not modulation targets.",
             object_schema(
                 serde_json::json!({
                     "trackId":{"type":"integer","minimum":1},
@@ -544,7 +543,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "resample_audio_region",
-            "Render selected tracks into a new immutable WAV asset and place it as an audio clip. Use this before slicing, reversing, or rearranging generated material. A track containing audio clips reserves one of Surge XT's eight serial effect slots, so it can have at most seven enabled graph effects.",
+            "Render selected tracks into a new immutable WAV asset and place it as an audio clip. Use this before slicing, reversing, or rearranging generated material. A track containing audio clips reserves one of Surge XT's eight serial effect slots; preset and added effects share the remaining capacity.",
             object_schema(
                 serde_json::json!({
                     "sourceTracks":{"oneOf":[{"type":"string","enum":["all"]},{"type":"array","items":id(),"minItems":1,"maxItems":32,"uniqueItems":true}]},
@@ -601,7 +600,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "add_effect",
-            "Add a named effect with renderer-independent default controls and set its mix. Surge XT supports at most eight enabled graph effects per MIDI-only track or seven on a track containing resampled audio. Graph effects explicitly replace a preset's embedded serial effects. Returns the stable effect ID; read the graph afterward to discover the effect family's exact configurable parameters.",
+            "Append a named effect after the preset's visible embedded effects and set its mix. Surge XT has eight serial slots shared by preset effects and added effects; a track containing resampled audio also reserves one slot for Audio Input. Returns the stable effect ID; use list_sound_tool_parameters to list all of its controls.",
             object_schema(
                 serde_json::json!({"trackId":id(),"name":{"type":"string","enum":["Delay","Reverb 1","Phaser","Rotary Speaker","Distortion","EQ","Frequency Shifter","Conditioner","Chorus","Vocoder","Reverb 2","Flanger","Ring Modulator","Airwindows","Neuron","Graphic EQ","Resonator","CHOW","Exciter","Ensemble","Combulator","Nimbus","Tape","Treemonster","Waveshaper","Mid-Side Tool","Spring Reverb","Bonsai","Floaty Delay","Convolution"]},"mix":{"type":"number","minimum":0,"maximum":1}}),
                 &["trackId", "name", "mix"],
@@ -609,7 +608,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "update_effect",
-            "Update one effect parameter by stable IDs.",
+            "Update one effect control. Copy parameter unchanged from list_sound_tool_parameters.",
             parameter_schema("effectId"),
         ),
         function(
@@ -622,15 +621,17 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "add_modulator",
-            "Add modulation and return its stable ID. Same-track instrument/native targets run inside Surge XT using its LFO, envelope, or Formula (Lua) system; discover exact native:<id> targets with list_instrument_parameters. Cross-track MIDI, audio envelope followers, track volume, and graph-effect targets are DAW routing. Formula is native-only and requires formula source. For sidechain ducking use trigger=audio, the kick sourceTrackId, target=track.volume, and polarity=decrease.",
+            "Add modulation and return its stable ID. Copy target from sound-graph modulationTargets or an instrument leaf's modulationTarget field; never copy its parameter field. Same-track native targets run inside Surge XT. Formula is native-only.",
             object_schema(
-                serde_json::json!({"trackId":id(),"target":{"type":"string","minLength":1,"maxLength":96},"shape":{"type":"string","enum":["sine","triangle","square","random","envelope","formula"]},"formula":{"type":"string","minLength":1,"maxLength":8192},"rate":{"type":"number","minimum":0.01,"maximum":20},"depth":{"type":"number","minimum":0,"maximum":1},"trigger":{"type":"string","enum":["free","midi","audio"]},"sourceTrackId":id(),"attackMs":{"type":"number","minimum":0,"maximum":1000},"releaseMs":{"type":"number","minimum":1,"maximum":5000},"threshold":{"type":"number","minimum":0,"maximum":1},"polarity":{"type":"string","enum":["increase","decrease"]}}),
-                &["trackId", "target", "shape", "rate", "depth", "trigger"],
+                serde_json::json!({"trackId":id(),"target":{"type":"string","minLength":1,"maxLength":96},"shape":{"type":"string","enum":["sine","triangle","square","random","envelope","formula"]},"formula":{"type":"string","minLength":1,"maxLength":8192},"rate":{"type":"number","minimum":0.01,"maximum":20},"rateMode":{"type":"string","enum":["hz","tempo"]},"depth":{"type":"number","minimum":0,"maximum":1},"trigger":{"type":"string","enum":["free","midi","audio"]},"sourceTrackId":id(),"attackMs":{"type":"number","minimum":0,"maximum":1000},"releaseMs":{"type":"number","minimum":1,"maximum":5000},"threshold":{"type":"number","minimum":0,"maximum":1},"polarity":{"type":"string","enum":["increase","decrease"]}}),
+                &[
+                    "trackId", "target", "shape", "rate", "rateMode", "depth", "trigger",
+                ],
             ),
         ),
         function(
             "update_modulator",
-            "Update one modulator parameter by stable IDs, including native Surge Formula source with parameter=formula.",
+            "Update one modulator control. Copy parameter unchanged from list_sound_tool_parameters; parameter=formula accepts full Surge Formula source.",
             parameter_schema_with_value_limit("modulatorId", 8_192),
         ),
         function(
@@ -643,9 +644,9 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "set_parameter",
-            "Set one instrument, effect, modulator, MIDI event, or routing parameter using stable IDs. Discover instrument controls with list_instrument_parameters and effect/modulator controls with list_sound_tool_parameters before changing unfamiliar controls. Surge preset defaults remain unchanged until an explicit override.",
+            "Set one control. Copy an editableParameter ID from parameter discovery; instrument.* and effect:* are modulation target IDs and are invalid here.",
             object_schema(
-                serde_json::json!({"trackId":id(),"tool":{"type":"string","enum":["instrument","effect","modulator","event","routing"]},"toolId":id(),"clipId":{"type":"integer","minimum":0},"parameter":{"type":"string","minLength":1,"maxLength":64},"value":{"type":"string","minLength":1,"maxLength":96}}),
+                serde_json::json!({"trackId":id(),"tool":{"type":"string","enum":["instrument","effect","modulator","event","routing"]},"toolId":id(),"clipId":{"type":"integer","minimum":0},"parameter":{"type":"string","minLength":1,"maxLength":64,"description":"Exact editable parameter ID from discovery. Never use a modulationTargets ID."},"value":{"type":"string","minLength":1,"maxLength":96}}),
                 &["trackId", "tool", "toolId", "clipId", "parameter", "value"],
             ),
         ),
@@ -782,27 +783,92 @@ pub(crate) fn list_instrument_parameters(
         .as_object()
         .ok_or_else(|| "tool arguments must be an object".to_owned())?;
     let track_id = required_id(object, "trackId")?;
-    let group = required_string(object, "group")?;
-    if !matches!(group, "common" | "advanced") {
-        return Err("group must be common or advanced".to_owned());
-    }
-    let query = object
-        .get("query")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let module = object.get("module").and_then(JsonValue::as_str);
     let project = current_project(session_path)?;
     let track = project
         .tracks
         .iter()
         .find(|track| track.id == track_id)
         .ok_or_else(|| format!("track {track_id} does not exist"))?;
-    let parameters = crate::surge::instrument_parameters(&track.instrument.preset)
-        .into_iter()
-        .filter(|parameter| parameter.common == (group == "common"))
-        .filter(|parameter| {
-            query.is_empty() || parameter.name.to_ascii_lowercase().contains(&query)
+    let parameters = crate::surge::instrument_parameters_for_instrument(&track.instrument);
+    if module.is_none() {
+        let mut global = module_entry(
+            "global",
+            "Global",
+            module_parameters(&parameters, "global").len(),
+        );
+        global["state"] = serde_json::json!(module_state(&parameters, "global"));
+        return Ok(serde_json::json!({
+            "trackId": track_id,
+            "preset": track.instrument.preset,
+            "midiContext": surge_midi_context(&parameters),
+            "modules": [
+                module_entry("quick", "Quick Controls", 8),
+                global,
+                module_entry("scene:a", "Scene A", 0),
+                module_entry("scene:b", "Scene B", 0),
+                module_entry("effects", "Effects", track.effects.len())
+            ]
         })
+        .to_string());
+    }
+    let module = module.expect("checked module");
+    if matches!(module, "scene:a" | "scene:b") {
+        let scene = module.strip_prefix("scene:").expect("scene module");
+        return Ok(serde_json::json!({
+            "trackId": track_id,
+            "preset": track.instrument.preset,
+            "module": module,
+            "modules": scene_modules(scene, &parameters)
+        })
+        .to_string());
+    }
+    if matches!(module, "scene:a/lfos" | "scene:b/lfos") {
+        let scene = module
+            .strip_prefix("scene:")
+            .and_then(|value| value.strip_suffix("/lfos"))
+            .expect("LFO module");
+        return Ok(serde_json::json!({
+            "trackId": track_id,
+            "preset": track.instrument.preset,
+            "module": module,
+            "modules": lfo_modules(scene, &parameters)
+        })
+        .to_string());
+    }
+    if module == "effects" {
+        let modules = track
+            .effects
+            .iter()
+            .map(|effect| {
+                serde_json::json!({
+                    "id": format!("effect:{}", effect.id),
+                    "name": effect.name,
+                    "source": if effect.preset_slot.is_some() { "preset" } else { "added" },
+                    "nextTool": SOUND_TOOL_PARAMETER_TOOL_NAME,
+                    "nextArguments": {
+                        "trackId": track_id,
+                        "tool": "effect",
+                        "toolId": effect.id,
+                        "group": "common"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        return Ok(serde_json::json!({
+            "trackId": track_id,
+            "preset": track.instrument.preset,
+            "module": module,
+            "modules": modules
+        })
+        .to_string());
+    }
+    let selected = module_parameters(&parameters, module);
+    if selected.is_empty() {
+        return Err("unknown instrument module".to_owned());
+    }
+    let parameters = selected
+        .into_iter()
         .map(|parameter| {
             let legacy_override =
                 crate::surge::legacy_instrument_parameter_override(&track.instrument, parameter.id);
@@ -818,7 +884,7 @@ pub(crate) fn list_instrument_parameters(
                 .native_overrides
                 .contains_key(&parameter.id)
                 || legacy_override.is_some();
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "parameter": format!("native:{}", parameter.id),
                 "graphParameter": crate::surge::instrument_graph_parameter(
                     &track.instrument.preset,
@@ -828,17 +894,270 @@ pub(crate) fn list_instrument_parameters(
                 "value": value,
                 "presetValue": parameter.value,
                 "display": parameter.display,
-                "overridden": overridden
-            })
+                "overridden": overridden,
+                "kind": if parameter.boolean {
+                    "boolean"
+                } else if !parameter.choices.is_empty() || parameter.discrete {
+                    "selection"
+                } else {
+                    "continuous"
+                },
+                "mutationTool":"set_parameter"
+            });
+            if parameter.voice_modulatable && parameter.scene_modulatable {
+                value["modulationTarget"] = serde_json::json!(format!("native:{}", parameter.id));
+            }
+            if !parameter.choices.is_empty() {
+                value["choices"] = serde_json::json!(
+                    parameter
+                        .choices
+                        .iter()
+                        .map(|(value, display)| serde_json::json!({
+                            "value": value,
+                            "display": display
+                        }))
+                        .collect::<Vec<_>>()
+                );
+            }
+            for (field, enabled) in [
+                ("bipolar", parameter.bipolar),
+                ("tempoSync", parameter.tempo_sync),
+                ("supportsDeactivation", parameter.can_deactivate),
+                ("deactivated", parameter.deactivated),
+            ] {
+                if enabled {
+                    value[field] = JsonValue::Bool(true);
+                }
+            }
+            value
         })
         .collect::<Vec<_>>();
     Ok(serde_json::json!({
         "trackId": track_id,
         "preset": track.instrument.preset,
-        "group": group,
+        "module": module,
+        "idType": "editableParameter",
         "parameters": parameters
     })
     .to_string())
+}
+
+fn surge_midi_context(parameters: &[crate::surge::InstrumentParameter]) -> JsonValue {
+    let display = |name: &str| {
+        parameters
+            .iter()
+            .find(|parameter| parameter.name == name)
+            .map(|parameter| parameter.display.clone())
+    };
+    serde_json::json!({
+        "recommendedRange": null,
+        "sceneMode": display("Scene Mode"),
+        "splitPoint": display("Split Point"),
+        "sceneA": {
+            "octave": display("Scene A Octave"),
+            "pitch": display("Scene A Pitch")
+        },
+        "sceneB": {
+            "octave": display("Scene B Octave"),
+            "pitch": display("Scene B Pitch")
+        }
+    })
+}
+
+fn module_entry(id: &str, name: &str, count: usize) -> JsonValue {
+    let mut value = serde_json::json!({"id":id,"name":name});
+    if count > 0 {
+        value["parameterCount"] = serde_json::json!(count);
+    }
+    value
+}
+
+fn scene_modules(scene: &str, parameters: &[crate::surge::InstrumentParameter]) -> Vec<JsonValue> {
+    [
+        ("voice", "Voice"),
+        ("osc:1", "Oscillator 1"),
+        ("osc:2", "Oscillator 2"),
+        ("osc:3", "Oscillator 3"),
+        ("ring:1x2", "Ring Modulation 1×2"),
+        ("ring:2x3", "Ring Modulation 2×3"),
+        ("noise", "Noise"),
+        ("output", "Mixer and Output"),
+        ("filter-routing", "Filter Routing and Waveshaper"),
+        ("filter:1", "Filter 1"),
+        ("filter:2", "Filter 2"),
+        ("envelope:amp", "Amp Envelope"),
+        ("envelope:filter", "Filter Envelope"),
+        ("lfos", "LFOs"),
+    ]
+    .into_iter()
+    .map(|(suffix, name)| {
+        let id = format!("scene:{scene}/{suffix}");
+        let count = if suffix == "lfos" {
+            0
+        } else {
+            module_parameters(parameters, &id).len()
+        };
+        let mut entry = module_entry(&id, name, count);
+        let state = module_state(parameters, &id);
+        if !state.is_empty() {
+            entry["state"] = serde_json::json!(state);
+        }
+        entry
+    })
+    .collect()
+}
+
+fn lfo_modules(scene: &str, parameters: &[crate::surge::InstrumentParameter]) -> Vec<JsonValue> {
+    ["voice", "scene"]
+        .into_iter()
+        .flat_map(|kind| {
+            (1..=6).map(move |number| {
+                let id = format!("scene:{scene}/lfo:{kind}:{number}");
+                let name = if kind == "voice" {
+                    format!("Voice LFO {number}")
+                } else {
+                    format!("Scene LFO {number}")
+                };
+                let mut entry = module_entry(&id, &name, 13);
+                entry["state"] = serde_json::json!(module_state(parameters, &id));
+                entry
+            })
+        })
+        .collect()
+}
+
+fn module_state(parameters: &[crate::surge::InstrumentParameter], module: &str) -> Vec<JsonValue> {
+    let suffixes: &[&str] = match module.rsplit('/').next().unwrap_or(module) {
+        "global" => &["Global Volume", "Active Scene", "Scene Mode"],
+        "voice" => &["Octave", "Pitch", "Play Mode"],
+        "osc:1" | "osc:2" | "osc:3" => &["Type", "Octave", "Pitch", "Volume"],
+        "noise" => &["Color", "Volume", "Route"],
+        "output" => &["Volume", "Pan", "Width"],
+        "filter-routing" => &[
+            "Filter Configuration",
+            "Waveshaper Type",
+            "Waveshaper Drive",
+        ],
+        "filter:1" | "filter:2" => &["Type", "Cutoff", "Resonance"],
+        "envelope:amp" | "envelope:filter" => &["Attack", "Decay", "Sustain", "Release"],
+        leaf if leaf.starts_with("lfo:") => &["Type", "Rate", "Trigger Mode"],
+        _ => &[],
+    };
+    let selected = module_parameters(parameters, module);
+    suffixes
+        .iter()
+        .filter_map(|suffix| {
+            selected
+                .iter()
+                .find(|parameter| parameter.name.ends_with(suffix))
+                .map(|parameter| {
+                    serde_json::json!({
+                        "name": suffix,
+                        "display": parameter.display
+                    })
+                })
+        })
+        .collect()
+}
+
+fn module_parameters<'a>(
+    parameters: &'a [crate::surge::InstrumentParameter],
+    module: &str,
+) -> Vec<&'a crate::surge::InstrumentParameter> {
+    let matches = |parameter: &&crate::surge::InstrumentParameter| {
+        let name = parameter.name.as_str();
+        match module {
+            "quick" => crate::surge::instrument_graph_parameter("Init", parameter.id).is_some(),
+            "global" => !name.starts_with("Scene ") && !is_effect_slot_parameter(name),
+            _ => scene_module_matches(name, module),
+        }
+    };
+    parameters.iter().filter(matches).collect()
+}
+
+fn is_effect_slot_parameter(name: &str) -> bool {
+    let Some(slot) = name.strip_prefix("FX ") else {
+        return false;
+    };
+    matches!(
+        slot.as_bytes(),
+        [b'A' | b'B' | b'S' | b'G', b'1'..=b'4', b' ', ..]
+    )
+}
+
+fn scene_module_matches(name: &str, module: &str) -> bool {
+    let Some(path) = module.strip_prefix("scene:") else {
+        return false;
+    };
+    let Some((scene, leaf)) = path.split_once('/') else {
+        return false;
+    };
+    let scene_name = match scene {
+        "a" => "Scene A ",
+        "b" => "Scene B ",
+        _ => return false,
+    };
+    let Some(local) = name.strip_prefix(scene_name) else {
+        return false;
+    };
+    match leaf {
+        "voice" => [
+            "Octave",
+            "Pitch",
+            "Portamento",
+            "Play Mode",
+            "FM Routing",
+            "FM Depth",
+            "Osc Drift",
+            "Keytrack Root Key",
+            "Pitch Bend Up Range",
+            "Pitch Bend Down Range",
+            "VCA Gain",
+            "Velocity > VCA Gain",
+        ]
+        .contains(&local),
+        "osc:1" | "osc:2" | "osc:3" => {
+            let number = leaf.strip_prefix("osc:").expect("oscillator leaf");
+            local.starts_with(&format!("Osc {number} "))
+        }
+        "ring:1x2" => local.starts_with("Ring Modulation 1x2 "),
+        "ring:2x3" => local.starts_with("Ring Modulation 2x3 "),
+        "noise" => local.starts_with("Noise "),
+        "output" => {
+            matches!(local, "Volume" | "Pan" | "Width")
+                || (local.starts_with("Send FX ") && local.ends_with(" Level"))
+        }
+        "filter-routing" => matches!(
+            local,
+            "Pre-Filter Gain"
+                | "Feedback"
+                | "Filter Configuration"
+                | "Filter Balance"
+                | "Highpass"
+                | "Waveshaper Type"
+                | "Waveshaper Drive"
+        ),
+        "filter:1" => local.starts_with("Filter 1 "),
+        "filter:2" => local.starts_with("Filter 2 ") || local == "Link Resonance",
+        "envelope:amp" => local.starts_with("Amp EG "),
+        "envelope:filter" => local.starts_with("Filter EG "),
+        _ => lfo_module_matches(local, leaf),
+    }
+}
+
+fn lfo_module_matches(local: &str, leaf: &str) -> bool {
+    let Some(specifier) = leaf.strip_prefix("lfo:") else {
+        return false;
+    };
+    let Some((kind, number)) = specifier.split_once(':') else {
+        return false;
+    };
+    let prefix = match kind {
+        "voice" => format!("LFO {number} "),
+        "scene" => format!("Scene LFO {number} "),
+        _ => return false,
+    };
+    local.starts_with(&prefix)
 }
 
 pub(crate) fn list_sound_tool_parameters(
@@ -868,6 +1187,13 @@ pub(crate) fn list_sound_tool_parameters(
                 .iter()
                 .find(|effect| effect.id == tool_id)
                 .ok_or_else(|| format!("effect {tool_id} does not exist"))?;
+            let semantics = crate::surge::effect_parameter_semantics(
+                &track.instrument,
+                &track.effects,
+                &track.routing.effect_order,
+                track.id,
+                effect.id,
+            );
             let mut values = vec![
                 serde_json::json!({"parameter":"enabled","name":"Enabled","value":effect.enabled,"type":"boolean","common":true}),
                 serde_json::json!({"parameter":"mix","name":"Mix","value":effect.mix,"minimum":0,"maximum":1,"common":true}),
@@ -878,22 +1204,34 @@ pub(crate) fn list_sound_tool_parameters(
             if let Some(value) = effect.resonance {
                 values.push(serde_json::json!({"parameter":"resonance","name":"Resonance","value":value,"minimum":0.1,"maximum":20,"unit":"Q","common":true}));
             }
+            let mut discovered = crate::surge::effect_parameter_values(&effect.name);
+            for (parameter, value) in &effect.parameters {
+                if discovered.contains_key(parameter) {
+                    discovered.insert(parameter.clone(), *value);
+                }
+            }
+            let parameters = discovered.iter().collect::<Vec<_>>();
             values.extend(
-                crate::model::effect_parameter_specs(&effect.name)
-                    .iter()
+                parameters
+                    .into_iter()
                     .enumerate()
-                    .filter_map(|(index, spec)| {
-                        let value = effect.parameters.get(spec.name)?;
-                        Some(serde_json::json!({
-                            "parameter":spec.name,
-                            "name":display_parameter_name(spec.name),
-                            "value":value,
-                            "minimum":0,
-                            "maximum":1,
-                            "common":index < 2
-                        }))
+                    .map(|(index, (parameter, value))| {
+                        let mut discovered = serde_json::json!({
+                                "parameter":parameter,
+                                "name":display_parameter_name(parameter),
+                                "value":value,
+                                "minimum":0,
+                                "maximum":1,
+                        "common":index < 6
+                            });
+                        add_effect_semantics(&mut discovered, semantics.get(parameter.as_str()));
+                        discovered
                     }),
             );
+            for value in &mut values {
+                let parameter = value["parameter"].as_str().unwrap_or_default();
+                add_effect_semantics(value, semantics.get(parameter));
+            }
             values
         }
         "modulator" => {
@@ -921,20 +1259,78 @@ pub(crate) fn list_sound_tool_parameters(
         _ => return Err("tool must be effect or modulator".to_owned()),
     };
     let common = group == "common";
+    let mutation_tool = if tool == "effect" {
+        "update_effect"
+    } else {
+        "update_modulator"
+    };
     Ok(serde_json::json!({
         "trackId":track_id,
         "tool":tool,
         "toolId":tool_id,
         "group":group,
-        "parameters":parameters.into_iter().filter(|parameter| parameter["common"] == common).collect::<Vec<_>>()
+        "idType":"editableParameter",
+        "source": if tool == "effect" {
+            track.effects.iter().find(|effect| effect.id == tool_id)
+                .map(|effect| if effect.preset_slot.is_some() {"preset"} else {"added"})
+        } else { None },
+        "parameters":parameters.into_iter().filter(|parameter| parameter["common"] == common).map(|mut parameter| {
+            parameter.as_object_mut().expect("parameter object").insert(
+                "mutationTool".to_owned(),
+                JsonValue::String(mutation_tool.to_owned())
+            );
+            parameter
+        }).collect::<Vec<_>>()
     })
     .to_string())
 }
 
+fn add_effect_semantics(
+    value: &mut JsonValue,
+    semantics: Option<&crate::surge::EffectParameterSemantics>,
+) {
+    let Some(semantics) = semantics else {
+        return;
+    };
+    value["display"] = JsonValue::String(semantics.display.clone());
+    value["kind"] = JsonValue::String(
+        if semantics.boolean {
+            "boolean"
+        } else if !semantics.choices.is_empty() || semantics.discrete {
+            "selection"
+        } else {
+            "continuous"
+        }
+        .to_owned(),
+    );
+    if !semantics.choices.is_empty() {
+        value["choices"] = serde_json::json!(
+            semantics
+                .choices
+                .iter()
+                .map(|(value, display)| serde_json::json!({
+                    "value": value,
+                    "display": display
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+    for (field, enabled) in [
+        ("bipolar", semantics.bipolar),
+        ("tempoSync", semantics.tempo_sync),
+        ("supportsDeactivation", semantics.can_deactivate),
+        ("deactivated", semantics.deactivated),
+    ] {
+        if enabled {
+            value[field] = JsonValue::Bool(true);
+        }
+    }
+}
+
 fn display_parameter_name(name: &str) -> String {
     let mut display = String::new();
-    for character in name.chars() {
-        if character.is_ascii_uppercase() {
+    for (index, character) in name.chars().enumerate() {
+        if index > 0 && character.is_ascii_uppercase() {
             display.push(' ');
         }
         display.push(character);
@@ -1070,6 +1466,7 @@ pub(crate) fn apply_agent_mutation(
         .as_object()
         .ok_or_else(|| "tool arguments must be an object".to_owned())?;
     let mut result_id = None;
+    let mut midi_context = None;
     let summary = match name {
         "new_track" => {
             let role = required_role(object, "role")?;
@@ -1138,6 +1535,16 @@ pub(crate) fn apply_agent_mutation(
                     preset_id,
                 )
                 .map_err(studio_error_message)?;
+            let instrument = &studio
+                .project()
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .expect("configured track")
+                .instrument;
+            midi_context = Some(surge_midi_context(
+                &crate::surge::instrument_parameters_for_instrument(instrument),
+            ));
             format!("Loaded Surge XT preset {preset_id} on track {track_id}")
         }
         "add_midi_clip" => {
@@ -1263,9 +1670,21 @@ pub(crate) fn apply_agent_mutation(
             let track_id = required_id(object, "trackId")?;
             let target = required_string(object, "target")?;
             let shape = required_string(object, "shape")?;
+            if !matches!(
+                shape,
+                "sine" | "triangle" | "square" | "random" | "envelope" | "formula"
+            ) {
+                return Err(
+                    "shape must be sine, triangle, square, random, envelope, or formula".to_owned(),
+                );
+            }
             let rate = required_number(object, "rate")? as f32;
+            let rate_mode = required_string(object, "rateMode")?;
             let depth = required_number(object, "depth")? as f32;
             let trigger = required_string(object, "trigger")?;
+            if !matches!(trigger, "free" | "midi" | "audio") {
+                return Err("trigger must be free, midi, or audio".to_owned());
+            }
             let source_track_id = object.get("sourceTrackId").and_then(JsonValue::as_u64);
             let attack_ms = optional_number(object, "attackMs", 5.0)? as f32;
             let release_ms = optional_number(object, "releaseMs", 180.0)? as f32;
@@ -1285,6 +1704,7 @@ pub(crate) fn apply_agent_mutation(
                         target,
                         shape,
                         rate,
+                        rate_mode,
                         depth,
                         trigger,
                         source_track_id,
@@ -1320,7 +1740,7 @@ pub(crate) fn apply_agent_mutation(
             let value = required_string(object, "value")?;
             studio
                 .configure_sound_tool(track_id, tool, tool_id, clip_id, parameter, value)
-                .map_err(studio_error_message)?;
+                .map_err(|error| parameter_error_message(error, tool, tool_id, parameter))?;
             format!("Set {tool} {tool_id} {parameter} on track {track_id}")
         }
         "set_track_volume" => {
@@ -1383,13 +1803,49 @@ pub(crate) fn apply_agent_mutation(
         }
         return Err(error);
     }
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "message": summary,
         "version": studio.project().version,
         "id": result_id,
         "channels": sound_tool_inventory(studio.project())
-    })
-    .to_string())
+    });
+    if let Some(context) = midi_context {
+        response["midiContext"] = context;
+    }
+    if let Some(display) = mutation_display(studio.project(), name, object) {
+        response["display"] = JsonValue::String(display);
+    }
+    Ok(response.to_string())
+}
+
+fn mutation_display(
+    project: &Project,
+    mutation: &str,
+    arguments: &Map<String, JsonValue>,
+) -> Option<String> {
+    let track_id = arguments.get("trackId")?.as_u64()?;
+    let track = project.tracks.iter().find(|track| track.id == track_id)?;
+    let parameter = arguments.get("parameter")?.as_str()?;
+    if mutation == "set_parameter" && arguments.get("tool")?.as_str()? == "instrument" {
+        let native_id = parameter.strip_prefix("native:")?.parse::<i32>().ok()?;
+        return crate::surge::instrument_parameters_for_instrument(&track.instrument)
+            .into_iter()
+            .find(|candidate| candidate.id == native_id)
+            .map(|candidate| candidate.display);
+    }
+    if mutation == "update_effect" {
+        let effect_id = arguments.get("effectId")?.as_u64()?;
+        return crate::surge::effect_parameter_semantics(
+            &track.instrument,
+            &track.effects,
+            &track.routing.effect_order,
+            track.id,
+            effect_id,
+        )
+        .remove(parameter)
+        .map(|semantics| semantics.display);
+    }
+    None
 }
 
 fn edit_selection(session_path: &Path) -> Result<(f32, f32), String> {
@@ -1550,6 +2006,13 @@ fn clip_arguments(
         .and_then(JsonValue::as_object)
         .ok_or_else(|| "playback must be an object".to_owned())?;
     let playback_mode = required_string(playback, "mode")?;
+    let maximum_events = if playback_mode == "loop" { 32 } else { 128 };
+    if events.len() > maximum_events {
+        return Err(format!(
+            "{playback_mode} has {} events; maximum is {maximum_events}",
+            events.len()
+        ));
+    }
     let loop_beats = match playback_mode {
         "loop" => required_number(playback, "lengthBeats")? as f32,
         "once" => duration_beats,
@@ -1588,10 +2051,31 @@ fn update_parameter(
     let value = required_string(object, "value")?;
     studio
         .configure_sound_tool(track_id, tool, tool_id, None, parameter, value)
-        .map_err(studio_error_message)?;
+        .map_err(|error| parameter_error_message(error, tool, tool_id, parameter))?;
     Ok(format!(
         "Updated {tool} {tool_id} {parameter} on track {track_id}"
     ))
+}
+
+fn parameter_error_message(
+    error: StudioError,
+    tool: &str,
+    tool_id: u64,
+    parameter: &str,
+) -> String {
+    if tool == "instrument"
+        && (parameter.starts_with("instrument.") || parameter.starts_with("effect:"))
+    {
+        return "modulation target used as editable parameter; use a discovered parameter ID"
+            .to_owned();
+    }
+    match error {
+        StudioError::UnknownSoundTool => format!("{tool} {tool_id} not found"),
+        StudioError::InvalidSoundTool => {
+            format!("invalid {tool} parameter or value: {parameter}")
+        }
+        other => studio_error_message(other),
+    }
 }
 
 fn plan_json(summary: &str) -> String {
@@ -2011,28 +2495,15 @@ fn studio_error_message(error: StudioError) -> String {
         StudioError::InvalidSelection => {
             "The selected region is outside the sound graph duration.".to_owned()
         }
-        StudioError::UnknownTrack => concat!(
-            "An action targets a track that does not exist. Use a published track ID and role, ",
-            "or add the role before editing it."
-        )
-        .to_owned(),
-        StudioError::InvalidMix => "A mixer value is outside its published range.".to_owned(),
-        StudioError::InvalidChannel => "A channel change exceeds the sound graph limits.".to_owned(),
-        StudioError::UnknownSoundTool => concat!(
-            "An action references a sound-tool, clip, or event ID that is not in sound-graph.json. ",
-            "Read the graph again and use its stable IDs."
-        )
-        .to_owned(),
-        StudioError::InvalidSoundTool => concat!(
-            "A sound-tool value or connection is incompatible or outside its published range. ",
-            "Use modulationTargets and the ranges in the graph contract."
-        )
-        .to_owned(),
-        StudioError::EffectCapacity => concat!(
-            "The Surge XT serial effect chain is full. Delete or disable an effect before adding ",
-            "another; tracks with resampled audio reserve one native slot for Audio Input."
-        )
-        .to_owned(),
+        StudioError::UnknownTrack => "track not found; call read_sound_graph".to_owned(),
+        StudioError::InvalidMix => "mixer value out of range".to_owned(),
+        StudioError::InvalidChannel => "channel limit exceeded".to_owned(),
+        StudioError::LastTrack => "cannot delete the only track; create another first".to_owned(),
+        StudioError::UnknownSoundTool => {
+            "sound-tool ID not found; call read_sound_graph".to_owned()
+        }
+        StudioError::InvalidSoundTool => "invalid sound-tool parameter or value".to_owned(),
+        StudioError::EffectCapacity => "effect chain full: 8 slots; audio input uses 1".to_owned(),
     }
 }
 
@@ -2374,19 +2845,174 @@ mod tests {
         }
         let session =
             EditSession::create(&project, "inspect migrated controls", 0.0, 1.0).expect("session");
+        let preset_cutoff_display =
+            crate::surge::instrument_parameters(&project.tracks[1].instrument.preset)
+                .into_iter()
+                .find(|parameter| {
+                    crate::surge::instrument_graph_parameter(
+                        &project.tracks[1].instrument.preset,
+                        parameter.id,
+                    ) == Some("cutoff")
+                })
+                .expect("preset cutoff")
+                .display;
 
         let response = list_instrument_parameters(
             session.path(),
-            &serde_json::json!({"trackId":track_id,"group":"common","query":"cutoff"}),
+            &serde_json::json!({"trackId":track_id,"module":"quick"}),
         )
         .expect("instrument parameters");
         let response: JsonValue = serde_json::from_str(&response).expect("parameter JSON");
         let cutoff = response["parameters"]
             .as_array()
-            .and_then(|parameters| parameters.first())
+            .and_then(|parameters| {
+                parameters
+                    .iter()
+                    .find(|parameter| parameter["graphParameter"] == "cutoff")
+            })
             .expect("cutoff parameter");
         assert!((cutoff["value"].as_f64().expect("cutoff value") - 0.123).abs() < 0.000_001);
         assert_eq!(cutoff["overridden"], true);
+        assert_ne!(cutoff["display"], preset_cutoff_display);
+    }
+
+    #[test]
+    fn instrument_parameter_listing_browses_small_native_modules() {
+        let project = Project::demo();
+        let track_id = project.tracks[1].id;
+        let session = EditSession::create(&project, "browse controls", 0.0, 1.0).expect("session");
+        let index: JsonValue = serde_json::from_str(
+            &list_instrument_parameters(session.path(), &serde_json::json!({"trackId":track_id}))
+                .expect("module index"),
+        )
+        .expect("module JSON");
+        let modules = index["modules"].as_array().expect("modules");
+        assert_eq!(modules.len(), 5);
+        assert_eq!(modules[0]["id"], "quick");
+        assert!(index["midiContext"].is_object());
+        assert!(index["midiContext"]["recommendedRange"].is_null());
+        assert!(index.to_string().len() < 2_000);
+
+        let scene: JsonValue = serde_json::from_str(
+            &list_instrument_parameters(
+                session.path(),
+                &serde_json::json!({"trackId":track_id,"module":"scene:a"}),
+            )
+            .expect("scene modules"),
+        )
+        .expect("scene JSON");
+        assert!(scene["modules"].as_array().expect("scene modules").len() >= 10);
+        assert!(scene.to_string().len() < 6_000);
+        assert!(
+            scene["modules"]
+                .as_array()
+                .expect("scene modules")
+                .iter()
+                .find(|module| module["id"] == "scene:a/osc:1")
+                .and_then(|module| module["state"].as_array())
+                .is_some_and(|state| state.len() == 4)
+        );
+
+        let oscillator: JsonValue = serde_json::from_str(
+            &list_instrument_parameters(
+                session.path(),
+                &serde_json::json!({"trackId":track_id,"module":"scene:a/osc:1"}),
+            )
+            .expect("oscillator parameters"),
+        )
+        .expect("oscillator JSON");
+        assert_eq!(
+            oscillator["parameters"]
+                .as_array()
+                .expect("parameters")
+                .len(),
+            16
+        );
+        let oscillator_parameters = oscillator["parameters"].as_array().expect("parameters");
+        assert_eq!(oscillator["idType"], "editableParameter");
+        assert!(
+            oscillator_parameters
+                .iter()
+                .any(|parameter| { parameter["modulationTarget"] == parameter["parameter"] })
+        );
+        let mute = oscillator_parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "Scene A Osc 1 Mute")
+            .expect("oscillator mute");
+        assert_eq!(mute["kind"], "boolean");
+        assert!(mute.get("modulationTarget").is_none());
+        assert!(oscillator.to_string().len() < 12_000);
+
+        let filter: JsonValue = serde_json::from_str(
+            &list_instrument_parameters(
+                session.path(),
+                &serde_json::json!({"trackId":track_id,"module":"scene:a/filter:1"}),
+            )
+            .expect("filter parameters"),
+        )
+        .expect("filter JSON");
+        let selection = filter["parameters"]
+            .as_array()
+            .expect("filter parameters")
+            .iter()
+            .find(|parameter| parameter["kind"] == "selection")
+            .expect("Surge selection control");
+        let choice = selection["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .expect("Surge selection choice");
+        assert!(
+            choice["display"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        let mutation: JsonValue = serde_json::from_str(
+            &apply_agent_mutation(
+                session.path(),
+                "set_parameter",
+                &serde_json::json!({
+                    "trackId":track_id,
+                    "tool":"instrument",
+                    "toolId":project.tracks[1].instrument.id,
+                    "clipId":0,
+                    "parameter":selection["parameter"],
+                    "value":choice["value"].to_string()
+                }),
+            )
+            .expect("set Surge selection"),
+        )
+        .expect("mutation JSON");
+        assert_eq!(mutation["display"], choice["display"]);
+        session.take_update().unwrap().expect("selection update");
+
+        let lfos: JsonValue = serde_json::from_str(
+            &list_instrument_parameters(
+                session.path(),
+                &serde_json::json!({"trackId":track_id,"module":"scene:b/lfos"}),
+            )
+            .expect("LFO modules"),
+        )
+        .expect("LFO JSON");
+        assert_eq!(lfos["modules"].as_array().expect("LFO modules").len(), 12);
+        assert!(lfos.to_string().len() < 6_000);
+
+        let lfo: JsonValue = serde_json::from_str(
+            &list_instrument_parameters(
+                session.path(),
+                &serde_json::json!({"trackId":track_id,"module":"scene:b/lfo:scene:4"}),
+            )
+            .expect("LFO parameters"),
+        )
+        .expect("LFO JSON");
+        assert_eq!(lfo["parameters"].as_array().expect("parameters").len(), 13);
+        let rate = lfo["parameters"]
+            .as_array()
+            .expect("parameters")
+            .iter()
+            .find(|parameter| parameter["name"] == "Scene B Scene LFO 4 Rate")
+            .expect("LFO rate");
+        assert_eq!(rate["tempoSync"], true);
+        assert!(lfo.to_string().len() < 10_000);
     }
 
     #[test]
@@ -2418,15 +3044,12 @@ mod tests {
     }
 
     #[test]
-    fn effect_discovery_preserves_the_declared_musical_order() {
+    fn effect_discovery_exposes_only_native_surge_names() {
         let mut project = Project::demo();
         let track = &mut project.tracks[0];
         let effect = &mut track.effects[0];
         effect.name = "Delay".to_owned();
-        effect.parameters = crate::model::effect_parameter_specs("Delay")
-            .iter()
-            .map(|spec| (spec.name.to_owned(), spec.default))
-            .collect();
+        effect.parameters = crate::surge::effect_parameter_values("Delay");
         let track_id = track.id;
         let effect_id = effect.id;
         let session = EditSession::create(&project, "inspect delay", 0.0, 1.0).expect("session");
@@ -2442,13 +3065,166 @@ mod tests {
         )
         .expect("effect parameters");
         let response: JsonValue = serde_json::from_str(&response).expect("parameter JSON");
+        assert_eq!(response["idType"], "editableParameter");
         let names = response["parameters"]
             .as_array()
             .expect("parameters")
             .iter()
             .filter_map(|parameter| parameter["parameter"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["enabled", "mix", "time", "feedback"]);
+        assert_eq!(&names[..2], ["enabled", "mix"]);
+        assert!(names.contains(&"Feedback"));
+        assert!(!names.contains(&"time"));
+        let mix = response["parameters"]
+            .as_array()
+            .expect("parameters")
+            .iter()
+            .find(|parameter| parameter["parameter"] == "mix")
+            .expect("mix");
+        assert!(mix["display"].is_string());
+        assert!(mix["kind"].is_string());
+    }
+
+    #[test]
+    fn generic_effect_discovery_uses_only_named_surge_controls_with_semantics() {
+        let mut project = Project::demo();
+        let track = &mut project.tracks[0];
+        let effect = &mut track.effects[0];
+        effect.name = "Exciter".to_owned();
+        effect.parameters.clear();
+        let track_id = track.id;
+        let effect_id = effect.id;
+        let session = EditSession::create(&project, "inspect exciter", 0.0, 1.0).expect("session");
+        let response: JsonValue = serde_json::from_str(
+            &list_sound_tool_parameters(
+                session.path(),
+                &serde_json::json!({
+                    "trackId":track_id,
+                    "tool":"effect",
+                    "toolId":effect_id,
+                    "group":"common"
+                }),
+            )
+            .expect("effect parameters"),
+        )
+        .expect("parameter JSON");
+        let parameters = response["parameters"].as_array().expect("parameters");
+        assert!(!parameters.is_empty());
+        assert!(
+            parameters
+                .iter()
+                .filter(|parameter| {
+                    !matches!(parameter["parameter"].as_str(), Some("enabled" | "mix"))
+                })
+                .all(|parameter| {
+                    !parameter["parameter"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("Param "))
+                        && parameter["display"].is_string()
+                        && parameter["kind"].is_string()
+                        && !parameter["name"]
+                            .as_str()
+                            .is_some_and(|name| name.starts_with(' '))
+                })
+        );
+    }
+
+    #[test]
+    fn every_discovered_native_effect_parameter_is_editable() {
+        let mut project = Project::demo();
+        let track = &mut project.tracks[0];
+        let effect = &mut track.effects[0];
+        effect.name = "Graphic EQ".to_owned();
+        effect.parameters = crate::surge::effect_parameter_values("Graphic EQ");
+        let track_id = track.id;
+        let effect_id = effect.id;
+        let session =
+            EditSession::create(&project, "edit discovered EQ band", 0.0, 1.0).expect("session");
+        let response: JsonValue = serde_json::from_str(
+            &list_sound_tool_parameters(
+                session.path(),
+                &serde_json::json!({
+                    "trackId":track_id,
+                    "tool":"effect",
+                    "toolId":effect_id,
+                    "group":"advanced"
+                }),
+            )
+            .expect("effect parameters"),
+        )
+        .expect("parameter JSON");
+        let parameter = response["parameters"]
+            .as_array()
+            .expect("parameters")
+            .iter()
+            .find_map(|parameter| parameter["parameter"].as_str())
+            .expect("native effect parameter");
+        let mutation: JsonValue = serde_json::from_str(
+            &apply_agent_mutation(
+                session.path(),
+                "update_effect",
+                &serde_json::json!({
+                    "trackId":track_id,
+                    "effectId":effect_id,
+                    "parameter":parameter,
+                    "value":"0.75"
+                }),
+            )
+            .expect("discovered parameter update"),
+        )
+        .expect("mutation JSON");
+        assert!(
+            mutation["display"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        let (_, updated) = session.take_update().unwrap().expect("published update");
+        assert_eq!(
+            updated.tracks[0].effects[0].parameters.get(parameter),
+            Some(&0.75)
+        );
+    }
+
+    #[test]
+    fn mutation_errors_and_modulator_rate_mode_are_explicit() {
+        let initial = Project::initial();
+        let session =
+            EditSession::create(&initial, "exercise concise mutations", 0.0, 1.0).expect("session");
+        let error = apply_agent_mutation(
+            session.path(),
+            "delete_track",
+            &serde_json::json!({"trackId":initial.tracks[0].id}),
+        )
+        .expect_err("only track cannot be deleted");
+        assert_eq!(error, "cannot delete the only track; create another first");
+
+        let project = Project::demo();
+        let track = &project.tracks[1];
+        let session =
+            EditSession::create(&project, "add tempo modulation", 0.0, 1.0).expect("session");
+        apply_agent_mutation(
+            session.path(),
+            "add_modulator",
+            &serde_json::json!({
+                "trackId":track.id,
+                "target":"instrument.cutoff",
+                "shape":"sine",
+                "rate":2,
+                "rateMode":"tempo",
+                "depth":0.5,
+                "trigger":"free"
+            }),
+        )
+        .expect("tempo-synced modulator");
+        let (_, updated) = session.take_update().unwrap().expect("modulator update");
+        assert_eq!(
+            updated.tracks[1]
+                .modulators
+                .last()
+                .expect("new modulator")
+                .rate_mode,
+            "tempo"
+        );
     }
 
     #[test]
@@ -2726,7 +3502,8 @@ mod tests {
         assert_eq!(pads["suggestedRoles"][0], "chords");
 
         let catalog: JsonValue = serde_json::from_str(
-            &list_surge_presets(&serde_json::json!({"path":"Factory/Pads"})).expect("Pads catalog"),
+            &list_surge_presets(&serde_json::json!({"path":"Factory/Leads"}))
+                .expect("Leads catalog"),
         )
         .expect("catalog JSON");
         assert_eq!(catalog["parent"], "Factory");
@@ -2735,24 +3512,53 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|preset| preset["id"] == "Factory/Pads/Flux Capacitor")
+                .any(|preset| preset["id"] == "Factory/Leads/Scream Lead")
         );
 
+        let preset_with_effects = crate::surge_presets::catalog()
+            .into_iter()
+            .find(|preset| {
+                crate::surge::preset_effects(&preset.id).is_ok_and(|effects| !effects.is_empty())
+            })
+            .expect("factory preset with embedded effects");
         let session =
             EditSession::create(&Project::demo(), "change the patch", 0.0, 2.0).expect("session");
-        apply_agent_mutation(
+        let added_effect_ids = Project::demo().tracks[2]
+            .effects
+            .iter()
+            .map(|effect| effect.id)
+            .collect::<Vec<_>>();
+        let response = apply_agent_mutation(
             session.path(),
             "set_surge_preset",
             &serde_json::json!({
                 "trackId":3,
-                "presetId":"Factory/Pads/Flux Capacitor"
+                "presetId":preset_with_effects.id
             }),
         )
         .expect("factory preset mutation");
+        let response: JsonValue = serde_json::from_str(&response).expect("mutation JSON");
+        assert!(response["midiContext"]["sceneMode"].is_string());
+        assert!(response["midiContext"]["recommendedRange"].is_null());
         let (_, project) = session.take_update().unwrap().expect("published update");
+        assert_eq!(project.tracks[2].instrument.preset, preset_with_effects.id);
+        assert!(
+            !project.tracks[2].effects.is_empty()
+                && project.tracks[2]
+                    .effects
+                    .iter()
+                    .any(|effect| effect.preset_slot.is_some()),
+            "factory effects must be visible as preset-sourced graph effects"
+        );
+        assert!(added_effect_ids.iter().all(|id| {
+            project.tracks[2]
+                .effects
+                .iter()
+                .any(|effect| effect.id == *id && effect.preset_slot.is_none())
+        }));
         assert_eq!(
-            project.tracks[2].instrument.preset,
-            "Factory/Pads/Flux Capacitor"
+            project.tracks[2].routing.effect_order.len(),
+            project.tracks[2].effects.len()
         );
     }
 
@@ -2815,7 +3621,7 @@ mod tests {
             }),
         )
         .expect_err("loop event budget");
-        assert!(error.contains("outside its published range"), "{error}");
+        assert_eq!(error, "loop has 33 events; maximum is 32");
     }
 
     #[test]
@@ -2945,7 +3751,7 @@ mod tests {
             &serde_json::json!({"trackId":2,"volume":1.51}),
         )
         .expect_err("out-of-range volume");
-        assert!(error.contains("mixer value is outside"));
+        assert_eq!(error, "mixer value out of range");
         assert!(session.take_update().unwrap().is_none());
 
         apply_agent_mutation(
@@ -2969,7 +3775,7 @@ mod tests {
         let response = apply_agent_mutation(
             session.path(),
             "add_effect",
-            &serde_json::json!({"trackId":2,"name":"Drive","mix":0.5}),
+            &serde_json::json!({"trackId":2,"name":"Distortion","mix":0.5}),
         )
         .expect("add effect");
         let effect_id = serde_json::from_str::<JsonValue>(&response).unwrap()["id"]
