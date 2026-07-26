@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -19,8 +19,22 @@ const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 type Object = Map<String, JsonValue>;
 
 pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
-    let value =
+    let mut value: JsonValue =
         serde_json::from_str(source).map_err(|error| invalid(format!("invalid JSON: {error}")))?;
+    let schema_version = value
+        .as_object()
+        .and_then(|root| root.get("schemaVersion"))
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|version| *version <= 2)
+                .ok_or_else(|| invalid("schemaVersion is unsupported"))
+        })
+        .transpose()?
+        .unwrap_or(1);
+    if schema_version < 2 {
+        migrate_legacy_effect_dependencies(&mut value)?;
+    }
     let root = object(&value, "sound graph")?;
     let name = limited_string(root, "name", 1, 160)?;
     let bpm = integer(root, "bpm")?;
@@ -41,11 +55,14 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
 
     let mut ids = HashSet::new();
     let mut event_ids = HashSet::new();
-    let tracks = track_values
+    let mut tracks = track_values
         .iter()
         .enumerate()
         .map(|(index, value)| parse_track(value, index, duration, &mut ids, &mut event_ids))
         .collect::<Result<Vec<_>, _>>()?;
+    if schema_version < 2 {
+        materialize_legacy_preset_effects(&mut tracks, &mut ids, &event_ids)?;
+    }
     let track_ids = tracks.iter().map(|track| track.id).collect::<HashSet<_>>();
     let track_ids = track_ids.into_iter().collect::<Vec<_>>();
     if tracks.iter().any(|track| {
@@ -140,6 +157,201 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         edit_operations,
         channel_operations,
     })
+}
+
+fn migrate_legacy_effect_dependencies(value: &mut JsonValue) -> Result<(), ProjectFileError> {
+    let mut effects = HashMap::new();
+    if let Some(tracks) = value.get("tracks").and_then(JsonValue::as_array) {
+        for track in tracks {
+            if let Some(track_effects) = track.get("effects").and_then(JsonValue::as_array) {
+                for effect in track_effects {
+                    if let (Some(id), Some(name)) = (
+                        effect.get("id").and_then(JsonValue::as_u64),
+                        effect.get("name").and_then(JsonValue::as_str),
+                    ) {
+                        effects.insert(id, name.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tracks) = value.get_mut("tracks").and_then(JsonValue::as_array_mut) {
+        for track in tracks {
+            if let Some(modulators) = track
+                .get_mut("modulators")
+                .and_then(JsonValue::as_array_mut)
+            {
+                for modulator in modulators {
+                    let Some(target) = modulator.get("target").and_then(JsonValue::as_str) else {
+                        continue;
+                    };
+                    if let Some((target, _, _)) = migrate_effect_target(target, &effects) {
+                        modulator["target"] = JsonValue::String(target);
+                    }
+                }
+            }
+            if let Some(connections) = track
+                .get_mut("routing")
+                .and_then(|routing| routing.get_mut("control"))
+                .and_then(JsonValue::as_array_mut)
+            {
+                for connection in connections {
+                    let Some(target) = connection.get("target").and_then(JsonValue::as_str) else {
+                        continue;
+                    };
+                    if let Some((target, _, _)) = migrate_effect_target(target, &effects) {
+                        connection["target"] = JsonValue::String(target);
+                    }
+                }
+            }
+            if let Some(edges) = track
+                .get_mut("routing")
+                .and_then(|routing| routing.get_mut("edges"))
+                .and_then(JsonValue::as_array_mut)
+            {
+                for edge in edges {
+                    let Some(target) = edge.get("target").and_then(JsonValue::as_str) else {
+                        continue;
+                    };
+                    if let Some((target, _, _)) = migrate_effect_target(target, &effects) {
+                        edge["target"] = JsonValue::String(target);
+                    }
+                }
+            }
+            for collection in ["modulationTargets", "automationTargets"] {
+                if let Some(targets) = track.get_mut(collection).and_then(JsonValue::as_array_mut) {
+                    for target in targets {
+                        let Some(id) = target.get("id").and_then(JsonValue::as_str) else {
+                            continue;
+                        };
+                        if let Some((id, _, _)) = migrate_effect_target(id, &effects) {
+                            target["id"] = JsonValue::String(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(edits) = value.get_mut("edits").and_then(JsonValue::as_array_mut) {
+        for edit in edits {
+            if let Some(action) = edit.get_mut("action") {
+                migrate_legacy_action_dependencies(action, &effects)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_action_dependencies(
+    value: &mut JsonValue,
+    effects: &HashMap<u64, String>,
+) -> Result<(), ProjectFileError> {
+    if value.get("type").and_then(JsonValue::as_str) == Some("automation") {
+        if let Some(target) = value.get("name").and_then(JsonValue::as_str) {
+            if let Some((target, effect_name, parameter)) = migrate_effect_target(target, effects) {
+                if let Some(points) = value.get_mut("points").and_then(JsonValue::as_array_mut) {
+                    for point in points {
+                        let Some(number) = point.get("value").and_then(JsonValue::as_f64) else {
+                            continue;
+                        };
+                        let migrated = migrate_effect_parameter_value(
+                            &effect_name,
+                            &parameter,
+                            number as f32,
+                        )?;
+                        point["value"] = serde_json::Number::from_f64(f64::from(migrated))
+                            .map(JsonValue::Number)
+                            .ok_or_else(|| invalid("legacy automation value is invalid"))?;
+                    }
+                }
+                value["name"] = JsonValue::String(target);
+            }
+        }
+    }
+    match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                migrate_legacy_action_dependencies(value, effects)?;
+            }
+        }
+        JsonValue::Object(object) => {
+            for value in object.values_mut() {
+                migrate_legacy_action_dependencies(value, effects)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn migrate_effect_target(
+    target: &str,
+    effects: &HashMap<u64, String>,
+) -> Option<(String, String, String)> {
+    let suffix = target.strip_prefix("effect:")?;
+    let (id, parameter) = suffix.split_once('.')?;
+    let effect_name = effects.get(&id.parse::<u64>().ok()?)?;
+    let native = persisted_effect_parameter(effect_name, parameter)?;
+    (native != parameter).then(|| {
+        (
+            format!("effect:{id}.{native}"),
+            effect_name.clone(),
+            parameter.to_owned(),
+        )
+    })
+}
+
+fn materialize_legacy_preset_effects(
+    tracks: &mut [Track],
+    ids: &mut HashSet<u64>,
+    event_ids: &HashSet<u64>,
+) -> Result<(), ProjectFileError> {
+    let mut next_id = ids
+        .iter()
+        .chain(event_ids)
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| invalid("sound graph IDs are exhausted"))?;
+    for track in tracks {
+        if track
+            .effects
+            .iter()
+            .any(|effect| effect.preset_slot.is_some())
+            || !crate::surge_presets::is_factory_id(&track.instrument.preset)
+        {
+            continue;
+        }
+        let mut preset = crate::surge::preset_effects(&track.instrument.preset)
+            .map_err(|_| invalid("could not migrate factory preset effects"))?;
+        if preset.is_empty() {
+            continue;
+        }
+        for effect in &mut preset {
+            while ids.contains(&next_id) || event_ids.contains(&next_id) {
+                next_id = next_id
+                    .checked_add(1)
+                    .filter(|id| *id <= MAX_SAFE_INTEGER)
+                    .ok_or_else(|| invalid("sound graph IDs are exhausted"))?;
+            }
+            effect.id = next_id;
+            ids.insert(next_id);
+            next_id = next_id
+                .checked_add(1)
+                .filter(|id| *id <= MAX_SAFE_INTEGER)
+                .ok_or_else(|| invalid("sound graph IDs are exhausted"))?;
+        }
+        let mut order = preset.iter().map(|effect| effect.id).collect::<Vec<_>>();
+        order.extend(track.routing.effect_order.iter().copied());
+        preset.append(&mut track.effects);
+        track.effects = preset;
+        track.routing.effect_order = order;
+        if !crate::model::track_effects_fit(track, !track.audio_clips.is_empty()) {
+            return Err(invalid("migrated factory effects exceed serial capacity"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_track(
@@ -238,7 +450,7 @@ fn parse_track(
     }
     let effects = effect_values
         .iter()
-        .map(|value| parse_effect(value, ids))
+        .map(|value| parse_effect(value, ids, &instrument))
         .collect::<Result<Vec<_>, _>>()?;
     let mut preset_slots = HashSet::new();
     if effects
@@ -383,7 +595,11 @@ fn parse_audio_clip(
     })
 }
 
-fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, ProjectFileError> {
+fn parse_effect(
+    value: &JsonValue,
+    ids: &mut HashSet<u64>,
+    instrument: &Instrument,
+) -> Result<Effect, ProjectFileError> {
     let effect = object(value, "effect")?;
     let id = unique_id(effect, "id", ids, "effect")?;
     expect_type(effect, "effect")?;
@@ -457,7 +673,7 @@ fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, Pro
             .map(|slot| (slot - 1) as usize)
         })
         .transpose()?;
-    Ok(Effect {
+    let parsed = Effect {
         id,
         name,
         preset_slot,
@@ -467,7 +683,24 @@ fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, Pro
         enabled: boolean(effect, "enabled")?,
         parameters: extra_parameters,
         parameter_overrides,
-    })
+    };
+    let semantics = crate::surge::effect_parameter_semantics(
+        instrument,
+        std::slice::from_ref(&parsed),
+        &[parsed.id],
+        1,
+        parsed.id,
+    );
+    for (parameter, value) in &parsed.parameters {
+        if semantics.get(parameter).is_some_and(|semantics| {
+            !semantics.choices.is_empty() && (semantics.value - value).abs() >= 0.000_01
+        }) {
+            return Err(invalid(format!(
+                "effect parameter {parameter} must match a Surge XT choice"
+            )));
+        }
+    }
+    Ok(parsed)
 }
 
 fn persisted_effect_name(name: &str) -> &str {
@@ -1585,6 +1818,91 @@ mod tests {
     }
 
     #[test]
+    fn rejects_imported_values_between_native_effect_choices() {
+        let mut project = Project::demo();
+        let track = &mut project.tracks[1];
+        let (effect, parameter) = crate::surge::SURGE_EFFECT_TYPES
+            .iter()
+            .filter(|name| **name != "Off" && **name != "Audio Input")
+            .find_map(|name| {
+                let candidate = Effect {
+                    id: 99_002,
+                    name: (*name).to_owned(),
+                    preset_slot: None,
+                    mix: 0.5,
+                    cutoff_hz: None,
+                    resonance: None,
+                    enabled: true,
+                    parameters: crate::surge::effect_parameter_values(name),
+                    parameter_overrides: Vec::new(),
+                };
+                crate::surge::effect_parameter_semantics(
+                    &track.instrument,
+                    std::slice::from_ref(&candidate),
+                    &[candidate.id],
+                    track.id,
+                    candidate.id,
+                )
+                .into_iter()
+                .find(|(_, semantics)| !semantics.choices.is_empty())
+                .map(|(parameter, _)| (candidate, parameter))
+            })
+            .expect("native effect selection");
+        track.effects = vec![effect];
+        track.effects[0].parameters.insert(parameter, 0.123_456);
+        track.routing.effect_order = vec![99_002];
+
+        let error = parse_project(&project.to_json()).expect_err("in-between native choice");
+        assert!(error.to_string().contains("must match a Surge XT choice"));
+    }
+
+    #[test]
+    fn materializes_factory_effects_when_upgrading_a_legacy_graph() {
+        let mut studio = crate::model::Studio::new();
+        let track_id = studio.project().tracks[1].id;
+        let instrument_id = studio.project().tracks[1].instrument.id;
+        studio
+            .configure_sound_tool(
+                track_id,
+                "instrument",
+                instrument_id,
+                None,
+                "preset",
+                "Factory/Basses/Evilous",
+            )
+            .expect("factory preset");
+        let mut legacy_project = studio.project().clone();
+        let legacy_track = &mut legacy_project.tracks[1];
+        let added_ids = legacy_track
+            .effects
+            .iter()
+            .filter(|effect| effect.preset_slot.is_none())
+            .map(|effect| effect.id)
+            .collect::<HashSet<_>>();
+        legacy_track
+            .effects
+            .retain(|effect| effect.preset_slot.is_none());
+        legacy_track
+            .routing
+            .effect_order
+            .retain(|effect_id| added_ids.contains(effect_id));
+        let mut legacy: JsonValue =
+            serde_json::from_str(&legacy_project.to_json()).expect("project JSON");
+        legacy
+            .as_object_mut()
+            .expect("root")
+            .remove("schemaVersion");
+
+        let migrated = parse_project(&legacy.to_string()).expect("legacy factory graph");
+        assert!(
+            migrated.tracks[1]
+                .effects
+                .iter()
+                .any(|effect| effect.preset_slot.is_some())
+        );
+    }
+
+    #[test]
     fn rejects_native_modulators_beyond_surge_slot_capacity() {
         let mut project = Project::demo();
         let track = &mut project.tracks[1];
@@ -1785,5 +2103,78 @@ mod tests {
         assert!(!effect.parameters.contains_key("lowFrequency"));
         assert!(!effect.parameters.contains_key("lowGain"));
         assert!(!migrated.to_json().contains("Low-pass filter"));
+    }
+
+    #[test]
+    fn migrates_legacy_effect_dependency_targets_and_automation_values() {
+        let mut source: JsonValue =
+            serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+        source
+            .as_object_mut()
+            .expect("root")
+            .remove("schemaVersion");
+        let effect_id = source["tracks"][1]["effects"][0]["id"]
+            .as_u64()
+            .expect("effect ID");
+        let track_id = source["tracks"][1]["id"].clone();
+        source["tracks"][1]["effects"][0]["name"] = JsonValue::String("Low-pass filter".to_owned());
+        source["tracks"][1]["modulators"][0]["target"] =
+            JsonValue::String(format!("effect:{effect_id}.cutoff"));
+        source["tracks"][1]["routing"]["control"][0]["target"] =
+            JsonValue::String(format!("effect:{effect_id}.cutoff"));
+        for edge in source["tracks"][1]["routing"]["edges"]
+            .as_array_mut()
+            .expect("routing edges")
+        {
+            if edge["type"] == "control" {
+                edge["target"] = JsonValue::String(format!("effect:{effect_id}.cutoff"));
+            }
+        }
+        for collection in ["modulationTargets", "automationTargets"] {
+            for target in source["tracks"][1][collection]
+                .as_array_mut()
+                .expect("published targets")
+            {
+                if target["id"] == format!("effect:{effect_id}.Frequency 3") {
+                    target["id"] = JsonValue::String(format!("effect:{effect_id}.cutoff"));
+                }
+            }
+        }
+        source["edits"]
+            .as_array_mut()
+            .expect("edits")
+            .push(serde_json::json!({
+                "id": 99_004,
+                "start": 0,
+                "end": 4,
+                "prompt": "legacy cutoff",
+                "summary": "legacy cutoff automation",
+                "action": {
+                    "type": "automation",
+                    "trackId": track_id,
+                    "target": "bass",
+                    "name": format!("effect:{effect_id}.cutoff"),
+                    "curve": "linear",
+                    "points": [
+                        {"time": 0, "value": 640},
+                        {"time": 1, "value": 1200}
+                    ]
+                }
+            }));
+
+        let migrated = parse_project(&source.to_string()).expect("legacy dependencies");
+        let native_target = format!("effect:{effect_id}.Frequency 3");
+        assert_eq!(migrated.tracks[1].modulators[0].target, native_target);
+        let Action::Automation {
+            parameter, points, ..
+        } = &migrated.edits.last().expect("automation edit").action
+        else {
+            panic!("expected automation");
+        };
+        assert_eq!(parameter, &native_target);
+        assert_eq!(
+            points[0].value,
+            crate::surge::normalize_filter_cutoff(640.0)
+        );
     }
 }

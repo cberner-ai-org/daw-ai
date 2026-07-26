@@ -116,6 +116,7 @@ pub(crate) struct InstrumentParameter {
 
 #[derive(Clone, Debug)]
 pub(crate) struct EffectParameterSemantics {
+    pub(crate) value: f32,
     pub(crate) display: String,
     pub(crate) boolean: bool,
     pub(crate) discrete: bool,
@@ -590,6 +591,7 @@ impl Engine {
         self.synth
             .from_synth_side_id(index, &mut id)
             .then(|| EffectParameterSemantics {
+                value: self.synth.get_parameter01(&mut id),
                 display: self.synth.get_parameter_display(&mut id),
                 boolean: self.synth.parameter_is_boolean(&id),
                 discrete: self.synth.parameter_is_discrete(&id),
@@ -813,21 +815,23 @@ pub(crate) fn instrument_parameter_is_modulatable(
 pub(crate) fn effect_parameter_semantics(
     instrument: &Instrument,
     effects: &[Effect],
-    effect_order: &[u64],
+    _effect_order: &[u64],
     track_id: u64,
     effect_id: u64,
 ) -> HashMap<String, EffectParameterSemantics> {
-    let mut semantic_effects = effects.to_vec();
-    if let Some(effect) = semantic_effects
-        .iter_mut()
+    let Some(mut effect) = effects
+        .iter()
         .find(|effect| effect.id == effect_id)
-    {
-        effect.enabled = true;
-    }
+        .cloned()
+    else {
+        return HashMap::new();
+    };
+    effect.enabled = true;
+    let semantic_order = [effect.id];
     let Ok(engine) = Engine::new(
         instrument,
-        &semantic_effects,
-        effect_order,
+        std::slice::from_ref(&effect),
+        &semantic_order,
         &[],
         track_id,
         48_000.0,
@@ -1615,13 +1619,18 @@ mod tests {
         let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
         let mut effect = crate::model::Project::demo().tracks[1].effects[0].clone();
         effect.enabled = false;
-        let semantics = effect_parameter_semantics(
-            &instrument,
-            std::slice::from_ref(&effect),
-            &[effect.id],
-            1,
-            effect.id,
-        );
+        effect.id = 99;
+        let mut effects = (0..SERIAL_EFFECT_SLOT_COUNT)
+            .map(|index| {
+                let mut enabled = effect.clone();
+                enabled.id = index as u64 + 1;
+                enabled.enabled = true;
+                enabled
+            })
+            .collect::<Vec<_>>();
+        effects.push(effect.clone());
+        let order = effects.iter().map(|effect| effect.id).collect::<Vec<_>>();
+        let semantics = effect_parameter_semantics(&instrument, &effects, &order, 1, effect.id);
 
         assert!(semantics.contains_key("mix"));
         assert!(
