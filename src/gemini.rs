@@ -22,7 +22,7 @@ use crate::gemini_tools::{
 };
 use crate::model::Project;
 #[cfg(test)]
-use crate::model::TrackRole;
+use crate::model::{MIN_MIDI_NOTE_BEATS, TrackRole};
 use crate::prompt::{Action, EditPlan};
 #[cfg(test)]
 use crate::prompt::{AutomationPoint, MAX_COMPOUND_ACTIONS, MidiNote};
@@ -1079,7 +1079,7 @@ fn midi_notes_field(object: &Object, loop_beats: f64) -> Result<Vec<MidiNote>, P
             let pitch = integer_field(event, "pitch")?;
             let velocity = number_field(event, "velocity")?;
             if !(0.0..loop_beats).contains(&time)
-                || !(0.0625..=loop_beats).contains(&duration)
+                || !(f64::from(MIN_MIDI_NOTE_BEATS)..=loop_beats).contains(&duration)
                 || pitch > 127
                 || !(0.01..=1.0).contains(&velocity)
             {
