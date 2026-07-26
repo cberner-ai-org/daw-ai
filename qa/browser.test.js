@@ -2380,6 +2380,26 @@ async function run() {
     await waitFor(async () => evaluate(cdp, appSession,
       "Boolean(document.querySelector('[data-sound-tool=\"instrument\"][data-track-id=\"2\"][data-parameter^=\"native:\"]'))"),
     "native instrument controls");
+    await evaluate(cdp, appSession,
+      "document.querySelector('[data-load-instrument-parameters=\"2:advanced\"]').click()");
+    await waitFor(async () => evaluate(cdp, appSession, `Boolean(
+      [...document.querySelectorAll('[data-channel-track="2"] label')]
+        .find((label) => label.textContent.includes('Osc 1 Mute'))
+        ?.querySelector('select[data-sound-tool="instrument"]')
+    )`), "discrete native instrument control");
+    assert.equal(
+      await evaluate(cdp, appSession, `(() => {
+        const control = [...document.querySelectorAll('[data-channel-track="2"] label')]
+          .find((label) => label.textContent.includes('Osc 1 Mute'))
+          .querySelector('select[data-sound-tool="instrument"]');
+        const target = document.querySelector(
+          '[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"]',
+        );
+        return control.options.length >= 2 && !target.querySelector(\`option[value="\${control.dataset.parameter}"]\`);
+      })()`),
+      true,
+      "discrete controls must use choices and non-modulatable controls must stay out of targets",
+    );
     const nativeParameter = await evaluate(cdp, appSession,
       "document.querySelector('[data-sound-tool=\"instrument\"][data-track-id=\"2\"][data-parameter^=\"native:\"]').dataset.parameter");
     assert.equal(

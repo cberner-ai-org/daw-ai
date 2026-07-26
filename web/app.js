@@ -692,7 +692,7 @@
                 <h4>Common controls</h4>
                 <div class="tool-controls instrument-envelope-controls">
                   ${(state.instrumentParameters[`${track.id}:common`] || []).map((parameter) =>
-                    soundRange(track, "instrument", track.instrument.id, "instrument", parameter.parameter, parameter.value, 0, 1, "%", "", `${parameter.name}${parameter.overridden ? " (overridden)" : ` - preset: ${parameter.display}`}`)
+                    instrumentControl(track, parameter)
                   ).join("")}
                   ${state.instrumentParameters[`${track.id}:common`] ? "" : `<button type="button" data-load-instrument-parameters="${track.id}:common">Show common controls</button>`}
                 </div>
@@ -700,7 +700,7 @@
                   <summary>Advanced controls</summary>
                   <div class="tool-controls">
                     ${(state.instrumentParameters[`${track.id}:advanced`] || []).map((parameter) =>
-                      soundRange(track, "instrument", track.instrument.id, "instrument", parameter.parameter, parameter.value, 0, 1, "%", "", `${parameter.name}${parameter.overridden ? " (overridden)" : ` - preset: ${parameter.display}`}`)
+                      instrumentControl(track, parameter)
                     ).join("")}
                     ${state.instrumentParameters[`${track.id}:advanced`] ? "" : `<button type="button" data-load-instrument-parameters="${track.id}:advanced">Show advanced controls</button>`}
                   </div>
@@ -883,6 +883,38 @@
     </label>`;
   }
 
+  function instrumentControl(track, parameter) {
+    const label = `${parameter.name}${parameter.overridden ? " (overridden)" : ` - preset: ${parameter.display}`}`;
+    const choices = parameter.choices?.length
+      ? parameter.choices
+      : parameter.kind === "boolean"
+        ? [{ value: 0, display: "Off" }, { value: 1, display: "On" }]
+        : [];
+    if (choices.length === 0) {
+      return soundRange(
+        track,
+        "instrument",
+        track.instrument.id,
+        "instrument",
+        parameter.parameter,
+        parameter.value,
+        0,
+        1,
+        "%",
+        "",
+        label,
+      );
+    }
+    const key = `${track.id}-instrument-${track.instrument.id}-${parameter.parameter}`;
+    const accessibleName = `${track.name} instrument #${track.instrument.id} ${parameter.parameter}`;
+    const options = choices
+      .map((choice) => `<option value="${choice.value}" ${Math.abs(choice.value - parameter.value) < 0.00001 ? "selected" : ""}>${escapeHtml(choice.display)}</option>`)
+      .join("");
+    return `<label class="tool-control">${escapeHtml(label)}
+      <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="${parameter.parameter}" data-control-key="${key}" aria-label="${escapeHtml(accessibleName)}">${options}</select>
+    </label>`;
+  }
+
   function soundToggle(track, tool, toolId, name, enabled) {
     const action = enabled ? "Disable" : "Enable";
     const accessibleName = `${action} ${track.name} ${name} ${tool} #${toolId}`;
@@ -956,6 +988,7 @@
   function renderModulator(track, modulator) {
     const nativeTargets = ["common", "advanced"]
       .flatMap((group) => state.instrumentParameters[`${track.id}:${group}`] || [])
+      .filter((parameter) => modulator.trigger !== "audio" && parameter.modulation?.[modulator.trigger])
       .map((parameter) => [parameter.parameter, `Surge: ${parameter.name}`]);
     const targets = [...track.modulationTargets.map((target) => [target.id, target.label]), ...nativeTargets];
     if (!targets.some(([value]) => value === modulator.target)) {

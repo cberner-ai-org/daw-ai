@@ -1490,12 +1490,14 @@ impl Studio {
             Action::Instrument { preset, target } => {
                 let track_index = role_action_track_index(&self.project, *target, None)
                     .ok_or(StudioError::UnknownTrack)?;
-                let instrument = &mut self.project.tracks[track_index].instrument;
-                if !valid_surge_preset(preset) {
-                    return Err(StudioError::InvalidSoundTool);
-                }
-                instrument.preset = (*preset).to_owned();
-                Ok(())
+                let instrument_id = self.project.tracks[track_index].instrument.id;
+                configure_track_preset(
+                    &mut self.project,
+                    track_index,
+                    instrument_id,
+                    preset,
+                    &mut self.next_id,
+                )
             }
             Action::Modulator {
                 parameter,
@@ -1514,13 +1516,30 @@ impl Studio {
                 value,
                 ..
             } => {
-                let track = self
+                let track_index = self
                     .project
                     .tracks
-                    .iter_mut()
-                    .find(|track| track.id == *track_id && track.role == *target)
+                    .iter()
+                    .position(|track| track.id == *track_id && track.role == *target)
                     .ok_or(StudioError::UnknownTrack)?;
-                configure_track_tool(track, tool, *tool_id, *clip_id, parameter, value)
+                if *tool == "instrument" && *parameter == "preset" {
+                    configure_track_preset(
+                        &mut self.project,
+                        track_index,
+                        *tool_id,
+                        value,
+                        &mut self.next_id,
+                    )
+                } else {
+                    configure_track_tool(
+                        &mut self.project.tracks[track_index],
+                        tool,
+                        *tool_id,
+                        *clip_id,
+                        parameter,
+                        value,
+                    )
+                }
             }
             Action::Automation {
                 track_id,
@@ -2201,70 +2220,23 @@ impl Studio {
             .iter()
             .position(|track| track.id == track_id)
             .ok_or(StudioError::UnknownTrack)?;
-        configure_track_tool(
-            &mut project.tracks[track_index],
-            tool,
-            tool_id,
-            clip_id,
-            parameter,
-            value,
-        )?;
         if tool == "instrument" && parameter == "preset" {
-            let track = &mut project.tracks[track_index];
-            let previous_preset_ids = track
-                .effects
-                .iter()
-                .filter_map(|effect| effect.preset_slot.map(|slot| (slot, effect.id)))
-                .collect::<std::collections::HashMap<_, _>>();
-            let added = track
-                .effects
-                .iter()
-                .filter(|effect| effect.preset_slot.is_none())
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut preset =
-                crate::surge::preset_effects(value).map_err(|_| StudioError::InvalidSoundTool)?;
-            for effect in &mut preset {
-                if let Some(id) = effect
-                    .preset_slot
-                    .and_then(|slot| previous_preset_ids.get(&slot))
-                {
-                    effect.id = *id;
-                } else {
-                    effect.id = allocated_next_id;
-                    allocated_next_id = allocated_next_id
-                        .checked_add(1)
-                        .ok_or(StudioError::InvalidSoundTool)?;
-                }
-            }
-            preset.extend(added);
-            track.effects = preset;
-            track.routing.effect_order = track.effects.iter().map(|effect| effect.id).collect();
-            if !track_effects_fit(track, !track.audio_clips.is_empty()) {
-                return Err(StudioError::EffectCapacity);
-            }
-            let available_modulation_targets = modulation_targets(track)
-                .into_iter()
-                .map(|target| target.id)
-                .collect::<std::collections::HashSet<_>>();
-            let previous_effect_ids = previous_preset_ids
-                .values()
-                .copied()
-                .collect::<std::collections::HashSet<_>>();
-            track.modulators.retain(|modulator| {
-                let targets_previous_effect = previous_effect_ids
-                    .iter()
-                    .any(|id| modulator.target.starts_with(&format!("effect:{id}.")));
-                !targets_previous_effect || available_modulation_targets.contains(&modulator.target)
-            });
-            let valid_automation_targets = automation_targets(track)
-                .into_iter()
-                .map(|target| target.id)
-                .collect::<std::collections::HashSet<_>>();
-            project.edits.retain_mut(|edit| {
-                edit.action
-                    .retain_valid_automation(track_id, &valid_automation_targets)
-            });
+            configure_track_preset(
+                &mut project,
+                track_index,
+                tool_id,
+                value,
+                &mut allocated_next_id,
+            )?;
+        } else {
+            configure_track_tool(
+                &mut project.tracks[track_index],
+                tool,
+                tool_id,
+                clip_id,
+                parameter,
+                value,
+            )?;
         }
         let track_ids = project
             .tracks
@@ -2497,6 +2469,78 @@ impl Studio {
         retained.sort_by(|left, right| left.start.total_cmp(&right.start));
         self.project.tracks[track_index].clips = retained;
     }
+}
+
+fn configure_track_preset(
+    project: &mut Project,
+    track_index: usize,
+    instrument_id: u64,
+    preset: &str,
+    next_id: &mut u64,
+) -> Result<(), StudioError> {
+    let track_id = project.tracks[track_index].id;
+    configure_instrument(
+        &mut project.tracks[track_index].instrument,
+        instrument_id,
+        "preset",
+        preset,
+    )?;
+    let track = &mut project.tracks[track_index];
+    let previous_preset_ids = track
+        .effects
+        .iter()
+        .filter_map(|effect| effect.preset_slot.map(|slot| (slot, effect.id)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let added = track
+        .effects
+        .iter()
+        .filter(|effect| effect.preset_slot.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut preset_effects =
+        crate::surge::preset_effects(preset).map_err(|_| StudioError::InvalidSoundTool)?;
+    for effect in &mut preset_effects {
+        if let Some(id) = effect
+            .preset_slot
+            .and_then(|slot| previous_preset_ids.get(&slot))
+        {
+            effect.id = *id;
+        } else {
+            effect.id = *next_id;
+            *next_id = next_id
+                .checked_add(1)
+                .ok_or(StudioError::InvalidSoundTool)?;
+        }
+    }
+    preset_effects.extend(added);
+    track.effects = preset_effects;
+    track.routing.effect_order = track.effects.iter().map(|effect| effect.id).collect();
+    if !track_effects_fit(track, !track.audio_clips.is_empty()) {
+        return Err(StudioError::EffectCapacity);
+    }
+    let available_modulation_targets = modulation_targets(track)
+        .into_iter()
+        .map(|target| target.id)
+        .collect::<std::collections::HashSet<_>>();
+    let previous_effect_ids = previous_preset_ids
+        .values()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    track.modulators.retain(|modulator| {
+        let targets_previous_effect = previous_effect_ids
+            .iter()
+            .any(|id| modulator.target.starts_with(&format!("effect:{id}.")));
+        !targets_previous_effect || available_modulation_targets.contains(&modulator.target)
+    });
+    let valid_automation_targets = automation_targets(track)
+        .into_iter()
+        .map(|target| target.id)
+        .collect::<std::collections::HashSet<_>>();
+    project.edits.retain_mut(|edit| {
+        edit.action
+            .retain_valid_automation(track_id, &valid_automation_targets)
+    });
+    Ok(())
 }
 
 fn configure_track_tool(
@@ -4375,15 +4419,24 @@ mod tests {
         });
 
         studio
-            .configure_sound_tool(
-                track_id,
-                "instrument",
-                instrument_id,
-                None,
-                "preset",
-                preset,
+            .apply_plan(
+                0.0,
+                4.0,
+                "refresh the preset",
+                crate::prompt::EditPlan {
+                    action: Action::Configure {
+                        track_id,
+                        target: TrackRole::Bass,
+                        tool: "instrument",
+                        tool_id: instrument_id,
+                        clip_id: None,
+                        parameter: "preset",
+                        value: preset.to_owned(),
+                    },
+                    summary: "Refreshed the preset".to_owned(),
+                },
             )
-            .expect("refresh same preset");
+            .expect("plan-driven preset refresh");
         assert!(
             studio.project.tracks[1]
                 .effects
@@ -4400,15 +4453,19 @@ mod tests {
         crate::project_file::parse_project(&studio.to_json()).expect("reopen refreshed preset");
 
         studio
-            .configure_sound_tool(
-                track_id,
-                "instrument",
-                instrument_id,
-                None,
-                "preset",
-                "Init",
+            .apply_plan(
+                0.0,
+                4.0,
+                "load init",
+                crate::prompt::EditPlan {
+                    action: Action::Instrument {
+                        preset: "Init",
+                        target: TrackRole::Bass,
+                    },
+                    summary: "Loaded Init".to_owned(),
+                },
             )
-            .expect("preset without embedded effects");
+            .expect("instrument action without embedded effects");
         assert!(
             !studio.project.tracks[1]
                 .effects
