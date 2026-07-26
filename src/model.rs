@@ -437,7 +437,7 @@ impl Project {
     fn write_graph_json(&self, output: &mut String) {
         write!(
             output,
-            "{{\"name\":{},\"bpm\":{},\"duration\":{},\"version\":{},\"tracks\":[",
+            "{{\"schemaVersion\":2,\"name\":{},\"bpm\":{},\"duration\":{},\"version\":{},\"tracks\":[",
             json_string(&self.name),
             self.bpm,
             decimal(self.duration),
