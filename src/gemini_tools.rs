@@ -10,9 +10,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value as JsonValue};
 
 use crate::audio_analysis::{self, MAX_REGION_SECONDS};
+#[cfg(test)]
+use crate::model::TrackRole;
 use crate::model::{
-    MAX_LOOP_PLAYBACK_BEATS, MAX_MIDI_EVENTS_PER_CLIP, MAX_ONCE_PLAYBACK_BEATS, MidiClipSpec,
-    ModulatorSpec, Project, Studio, StudioError, TrackRole, json_string,
+    MAX_LOOP_PLAYBACK_BEATS, MAX_MIDI_EVENTS_PER_CLIP, MAX_ONCE_PLAYBACK_BEATS,
+    MIN_MIDI_NOTE_BEATS, MidiClipSpec, ModulatorSpec, Project, Studio, StudioError,
+    TRACK_COLOR_PALETTE, json_string,
 };
 use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
 use crate::storage::{ProjectStore, replace_text_file};
@@ -453,8 +456,8 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
     let notes = || {
         serde_json::json!({
             "type":"array","maxItems":MAX_MIDI_EVENTS_PER_CLIP,"items":{"type":"object","properties":{
-                "time":{"type":"number","minimum":0,"maximum":256,"description":"Beat offset from the clip start."},
-                "duration":{"type":"number","minimum":0.0625,"maximum":256},
+                "time":{"type":"number","minimum":0,"maximum":256,"description":"Beat offset from the clip start. Differences between event times determine retrigger speed and may be smaller than note duration."},
+                "duration":{"type":"number","minimum":MIN_MIDI_NOTE_BEATS,"maximum":256,"description":"MIDI gate length in beats, independent of spacing between event times. 0.03125 beats is a 1/128 note."},
                 "pitch":{"type":"integer","minimum":0,"maximum":127},
                 "velocity":{"type":"number","minimum":0.01,"maximum":1}
             },"required":["time","duration","pitch","velocity"],"additionalProperties":false}
@@ -475,8 +478,14 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
     vec![
         function(
             "new_track",
-            "Create one Surge XT track with the Init preset, no clips, effects, or modulators. Returns its stable ID.",
-            object_schema(serde_json::json!({}), &[]),
+            "Create one neutral Surge XT track with Init and no clips, effects, or modulators. Choose a short descriptive role label and a color from the palette. Returns its stable ID.",
+            object_schema(
+                serde_json::json!({
+                    "description":{"type":"string","minLength":1,"maxLength":16,"description":"Short role or purpose, such as Snare Build or Bass Drop."},
+                    "color":{"type":"string","enum":TRACK_COLOR_PALETTE,"description":"Display color chosen from the DAW-AI track palette."}
+                }),
+                &["description", "color"],
+            ),
         ),
         function(
             "delete_track",
@@ -1495,8 +1504,16 @@ pub(crate) fn apply_agent_mutation(
     let mut midi_context = None;
     let summary = match name {
         "new_track" => {
+            let description = required_string(object, "description")?;
+            let color = required_string(object, "color")?;
+            if description.trim().is_empty() || description.chars().count() > 16 {
+                return Err("description must contain between 1 and 16 characters".to_owned());
+            }
+            if !TRACK_COLOR_PALETTE.contains(&color) {
+                return Err("color must be chosen from the new_track palette".to_owned());
+            }
             let id = studio
-                .add_empty_channel(TrackRole::Neutral)
+                .add_described_channel(description, color)
                 .map_err(studio_error_message)?;
             result_id = Some(id);
             format!("Created track {id}")
@@ -1912,9 +1929,9 @@ fn clip_arguments(
                 "events[{index}].time must be at least 0 and before the {loop_beats}-beat playback length"
             ));
         }
-        if !(0.0625..=loop_beats).contains(&note.duration) {
+        if !(MIN_MIDI_NOTE_BEATS..=loop_beats).contains(&note.duration) {
             return Err(format!(
-                "events[{index}].duration must be between 0.0625 and {loop_beats} beats"
+                "events[{index}].duration must be between {MIN_MIDI_NOTE_BEATS} and {loop_beats} beats"
             ));
         }
         if !(0.01..=1.0).contains(&note.velocity) {
@@ -2718,6 +2735,14 @@ mod tests {
             midi["parameters"]["properties"]["durationBeats"]["maximum"],
             MAX_ONCE_PLAYBACK_BEATS
         );
+        assert_eq!(
+            midi["parameters"]["properties"]["events"]["maxItems"],
+            MAX_MIDI_EVENTS_PER_CLIP
+        );
+        assert_eq!(
+            midi["parameters"]["properties"]["events"]["items"]["properties"]["duration"]["minimum"],
+            MIN_MIDI_NOTE_BEATS
+        );
         let new_track = declarations
             .iter()
             .find(|tool| tool["name"] == "new_track")
@@ -2727,7 +2752,17 @@ mod tests {
                 .as_object()
                 .expect("new track properties")
                 .len(),
-            0
+            2
+        );
+        assert_eq!(
+            new_track["parameters"]["properties"]["description"]["maxLength"],
+            16
+        );
+        assert_eq!(
+            new_track["parameters"]["properties"]["color"]["enum"]
+                .as_array()
+                .map(Vec::len),
+            Some(TRACK_COLOR_PALETTE.len())
         );
         let update_modulator = declarations
             .iter()
@@ -3274,8 +3309,12 @@ mod tests {
         let original = Project::demo();
         let session =
             EditSession::create(&original, "shape the bass", 4.0, 8.0).expect("edit session");
-        let response = apply_agent_mutation(session.path(), "new_track", &serde_json::json!({}))
-            .expect("new track");
+        let response = apply_agent_mutation(
+            session.path(),
+            "new_track",
+            &serde_json::json!({"description":"Snare Build","color":"#ff91ad"}),
+        )
+        .expect("new track");
         let response: JsonValue = serde_json::from_str(&response).unwrap();
         let track_id = response["id"].as_u64().expect("created track ID");
         let (plan, project) = session.take_update().unwrap().expect("published update");
@@ -3287,7 +3326,8 @@ mod tests {
             .expect("created track");
         assert!(track.clips.is_empty());
         assert_eq!(track.role, TrackRole::Neutral);
-        assert_eq!(track.name, "Track");
+        assert_eq!(track.name, "Snare Build");
+        assert_eq!(track.color, "#ff91ad");
         assert_eq!(track.volume, 1.0);
         assert_eq!(track.instrument.preset, "Init");
         assert!(track.effects.is_empty());
@@ -3303,8 +3343,12 @@ mod tests {
     fn midi_pitches_are_not_constrained_by_track_opinions() {
         let original = Project::initial();
         let session = EditSession::create(&original, "add notes", 0.0, 4.0).expect("edit session");
-        let response = apply_agent_mutation(session.path(), "new_track", &serde_json::json!({}))
-            .expect("new track");
+        let response = apply_agent_mutation(
+            session.path(),
+            "new_track",
+            &serde_json::json!({"description":"Percussion","color":"#67d5e8"}),
+        )
+        .expect("new track");
         let response: JsonValue = serde_json::from_str(&response).unwrap();
         let track_id = response["id"].as_u64().expect("created track ID");
         session.take_update().unwrap().expect("published update");
@@ -3535,6 +3579,45 @@ mod tests {
             error,
             "loop playback length must be between 0.25 and 16 beats"
         );
+    }
+
+    #[test]
+    fn midi_tools_round_trip_1024_one_hundred_twenty_eighth_notes() {
+        let original = Project::initial();
+        let session =
+            EditSession::create(&original, "write a dense roll", 0.0, 4.0).expect("session");
+        let events = (0..MAX_MIDI_EVENTS_PER_CLIP)
+            .map(|index| {
+                serde_json::json!({
+                    "time":index as f32 / 256.0,
+                    "duration":MIN_MIDI_NOTE_BEATS,
+                    "pitch":60,
+                    "velocity":0.8
+                })
+            })
+            .collect::<Vec<_>>();
+        apply_agent_mutation(
+            session.path(),
+            "add_midi_clip",
+            &serde_json::json!({
+                "trackId":1,
+                "label":"Dense roll",
+                "startBeat":0,
+                "durationBeats":4,
+                "playback":{"mode":"once"},
+                "events":events
+            }),
+        )
+        .expect("dense roll");
+        let (_, project) = session.take_update().unwrap().expect("dense update");
+        let clip = project.tracks[0].clips.last().expect("dense clip");
+        assert_eq!(clip.events.len(), MAX_MIDI_EVENTS_PER_CLIP);
+        assert!(
+            clip.events
+                .iter()
+                .all(|event| event.duration == MIN_MIDI_NOTE_BEATS)
+        );
+        Project::from_json(&project.to_json()).expect("dense project round trip");
     }
 
     #[test]

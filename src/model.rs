@@ -9,11 +9,15 @@ const HISTORY_LIMIT: usize = 50;
 const TRACK_LIMIT: usize = 128;
 pub(crate) const EDIT_LOG_LIMIT: usize = 256;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
-pub(crate) const MAX_MIDI_EVENTS_PER_CLIP: usize = 128;
+pub(crate) const MAX_MIDI_EVENTS_PER_CLIP: usize = 1_024;
+pub(crate) const MIN_MIDI_NOTE_BEATS: f32 = 0.03125;
 pub(crate) const MAX_LOOP_PLAYBACK_BEATS: f32 = 16.0;
 pub(crate) const MAX_ONCE_PLAYBACK_BEATS: f32 = 256.0;
 pub(crate) const SURGE_ENGINE: &str = "Surge XT";
 pub(crate) const SURGE_PRESETS: &[&str] = &["Init"];
+pub(crate) const TRACK_COLOR_PALETTE: &[&str] = &[
+    "#ffb86b", "#74e0bc", "#8ca9ff", "#d99cff", "#ff91ad", "#ffd166", "#67d5e8", "#ff6b6b",
+];
 
 pub(crate) fn valid_operation_id(value: &str) -> bool {
     !value.is_empty()
@@ -1584,6 +1588,30 @@ impl Studio {
         Ok(track_id)
     }
 
+    pub(crate) fn add_described_channel(
+        &mut self,
+        description: &str,
+        color: &str,
+    ) -> Result<u64, StudioError> {
+        let description = description.trim();
+        if description.is_empty()
+            || description.chars().count() > 16
+            || !TRACK_COLOR_PALETTE.contains(&color)
+        {
+            return Err(StudioError::InvalidChannel);
+        }
+        let track_id = self.add_empty_channel(TrackRole::Neutral)?;
+        let track = self
+            .project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .expect("newly created track exists");
+        track.name = description.to_owned();
+        track.color = color.to_owned();
+        Ok(track_id)
+    }
+
     pub fn delete_channel(&mut self, track_id: u64) -> Result<(), StudioError> {
         let Some(index) = self
             .project
@@ -2135,7 +2163,7 @@ impl Studio {
                 !note.time.is_finite()
                     || !(0.0..loop_beats).contains(&note.time)
                     || !note.duration.is_finite()
-                    || !(0.0625..=loop_beats).contains(&note.duration)
+                    || !(MIN_MIDI_NOTE_BEATS..=loop_beats).contains(&note.duration)
                     || !note.velocity.is_finite()
                     || !(0.01..=1.0).contains(&note.velocity)
             })
@@ -2505,7 +2533,9 @@ fn configure_track_tool(
                 .ok_or(StudioError::UnknownSoundTool)?;
             match parameter {
                 "time" => event.time = parse_range_exclusive(value, 0.0, clip.loop_beats)?,
-                "duration" => event.duration = parse_range(value, 0.0625, clip.loop_beats)?,
+                "duration" => {
+                    event.duration = parse_range(value, MIN_MIDI_NOTE_BEATS, clip.loop_beats)?
+                }
                 "pitch" => event.pitch = parse_integer_range(value, 0, 127)? as u8,
                 "velocity" => event.velocity = parse_range(value, 0.01, 1.0)?,
                 _ => return Err(StudioError::InvalidSoundTool),
@@ -2587,7 +2617,7 @@ fn validate_clip_fields(
             !note.time.is_finite()
                 || !(0.0..loop_beats).contains(&note.time)
                 || !note.duration.is_finite()
-                || !(0.0625..=loop_beats).contains(&note.duration)
+                || !(MIN_MIDI_NOTE_BEATS..=loop_beats).contains(&note.duration)
                 || !note.velocity.is_finite()
                 || !(0.01..=1.0).contains(&note.velocity)
         })

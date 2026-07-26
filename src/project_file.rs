@@ -4,15 +4,15 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::model::{
     ChannelOperation, ChannelOperationAction, Clip, ClipEvent, Edit, EditOperation, Effect,
-    Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project, ProjectFileError, Routing, SURGE_ENGINE,
-    Track, TrackRole, automation_target_range, valid_operation_id, valid_surge_preset,
+    Instrument, MAX_MIDI_EVENTS_PER_CLIP, MAX_PROMPT_CHARACTERS, MIN_MIDI_NOTE_BEATS, Modulator,
+    Project, ProjectFileError, Routing, SURGE_ENGINE, Track, TrackRole, automation_target_range,
+    valid_operation_id, valid_surge_preset,
 };
 use crate::prompt::{Action, AutomationPoint, MAX_COMPOUND_ACTIONS, MidiNote};
 
 const MAX_TRACKS: usize = 128;
 const MAX_TOOLS_PER_TRACK: usize = 256;
 const MAX_CLIPS_PER_TRACK: usize = 2_048;
-const MAX_EVENTS_PER_CLIP: usize = 2_048;
 const MAX_EDITS: usize = 10_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -650,9 +650,9 @@ fn parse_clip(
         )));
     }
     let event_values = array(clip, "events")?;
-    if event_values.len() > MAX_EVENTS_PER_CLIP {
+    if event_values.len() > MAX_MIDI_EVENTS_PER_CLIP {
         return Err(invalid(format!(
-            "MIDI clips support at most {MAX_EVENTS_PER_CLIP} events"
+            "MIDI clips support at most {MAX_MIDI_EVENTS_PER_CLIP} events"
         )));
     }
     let mut clip_event_ids = HashSet::new();
@@ -694,7 +694,7 @@ fn parse_clip_event(
         id,
         kind,
         time,
-        duration: range(event, "duration", 0.0625, loop_beats)?,
+        duration: range(event, "duration", MIN_MIDI_NOTE_BEATS, loop_beats)?,
         pitch: bounded_integer(event, "pitch", 0, 127)? as u8,
         velocity: range(event, "velocity", 0.01, 1.0)?,
     })
@@ -1050,7 +1050,7 @@ fn parse_midi_note(value: &JsonValue, loop_beats: f32) -> Result<MidiNote, Proje
     }
     Ok(MidiNote {
         time,
-        duration: range(event, "duration", 0.0625, loop_beats)?,
+        duration: range(event, "duration", MIN_MIDI_NOTE_BEATS, loop_beats)?,
         pitch: bounded_integer(event, "pitch", 0, 127)? as u8,
         velocity: range(event, "velocity", 0.01, 1.0)?,
     })
