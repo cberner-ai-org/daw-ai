@@ -280,7 +280,7 @@ fn run_session_with_transport_reference(
         if calls.is_empty() {
             if state.plans.is_empty() {
                 input = JsonValue::String(format!(
-                    "You have not made an edit. Call {READ_TOOL_NAME}, then use a concrete CRUD graph mutation such as new_track, add_midi_clip, or set_parameter. {AUDIO_TOOL_NAME} is available whenever listening would help you decide."
+                    "You have not made an edit. Call {READ_TOOL_NAME}, then use a concrete CRUD graph mutation such as new_track, add_midi_clip, or set_instrument_parameter. {AUDIO_TOOL_NAME} is available whenever listening would help you decide."
                 ));
                 continue;
             }
@@ -465,13 +465,9 @@ fn execute_tool(
             };
             Ok(ToolOutput::text(output))
         }
-        name if is_mutation_tool(name) => Ok(ToolOutput::text(apply_and_commit_mutation(
-            session,
-            &call.arguments,
-            name,
-            state,
-            on_update,
-        )?)),
+        name if is_mutation_tool(name) || name == "set_parameter" => Ok(ToolOutput::text(
+            apply_and_commit_mutation(session, &call.arguments, name, state, on_update)?,
+        )),
         AUDIO_TOOL_NAME => {
             match prepare_audio_render(session.path(), &call.arguments).and_then(render_audio) {
                 Ok(audio) => {
