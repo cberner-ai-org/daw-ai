@@ -169,6 +169,9 @@ fn collect_presets(root: &Path, directory: &Path, presets: &mut Vec<Preset>) {
             .map(|parent| parent.to_string_lossy().replace('\\', "/"))
             .filter(|category| !category.is_empty())
             .unwrap_or_else(|| "Uncategorized".to_owned());
+        if category == "FX" && name == "Aggero" {
+            continue;
+        }
         presets.push(Preset {
             id: format!("{FACTORY_PREFIX}{category}/{name}"),
             category,
@@ -217,6 +220,11 @@ mod tests {
             presets
                 .iter()
                 .any(|preset| preset.id == "Factory/Pads/Flux Capacitor")
+        );
+        assert!(
+            presets
+                .iter()
+                .all(|preset| preset.id != "Factory/FX/Aggero")
         );
     }
 
