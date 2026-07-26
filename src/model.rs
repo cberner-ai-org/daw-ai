@@ -2856,8 +2856,8 @@ fn validate_clip_fields(
         || end > project_duration
         || !loop_beats.is_finite()
         || match playback_mode {
-            "loop" => !(0.25..=16.0).contains(&loop_beats) || notes.len() > 32,
-            "once" => !(0.25..=64.0).contains(&loop_beats) || notes.len() > 128,
+            "loop" => !(0.25..=16.0).contains(&loop_beats) || notes.len() > 128,
+            "once" => !(0.25..=256.0).contains(&loop_beats) || notes.len() > 128,
             _ => true,
         }
         || notes.iter().any(|note| {

@@ -22,6 +22,7 @@ pub(crate) const AUDIO_TOOL_NAME: &str = "render_audio_region";
 pub(crate) const PRESET_TOOL_NAME: &str = "list_surge_presets";
 pub(crate) const INSTRUMENT_PARAMETER_TOOL_NAME: &str = "list_instrument_parameters";
 pub(crate) const SOUND_TOOL_PARAMETER_TOOL_NAME: &str = "list_sound_tool_parameters";
+const SET_INSTRUMENT_PARAMETER_TOOL_NAME: &str = "set_instrument_parameter";
 const GRAPH_FILE: &str = "sound-graph.json";
 const REQUEST_FILE: &str = "request.json";
 const SESSION_FILE: &str = "session.json";
@@ -46,7 +47,7 @@ pub(crate) const MUTATION_TOOL_NAMES: &[&str] = &[
     "add_modulator",
     "update_modulator",
     "delete_modulator",
-    "set_parameter",
+    SET_INSTRUMENT_PARAMETER_TOOL_NAME,
     "set_track_volume",
     "set_track_mute",
     "set_tempo",
@@ -399,7 +400,7 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             INSTRUMENT_PARAMETER_TOOL_NAME,
-            "Browse Surge XT by module. Start with only trackId, then copy one module ID into the next call. At a leaf copy parameter into set_parameter, or modulationTarget into add_modulator.target.",
+            "Browse Surge XT by module. Start with only trackId, then copy one module ID into the next call. At a leaf copy parameter into set_instrument_parameter, or modulationTarget into add_modulator.target.",
             object_schema(
                 serde_json::json!({
                     "trackId":{"type":"integer","minimum":1},
@@ -450,9 +451,9 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         || serde_json::json!({"type":"string","enum":["drums","bass","chords","lead","texture"]});
     let notes = || {
         serde_json::json!({
-            "type":"array","maxItems":128,"description":"Loop mode supports at most 32 events; once mode supports at most 128.","items":{"type":"object","properties":{
-                "time":{"type":"number","minimum":0,"maximum":64,"description":"Beat offset from the clip start."},
-                "duration":{"type":"number","minimum":0.0625,"maximum":64},
+            "type":"array","maxItems":128,"items":{"type":"object","properties":{
+                "time":{"type":"number","minimum":0,"maximum":256,"description":"Beat offset from the clip start."},
+                "duration":{"type":"number","minimum":0.0625,"maximum":256},
                 "pitch":{"type":"integer","minimum":0,"maximum":127,"description":"For a dedicated starter drum voice use only its canonical pitch: kick 36, snare 38, closedHat 42, openHat 46, crash 49. Never combine drum voices on one Surge track."},
                 "velocity":{"type":"number","minimum":0.01,"maximum":1}
             },"required":["time","duration","pitch","velocity"],"additionalProperties":false}
@@ -462,7 +463,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "trackId":id(), "label":{"type":"string","minLength":1,"maxLength":64},
             "startBeat":{"type":"number","minimum":0,"description":"Absolute beat from the start of the project."},
-            "durationBeats":{"type":"number","minimum":0.25,"maximum":64},
+            "durationBeats":{"type":"number","minimum":0.25,"maximum":256},
             "playback":{"description":"Default to loop for drums, bass grooves, chord accompaniment, arpeggios, and riffs. Use once mainly for melodies, fills, transitions, or material whose individual events genuinely develop without repetition.","oneOf":[
                 {"type":"object","properties":{"mode":{"type":"string","enum":["loop"]},"lengthBeats":{"type":"number","minimum":0.25,"maximum":16}},"required":["mode","lengthBeats"],"additionalProperties":false},
                 {"type":"object","properties":{"mode":{"type":"string","enum":["once"]}},"required":["mode"],"additionalProperties":false}
@@ -643,11 +644,11 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             ),
         ),
         function(
-            "set_parameter",
-            "Set one control. Copy an editableParameter ID from parameter discovery; instrument.* and effect:* are modulation target IDs and are invalid here.",
+            SET_INSTRUMENT_PARAMETER_TOOL_NAME,
+            "Set one Surge XT instrument control. Copy parameter unchanged from list_instrument_parameters. Values are strings because Surge controls may be numeric, Boolean, or enumerated.",
             object_schema(
-                serde_json::json!({"trackId":id(),"tool":{"type":"string","enum":["instrument","effect","modulator","event","routing"]},"toolId":id(),"clipId":{"type":"integer","minimum":0},"parameter":{"type":"string","minLength":1,"maxLength":64,"description":"Exact editable parameter ID from discovery. Never use a modulationTargets ID."},"value":{"type":"string","minLength":1,"maxLength":96}}),
-                &["trackId", "tool", "toolId", "clipId", "parameter", "value"],
+                serde_json::json!({"trackId":id(),"parameter":{"type":"string","pattern":"^native:[0-9]+$","maxLength":64,"description":"Exact native parameter ID returned by list_instrument_parameters."},"value":{"type":"string","minLength":1,"maxLength":96}}),
+                &["trackId", "parameter", "value"],
             ),
         ),
         function(
@@ -898,7 +899,7 @@ pub(crate) fn list_instrument_parameters(
                 } else {
                     "continuous"
                 },
-                "mutationTool":"set_parameter"
+                "mutationTool":SET_INSTRUMENT_PARAMETER_TOOL_NAME
             });
             value["automationTarget"] = serde_json::json!(format!("native:{}", parameter.id));
             if parameter.boolean || parameter.discrete || !parameter.choices.is_empty() {
@@ -1732,6 +1733,23 @@ pub(crate) fn apply_agent_mutation(
                 .map_err(studio_error_message)?;
             format!("Deleted modulator {modulator_id} from track {track_id}")
         }
+        SET_INSTRUMENT_PARAMETER_TOOL_NAME => {
+            let track_id = required_id(object, "trackId")?;
+            let tool = "instrument";
+            let tool_id = studio
+                .project()
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .map(|track| track.instrument.id)
+                .ok_or_else(|| format!("track {track_id} does not exist"))?;
+            let parameter = required_string(object, "parameter")?;
+            let value = required_string(object, "value")?;
+            studio
+                .configure_sound_tool(track_id, tool, tool_id, None, parameter, value)
+                .map_err(|error| parameter_error_message(error, tool, tool_id, parameter))?;
+            format!("Set Surge XT instrument parameter {parameter} on track {track_id}")
+        }
         "set_parameter" => {
             let track_id = required_id(object, "trackId")?;
             let tool = required_string(object, "tool")?;
@@ -1830,7 +1848,9 @@ fn mutation_display(
     let track_id = arguments.get("trackId")?.as_u64()?;
     let track = project.tracks.iter().find(|track| track.id == track_id)?;
     let parameter = arguments.get("parameter")?.as_str()?;
-    if mutation == "set_parameter" && arguments.get("tool")?.as_str()? == "instrument" {
+    if mutation == SET_INSTRUMENT_PARAMETER_TOOL_NAME
+        || (mutation == "set_parameter" && arguments.get("tool")?.as_str()? == "instrument")
+    {
         let native_id = parameter.strip_prefix("native:")?.parse::<i32>().ok()?;
         return crate::surge::instrument_parameters_for_instrument(&track.instrument)
             .into_iter()
@@ -2010,7 +2030,7 @@ fn clip_arguments(
         .and_then(JsonValue::as_object)
         .ok_or_else(|| "playback must be an object".to_owned())?;
     let playback_mode = required_string(playback, "mode")?;
-    let maximum_events = if playback_mode == "loop" { 32 } else { 128 };
+    let maximum_events = 128;
     if events.len() > maximum_events {
         return Err(format!(
             "{playback_mode} has {} events; maximum is {maximum_events}",
@@ -2977,12 +2997,9 @@ mod tests {
         let mutation: JsonValue = serde_json::from_str(
             &apply_agent_mutation(
                 session.path(),
-                "set_parameter",
+                SET_INSTRUMENT_PARAMETER_TOOL_NAME,
                 &serde_json::json!({
                     "trackId":track_id,
-                    "tool":"instrument",
-                    "toolId":project.tracks[1].instrument.id,
-                    "clipId":0,
                     "parameter":selection["parameter"],
                     "value":choice["value"].to_string()
                 }),
@@ -3616,7 +3633,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let error = apply_agent_mutation(
+        apply_agent_mutation(
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
@@ -3628,8 +3645,9 @@ mod tests {
                 "events":loop_events
             }),
         )
-        .expect_err("loop event budget");
-        assert_eq!(error, "loop has 33 events; maximum is 32");
+        .expect("dense loop");
+        let (_, project) = session.take_update().unwrap().expect("loop update");
+        assert_eq!(project.tracks[0].clips.last().unwrap().events.len(), 33);
     }
 
     #[test]
