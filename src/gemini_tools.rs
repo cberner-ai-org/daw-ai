@@ -411,15 +411,14 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             SOUND_TOOL_PARAMETER_TOOL_NAME,
-            "List editable controls for one effect or modulator. Use common first, advanced for secondary controls. Returned parameter IDs are for update_effect/update_modulator, not modulation targets.",
+            "List every editable control for one effect or modulator. Effect controls and metadata come directly from Surge XT. Returned parameter IDs are for update_effect/update_modulator, not modulation targets.",
             object_schema(
                 serde_json::json!({
                     "trackId":{"type":"integer","minimum":1},
                     "tool":{"type":"string","enum":["effect","modulator"]},
-                    "toolId":{"type":"integer","minimum":1},
-                    "group":{"type":"string","enum":["common","advanced"]}
+                    "toolId":{"type":"integer","minimum":1}
                 }),
-                &["trackId", "tool", "toolId", "group"],
+                &["trackId", "tool", "toolId"],
             ),
         ),
     ];
@@ -850,8 +849,7 @@ pub(crate) fn list_instrument_parameters(
                     "nextArguments": {
                         "trackId": track_id,
                         "tool": "effect",
-                        "toolId": effect.id,
-                        "group": "common"
+                        "toolId": effect.id
                     }
                 })
             })
@@ -1175,10 +1173,6 @@ pub(crate) fn list_sound_tool_parameters(
     let track_id = required_id(object, "trackId")?;
     let tool_id = required_id(object, "toolId")?;
     let tool = required_string(object, "tool")?;
-    let group = required_string(object, "group")?;
-    if !matches!(group, "common" | "advanced") {
-        return Err("group must be common or advanced".to_owned());
-    }
     let project = current_project(session_path)?;
     let track = project
         .tracks
@@ -1200,14 +1194,14 @@ pub(crate) fn list_sound_tool_parameters(
                 effect.id,
             );
             let mut values = vec![
-                serde_json::json!({"parameter":"enabled","name":"Enabled","value":effect.enabled,"type":"boolean","common":true}),
-                serde_json::json!({"parameter":"mix","name":"Mix","value":effect.mix,"minimum":0,"maximum":1,"common":true}),
+                serde_json::json!({"parameter":"enabled","name":"Enabled","value":effect.enabled,"type":"boolean"}),
+                serde_json::json!({"parameter":"mix","name":"Mix","value":effect.mix,"minimum":0,"maximum":1}),
             ];
             if let Some(value) = effect.cutoff_hz {
-                values.push(serde_json::json!({"parameter":"cutoff","name":"Cutoff","value":value,"minimum":80,"maximum":16000,"unit":"Hz","common":true}));
+                values.push(serde_json::json!({"parameter":"cutoff","name":"Cutoff","value":value,"minimum":80,"maximum":16000,"unit":"Hz"}));
             }
             if let Some(value) = effect.resonance {
-                values.push(serde_json::json!({"parameter":"resonance","name":"Resonance","value":value,"minimum":0.1,"maximum":20,"unit":"Q","common":true}));
+                values.push(serde_json::json!({"parameter":"resonance","name":"Resonance","value":value,"minimum":0.1,"maximum":20,"unit":"Q"}));
             }
             let mut discovered = crate::surge::effect_parameter_values(&effect.name);
             for (parameter, value) in &effect.parameters {
@@ -1215,24 +1209,17 @@ pub(crate) fn list_sound_tool_parameters(
                     discovered.insert(parameter.clone(), *value);
                 }
             }
-            let parameters = discovered.iter().collect::<Vec<_>>();
-            values.extend(
-                parameters
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (parameter, value))| {
-                        let mut discovered = serde_json::json!({
-                                "parameter":parameter,
-                                "name":display_parameter_name(parameter),
-                                "value":value,
-                                "minimum":0,
-                                "maximum":1,
-                        "common":index < 6
-                            });
-                        add_effect_semantics(&mut discovered, semantics.get(parameter.as_str()));
-                        discovered
-                    }),
-            );
+            values.extend(discovered.iter().map(|(parameter, value)| {
+                let mut discovered = serde_json::json!({
+                    "parameter":parameter,
+                    "name":display_parameter_name(parameter),
+                    "value":value,
+                    "minimum":0,
+                    "maximum":1
+                });
+                add_effect_semantics(&mut discovered, semantics.get(parameter.as_str()));
+                discovered
+            }));
             for value in &mut values {
                 let parameter = value["parameter"].as_str().unwrap_or_default();
                 add_effect_semantics(value, semantics.get(parameter));
@@ -1245,25 +1232,31 @@ pub(crate) fn list_sound_tool_parameters(
                 .iter()
                 .find(|modulator| modulator.id == tool_id)
                 .ok_or_else(|| format!("modulator {tool_id} does not exist"))?;
-            vec![
-                serde_json::json!({"parameter":"enabled","name":"Enabled","value":modulator.enabled,"type":"boolean","common":true}),
-                serde_json::json!({"parameter":"shape","name":"Shape","value":modulator.shape,"choices":["sine","triangle","square","random","envelope","formula"],"common":true}),
-                serde_json::json!({"parameter":"target","name":"Target","value":modulator.target,"common":true}),
-                serde_json::json!({"parameter":"rate","name":"Rate","value":modulator.rate,"minimum":0.01,"maximum":20,"common":true}),
-                serde_json::json!({"parameter":"depth","name":"Depth","value":modulator.depth,"minimum":0,"maximum":1,"common":true}),
-                serde_json::json!({"parameter":"rateMode","name":"Rate mode","value":modulator.rate_mode,"choices":["hz","tempo"],"common":false}),
-                serde_json::json!({"parameter":"trigger","name":"Trigger","value":modulator.trigger,"choices":["free","midi","audio"],"common":false}),
-                serde_json::json!({"parameter":"sourceTrackId","name":"Source track ID","value":modulator.source_track_id,"common":false}),
-                serde_json::json!({"parameter":"polarity","name":"Polarity","value":modulator.polarity,"choices":["increase","decrease"],"common":false}),
-                serde_json::json!({"parameter":"threshold","name":"Threshold","value":modulator.threshold,"minimum":0,"maximum":1,"common":false}),
-                serde_json::json!({"parameter":"attackMs","name":"Attack","value":modulator.attack_ms,"minimum":0,"maximum":1000,"unit":"ms","common":false}),
-                serde_json::json!({"parameter":"releaseMs","name":"Release","value":modulator.release_ms,"minimum":1,"maximum":5000,"unit":"ms","common":false}),
-                serde_json::json!({"parameter":"formula","name":"Surge Formula (Lua)","value":modulator.formula,"maximumLength":8192,"mutationTool":"update_modulator","common":false}),
-            ]
+            let mut values = vec![
+                serde_json::json!({"parameter":"enabled","name":"Enabled","value":modulator.enabled,"type":"boolean"}),
+                serde_json::json!({"parameter":"shape","name":"Shape","value":modulator.shape,"choices":["sine","triangle","square","random","envelope","formula"]}),
+                serde_json::json!({"parameter":"target","name":"Target","value":modulator.target}),
+                serde_json::json!({"parameter":"rate","name":"Rate","value":modulator.rate,"minimum":0.01,"maximum":20}),
+                serde_json::json!({"parameter":"rateMode","name":"Rate mode","value":modulator.rate_mode,"choices":["hz","tempo"]}),
+                serde_json::json!({"parameter":"depth","name":"Depth","value":modulator.depth,"minimum":0,"maximum":1}),
+                serde_json::json!({"parameter":"trigger","name":"Trigger","value":modulator.trigger,"choices":["free","midi","audio"]}),
+                serde_json::json!({"parameter":"polarity","name":"Polarity","value":modulator.polarity,"choices":["increase","decrease"]}),
+            ];
+            if modulator.trigger == "audio" {
+                values.extend([
+                    serde_json::json!({"parameter":"sourceTrackId","name":"Source track ID","value":modulator.source_track_id}),
+                    serde_json::json!({"parameter":"threshold","name":"Threshold","value":modulator.threshold,"minimum":0,"maximum":1}),
+                    serde_json::json!({"parameter":"attackMs","name":"Attack","value":modulator.attack_ms,"minimum":0,"maximum":1000,"unit":"ms"}),
+                    serde_json::json!({"parameter":"releaseMs","name":"Release","value":modulator.release_ms,"minimum":1,"maximum":5000,"unit":"ms"}),
+                ]);
+            }
+            if modulator.shape == "formula" {
+                values.push(serde_json::json!({"parameter":"formula","name":"Surge Formula (Lua)","value":modulator.formula,"maximumLength":8192}));
+            }
+            values
         }
         _ => return Err("tool must be effect or modulator".to_owned()),
     };
-    let common = group == "common";
     let mutation_tool = if tool == "effect" {
         "update_effect"
     } else {
@@ -1273,13 +1266,12 @@ pub(crate) fn list_sound_tool_parameters(
         "trackId":track_id,
         "tool":tool,
         "toolId":tool_id,
-        "group":group,
         "idType":"editableParameter",
         "source": if tool == "effect" {
             track.effects.iter().find(|effect| effect.id == tool_id)
                 .map(|effect| if effect.preset_slot.is_some() {"preset"} else {"added"})
         } else { None },
-        "parameters":parameters.into_iter().filter(|parameter| parameter["common"] == common).map(|mut parameter| {
+        "parameters":parameters.into_iter().map(|mut parameter| {
             parameter.as_object_mut().expect("parameter object").insert(
                 "mutationTool".to_owned(),
                 JsonValue::String(mutation_tool.to_owned())
@@ -3042,7 +3034,9 @@ mod tests {
 
     #[test]
     fn formula_discovery_routes_long_source_to_modulator_update() {
-        let project = Project::demo();
+        let mut project = Project::demo();
+        project.tracks[1].modulators[0].shape = "formula".to_owned();
+        project.tracks[1].modulators[0].formula = "return sin(phase)".to_owned();
         let track = &project.tracks[1];
         let modulator = &track.modulators[0];
         let session = EditSession::create(&project, "inspect formula", 0.0, 1.0).expect("session");
@@ -3052,8 +3046,7 @@ mod tests {
             &serde_json::json!({
                 "trackId":track.id,
                 "tool":"modulator",
-                "toolId":modulator.id,
-                "group":"advanced"
+                "toolId":modulator.id
             }),
         )
         .expect("modulator parameters");
@@ -3084,8 +3077,7 @@ mod tests {
             &serde_json::json!({
                 "trackId":track_id,
                 "tool":"effect",
-                "toolId":effect_id,
-                "group":"common"
+                "toolId":effect_id
             }),
         )
         .expect("effect parameters");
@@ -3111,7 +3103,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_effect_discovery_uses_only_named_surge_controls_with_semantics() {
+    fn generic_effect_discovery_returns_every_surge_control_with_semantics() {
         let mut project = Project::demo();
         let track = &mut project.tracks[0];
         let effect = &mut track.effects[0];
@@ -3126,8 +3118,7 @@ mod tests {
                 &serde_json::json!({
                     "trackId":track_id,
                     "tool":"effect",
-                    "toolId":effect_id,
-                    "group":"common"
+                    "toolId":effect_id
                 }),
             )
             .expect("effect parameters"),
@@ -3142,14 +3133,7 @@ mod tests {
                     !matches!(parameter["parameter"].as_str(), Some("enabled" | "mix"))
                 })
                 .all(|parameter| {
-                    !parameter["parameter"]
-                        .as_str()
-                        .is_some_and(|name| name.starts_with("Param "))
-                        && parameter["display"].is_string()
-                        && parameter["kind"].is_string()
-                        && !parameter["name"]
-                            .as_str()
-                            .is_some_and(|name| name.starts_with(' '))
+                    parameter["display"].is_string() && parameter["kind"].is_string()
                 })
         );
     }
@@ -3171,8 +3155,7 @@ mod tests {
                 &serde_json::json!({
                     "trackId":track_id,
                     "tool":"effect",
-                    "toolId":effect_id,
-                    "group":"advanced"
+                    "toolId":effect_id
                 }),
             )
             .expect("effect parameters"),
@@ -3182,7 +3165,8 @@ mod tests {
             .as_array()
             .expect("parameters")
             .iter()
-            .find_map(|parameter| parameter["parameter"].as_str())
+            .find(|parameter| parameter["kind"] == "continuous")
+            .and_then(|parameter| parameter["parameter"].as_str())
             .expect("native effect parameter");
         let mutation: JsonValue = serde_json::from_str(
             &apply_agent_mutation(
@@ -3585,6 +3569,19 @@ mod tests {
             project.tracks[2].routing.effect_order.len(),
             project.tracks[2].effects.len()
         );
+
+        apply_agent_mutation(
+            session.path(),
+            "set_surge_preset",
+            &serde_json::json!({
+                "trackId":3,
+                "presetId":"Factory/Polysynths/Anthemish 1"
+            }),
+        )
+        .expect("preset with non-deactivatable inactive effect rate");
+        let (_, project) = session.take_update().unwrap().expect("preset update");
+        crate::project_file::parse_project(&project.to_json())
+            .expect("preset effect state remains persistable");
     }
 
     #[test]
