@@ -2495,14 +2495,13 @@ async function run() {
     }, "precise sound-tool values");
     assert.deepEqual(
       await evaluate(cdp, appSession, `(() => {
-        const release = document.querySelector(
-          '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="${nativeParameter}"]',
-        );
         const mix = document.querySelector(
           '[data-sound-tool="effect"][data-track-id="3"][data-tool-id="310"][data-parameter="mix"]',
         );
         return {
-          release: { value: release.value, step: release.step, output: release.nextElementSibling.value },
+          instrumentCacheInvalidated: Boolean(
+            document.querySelector('[data-load-instrument-parameters="2:common"]'),
+          ),
           mix: {
             value: mix.value,
             step: mix.step,
@@ -2512,10 +2511,10 @@ async function run() {
         };
       })()`),
       {
-        release: { value: "0.025", step: "any", output: "2.5%" },
+        instrumentCacheInvalidated: true,
         mix: { value: "0.005", step: "any", output: "0.5%", heading: "0.5%" },
       },
-      "authoritative floats must render without range sanitization or display rounding",
+      "native edits must invalidate topology metadata while effect floats remain exact",
     );
     await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
     await waitFor(async () => {
@@ -2527,6 +2526,17 @@ async function run() {
       const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
       return project.tracks[1].instrument.nativeOverrides?.[nativeParameter.slice(7)] === undefined;
     }, "precise native instrument control undo");
+    assert.equal(
+      await evaluate(cdp, appSession,
+        "Boolean(document.querySelector('[data-load-instrument-parameters=\"2:common\"]'))"),
+      true,
+      "undoing a native edit must leave stale topology metadata unloaded",
+    );
+    await evaluate(cdp, appSession,
+      "document.querySelector('[data-load-instrument-parameters=\"2:common\"]').click()");
+    await waitFor(async () => evaluate(cdp, appSession, `Boolean(document.querySelector(
+      '[data-sound-tool="instrument"][data-track-id="2"][data-parameter="${nativeParameter}"]'
+    ))`), "reloaded native controls after undo");
     assert.deepEqual(
       await evaluate(cdp, appSession, `(() => {
         const control = document.querySelector(

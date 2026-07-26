@@ -409,7 +409,9 @@
         !previousTrack ||
         !track ||
         previousTrack.instrument.id !== track.instrument.id ||
-        previousTrack.instrument.preset !== track.instrument.preset
+        previousTrack.instrument.preset !== track.instrument.preset ||
+        JSON.stringify(previousTrack.instrument.nativeOverrides || {}) !==
+          JSON.stringify(track.instrument.nativeOverrides || {})
       ) {
         delete state.instrumentParameters[key];
         continue;
@@ -956,18 +958,11 @@
       .filter((parameter) => !["mix", "cutoff", "resonance"].includes(parameter))
       .map((parameter) => [parameter, effect.parameters[parameter]])
       .filter(([, value]) => Number.isFinite(value));
-    const renderDetailed = ([parameter, value]) => soundRange(
+    const renderDetailed = ([parameter, value]) => effectControl(
         track,
-        "effect",
-        effect.id,
-        effect.name,
+        effect,
         parameter,
         value,
-        0,
-        1,
-        "%",
-        "",
-        parameter.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase()),
       );
     const commonControls = detailedParameters.slice(0, 2).map(renderDetailed).join("");
     const advancedControls = detailedParameters.slice(2).map(renderDetailed).join("");
@@ -983,6 +978,41 @@
         <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} later`)}" ${index === effectCount - 1 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.min(effectCount - 1, index + 1)}" data-control-key="${track.id}-routing-${effect.id}-down">&darr;</button>
       </div>
     </div>`;
+  }
+
+  function effectControl(track, effect, parameter, value) {
+    const semantics = effect.parameterSemantics?.[parameter];
+    const label = parameter.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase());
+    const choices = semantics?.choices?.length
+      ? semantics.choices
+      : semantics?.kind === "boolean"
+        ? [{ value: 0, display: "Off" }, { value: 1, display: "On" }]
+        : [];
+    if (choices.length === 0) {
+      return soundRange(
+        track,
+        "effect",
+        effect.id,
+        effect.name,
+        parameter,
+        value,
+        0,
+        1,
+        "%",
+        "",
+        label,
+      );
+    }
+    const selected = choices.reduce((closest, choice) =>
+      Math.abs(choice.value - value) < Math.abs(closest.value - value) ? choice : closest
+    );
+    const key = `${track.id}-effect-${effect.id}-${parameter}`;
+    const accessibleName = `${track.name} ${effect.name} effect #${effect.id} ${parameter}`;
+    return `<label class="tool-control">${escapeHtml(label)}
+      <select data-sound-tool="effect" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="${parameter}" data-control-key="${key}" aria-label="${escapeHtml(accessibleName)}">${choices
+        .map((choice) => `<option value="${choice.value}" ${choice === selected ? "selected" : ""}>${escapeHtml(choice.display)}</option>`)
+        .join("")}</select>
+    </label>`;
   }
 
   function renderModulator(track, modulator) {
@@ -1357,14 +1387,8 @@
       commitUi: () => {
         if (request.tool !== "instrument") return;
         if (request.parameter.startsWith("native:")) {
-          for (const group of ["common", "advanced"]) {
-            const parameter = state.instrumentParameters[`${request.track_id}:${group}`]
-              ?.find((candidate) => candidate.parameter === request.parameter);
-            if (parameter) {
-              parameter.value = Number(request.value);
-              parameter.overridden = true;
-            }
-          }
+          delete state.instrumentParameters[`${request.track_id}:common`];
+          delete state.instrumentParameters[`${request.track_id}:advanced`];
         } else if (request.parameter === "preset") {
           delete state.instrumentParameters[`${request.track_id}:common`];
           delete state.instrumentParameters[`${request.track_id}:advanced`];

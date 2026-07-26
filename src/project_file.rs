@@ -46,6 +46,10 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         return Err(invalid("duration must be between 0.25 and 86400 seconds"));
     }
     let version = integer(root, "version")?;
+    let reserved_edit_ids = array(root, "edits")?
+        .iter()
+        .filter_map(|edit| edit.get("id").and_then(JsonValue::as_u64))
+        .collect::<HashSet<_>>();
     let track_values = array(root, "tracks")?;
     if track_values.is_empty() || track_values.len() > MAX_TRACKS {
         return Err(invalid(format!(
@@ -61,7 +65,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .map(|(index, value)| parse_track(value, index, duration, &mut ids, &mut event_ids))
         .collect::<Result<Vec<_>, _>>()?;
     if schema_version < 2 {
-        materialize_legacy_preset_effects(&mut tracks, &mut ids, &event_ids)?;
+        materialize_legacy_preset_effects(&mut tracks, &mut ids, &event_ids, &reserved_edit_ids)?;
     }
     let track_ids = tracks.iter().map(|track| track.id).collect::<HashSet<_>>();
     let track_ids = track_ids.into_iter().collect::<Vec<_>>();
@@ -305,6 +309,7 @@ fn materialize_legacy_preset_effects(
     tracks: &mut [Track],
     ids: &mut HashSet<u64>,
     event_ids: &HashSet<u64>,
+    reserved_ids: &HashSet<u64>,
 ) -> Result<(), ProjectFileError> {
     let mut next_id = ids
         .iter()
@@ -329,7 +334,10 @@ fn materialize_legacy_preset_effects(
             continue;
         }
         for effect in &mut preset {
-            while ids.contains(&next_id) || event_ids.contains(&next_id) {
+            while ids.contains(&next_id)
+                || event_ids.contains(&next_id)
+                || reserved_ids.contains(&next_id)
+            {
                 next_id = next_id
                     .checked_add(1)
                     .filter(|id| *id <= MAX_SAFE_INTEGER)
@@ -426,7 +434,7 @@ fn parse_track(
     {
         return Err(invalid("instrument overrides must be unique"));
     }
-    let instrument = Instrument {
+    let mut instrument = Instrument {
         id: instrument_id,
         engine: SURGE_ENGINE.to_owned(),
         preset: preset.to_owned(),
@@ -442,6 +450,7 @@ fn parse_track(
         parameter_overrides: overrides,
         native_overrides: parse_native_overrides(instrument_object, preset)?,
     };
+    normalize_native_overrides(&mut instrument);
     let effect_values = array(track, "effects")?;
     if effect_values.len() > MAX_TOOLS_PER_TRACK {
         return Err(invalid(format!(
@@ -1710,6 +1719,25 @@ fn parse_native_overrides(
     Ok(overrides)
 }
 
+fn normalize_native_overrides(instrument: &mut Instrument) {
+    if instrument.native_overrides.is_empty() {
+        return;
+    }
+    for parameter in crate::surge::instrument_parameters_for_instrument(instrument) {
+        if let Some(value) = instrument.native_overrides.get_mut(&parameter.id) {
+            *value = parameter
+                .choices
+                .iter()
+                .min_by(|(left, _), (right, _)| {
+                    (left - parameter.value)
+                        .abs()
+                        .total_cmp(&(right - parameter.value).abs())
+                })
+                .map_or(parameter.value, |(choice, _)| *choice);
+        }
+    }
+}
+
 fn relative_range(object: &Object, name: &str) -> Result<f32, ProjectFileError> {
     range(object, name, 0.0, 1.0)
 }
@@ -1780,6 +1808,22 @@ mod tests {
         project["tracks"][0]["instrument"]["nativeOverrides"] = serde_json::json!({"999999": 0.5});
         let error = parse_project(&project.to_string()).expect_err("unknown native parameter");
         assert!(error.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn normalizes_imported_native_selections_to_surge_choices() {
+        let mut project: JsonValue =
+            serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+        let instrument = &Project::demo().tracks[1].instrument;
+        let mute = crate::surge::instrument_parameters_for_instrument(instrument)
+            .into_iter()
+            .find(|parameter| parameter.name.ends_with("Osc 1 Mute"))
+            .expect("oscillator mute");
+        project["tracks"][1]["instrument"]["nativeOverrides"] =
+            serde_json::json!({mute.id.to_string(): 0.123456});
+
+        let parsed = parse_project(&project.to_string()).expect("normalized native choice");
+        assert_eq!(parsed.tracks[1].instrument.native_overrides[&mute.id], 0.0);
     }
 
     #[test]
@@ -1886,6 +1930,29 @@ mod tests {
             .routing
             .effect_order
             .retain(|effect_id| added_ids.contains(effect_id));
+        let highest_graph_id = legacy_project
+            .tracks
+            .iter()
+            .flat_map(|track| {
+                std::iter::once(track.id)
+                    .chain(std::iter::once(track.instrument.id))
+                    .chain(track.effects.iter().map(|effect| effect.id))
+                    .chain(track.modulators.iter().map(|modulator| modulator.id))
+                    .chain(track.clips.iter().map(|clip| clip.id))
+                    .chain(track.audio_clips.iter().map(|clip| clip.id))
+            })
+            .max()
+            .expect("graph ID");
+        let reserved_edit_id = highest_graph_id + 1;
+        legacy_project.edits.push(Edit {
+            id: reserved_edit_id,
+            operation_id: None,
+            start: 0.0,
+            end: 4.0,
+            prompt: "legacy edit".to_owned(),
+            summary: "legacy edit".to_owned(),
+            action: Action::GraphMutation,
+        });
         let mut legacy: JsonValue =
             serde_json::from_str(&legacy_project.to_json()).expect("project JSON");
         legacy
@@ -1899,6 +1966,12 @@ mod tests {
                 .effects
                 .iter()
                 .any(|effect| effect.preset_slot.is_some())
+        );
+        assert!(
+            migrated.tracks[1]
+                .effects
+                .iter()
+                .all(|effect| effect.id != reserved_edit_id)
         );
     }
 

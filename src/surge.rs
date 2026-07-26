@@ -70,6 +70,9 @@ type InstrumentParameterCache = HashMap<String, Arc<OnceLock<Vec<InstrumentParam
 static INSTRUMENT_PARAMETER_CACHE: OnceLock<Mutex<InstrumentParameterCache>> = OnceLock::new();
 static EFFECT_PARAMETER_CACHE: OnceLock<Mutex<HashMap<String, BTreeMap<String, f32>>>> =
     OnceLock::new();
+static EFFECT_CONTROL_SEMANTICS_CACHE: OnceLock<
+    Mutex<HashMap<String, HashMap<String, EffectParameterSemantics>>>,
+> = OnceLock::new();
 #[cfg(test)]
 thread_local! {
     static ENGINE_CREATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -852,6 +855,52 @@ pub(crate) fn effect_parameter_semantics(
         }
     }
     result
+}
+
+pub(crate) fn effect_control_semantics(name: &str) -> HashMap<String, EffectParameterSemantics> {
+    let cache = EFFECT_CONTROL_SEMANTICS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(semantics) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(name)
+        .cloned()
+    {
+        return semantics;
+    }
+    let instrument = Instrument {
+        id: 1,
+        engine: crate::model::SURGE_ENGINE.to_owned(),
+        preset: "Init".to_owned(),
+        attack: 0.0,
+        decay: 0.0,
+        sustain: 0.0,
+        release: 0.0,
+        cutoff: 0.0,
+        resonance: 0.0,
+        pitch: 0.0,
+        timbre: 0.5,
+        output: 0.0,
+        parameter_overrides: Vec::new(),
+        native_overrides: BTreeMap::new(),
+    };
+    let effect = Effect {
+        id: 1,
+        name: name.to_owned(),
+        preset_slot: None,
+        mix: 0.5,
+        cutoff_hz: None,
+        resonance: None,
+        enabled: true,
+        parameters: effect_parameter_values(name),
+        parameter_overrides: Vec::new(),
+    };
+    let semantics =
+        effect_parameter_semantics(&instrument, std::slice::from_ref(&effect), &[1], 1, 1);
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(name.to_owned(), semantics.clone());
+    semantics
 }
 
 pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
