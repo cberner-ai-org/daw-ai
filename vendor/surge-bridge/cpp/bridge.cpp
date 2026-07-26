@@ -175,6 +175,11 @@ extern "C" {
         return value && value->can_temposync();
     }
 
+    bool surge_parameter_is_temposync(SurgeSynthesizer* surge, int parameter) {
+        auto* value = surge_parameter(surge, parameter);
+        return value && value->temposync;
+    }
+
     bool surge_parameter_can_deactivate(SurgeSynthesizer* surge, int parameter) {
         auto* value = surge_parameter(surge, parameter);
         return value && value->can_deactivate();
@@ -183,6 +188,20 @@ extern "C" {
     bool surge_parameter_is_deactivated(SurgeSynthesizer* surge, int parameter) {
         auto* value = surge_parameter(surge, parameter);
         return value && value->appears_deactivated();
+    }
+
+    bool surge_set_parameter_temposync(SurgeSynthesizer* surge, int parameter, bool enabled) {
+        auto* value = surge_parameter(surge, parameter);
+        if (!value || (enabled && !value->can_temposync())) return false;
+        value->temposync = enabled;
+        return true;
+    }
+
+    bool surge_set_parameter_deactivated(SurgeSynthesizer* surge, int parameter, bool enabled) {
+        auto* value = surge_parameter(surge, parameter);
+        if (!value || (enabled && !value->can_deactivate())) return false;
+        value->deactivated = enabled;
+        return true;
     }
 
     int surge_parameter_choice_count(SurgeSynthesizer* surge, int parameter) {

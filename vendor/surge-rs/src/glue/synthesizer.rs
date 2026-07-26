@@ -266,6 +266,10 @@ impl SurgeSynthesizer {
         }
     }
 
+    pub fn parameter_is_temposync(&self, index: &SurgeId) -> bool {
+        unsafe { hell_ffi::surge_parameter_is_temposync(self.ptr, index.get_synth_side_id()) }
+    }
+
     pub fn parameter_can_deactivate(&self, index: &SurgeId) -> bool {
         unsafe {
             hell_ffi::surge_parameter_can_deactivate(self.ptr, index.get_synth_side_id())
@@ -275,6 +279,26 @@ impl SurgeSynthesizer {
     pub fn parameter_is_deactivated(&self, index: &SurgeId) -> bool {
         unsafe {
             hell_ffi::surge_parameter_is_deactivated(self.ptr, index.get_synth_side_id())
+        }
+    }
+
+    pub fn set_parameter_temposync(&self, index: &SurgeId, enabled: bool) -> bool {
+        unsafe {
+            hell_ffi::surge_set_parameter_temposync(
+                self.ptr,
+                index.get_synth_side_id(),
+                enabled,
+            )
+        }
+    }
+
+    pub fn set_parameter_deactivated(&self, index: &SurgeId, enabled: bool) -> bool {
+        unsafe {
+            hell_ffi::surge_set_parameter_deactivated(
+                self.ptr,
+                index.get_synth_side_id(),
+                enabled,
+            )
         }
     }
 

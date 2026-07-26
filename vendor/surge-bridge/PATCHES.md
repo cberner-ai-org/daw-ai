@@ -17,5 +17,8 @@ DAW-AI exposes Surge XT's own parameter semantics used by compact model-facing
 discovery: integer and Boolean choices with formatted labels, bipolar range,
 tempo sync, and deactivation.
 
+DAW-AI can also restore Surge XT's tempo-sync and deactivation flags when an
+embedded preset effect moves to a different native slot.
+
 Headless parameter writes reject oscillator types whose required wavetable data
 is absent from the current patch, preventing invalid native oscillator state.

@@ -93,6 +93,8 @@ pub struct Effect {
     pub enabled: bool,
     pub parameters: BTreeMap<String, f32>,
     pub parameter_overrides: Vec<String>,
+    pub tempo_sync_parameters: Vec<String>,
+    pub deactivated_parameters: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -598,6 +600,20 @@ impl Track {
             }
             output.push_str(",\"overrides\":[");
             for (index, parameter) in effect.parameter_overrides.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&json_string(parameter));
+            }
+            output.push_str("],\"tempoSync\":[");
+            for (index, parameter) in effect.tempo_sync_parameters.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&json_string(parameter));
+            }
+            output.push_str("],\"deactivated\":[");
+            for (index, parameter) in effect.deactivated_parameters.iter().enumerate() {
                 if index > 0 {
                     output.push(',');
                 }
@@ -3223,6 +3239,15 @@ pub(crate) fn valid_automation_target(track: &Track, value: &str) -> bool {
 }
 
 pub(crate) fn automation_target_range(track: &Track, value: &str) -> Option<(f32, f32)> {
+    if let Some(id) = value
+        .strip_prefix("native:")
+        .and_then(|id| id.parse::<i32>().ok())
+        && crate::surge::instrument_parameters_for_instrument(&track.instrument)
+            .iter()
+            .any(|parameter| parameter.id == id)
+    {
+        return Some((0.0, 1.0));
+    }
     automation_targets(track)
         .into_iter()
         .find(|target| target.id == value)
@@ -3526,6 +3551,8 @@ fn effect(id: u64, name: &str, mix: f32) -> Effect {
         enabled: true,
         parameters,
         parameter_overrides: Vec::new(),
+        tempo_sync_parameters: Vec::new(),
+        deactivated_parameters: Vec::new(),
     }
 }
 

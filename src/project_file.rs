@@ -692,6 +692,8 @@ fn parse_effect(
         enabled: boolean(effect, "enabled")?,
         parameters: extra_parameters,
         parameter_overrides,
+        tempo_sync_parameters: string_list(effect, "tempoSync")?,
+        deactivated_parameters: string_list(effect, "deactivated")?,
     };
     let semantics = crate::surge::effect_parameter_semantics(
         instrument,
@@ -709,7 +711,44 @@ fn parse_effect(
             )));
         }
     }
+    for parameter in &parsed.tempo_sync_parameters {
+        if !semantics
+            .get(parameter)
+            .is_some_and(|semantics| semantics.tempo_sync)
+        {
+            return Err(invalid(format!(
+                "effect parameter {parameter} cannot use tempo sync"
+            )));
+        }
+    }
+    for parameter in &parsed.deactivated_parameters {
+        if !semantics
+            .get(parameter)
+            .is_some_and(|semantics| semantics.can_deactivate)
+        {
+            return Err(invalid(format!(
+                "effect parameter {parameter} cannot be deactivated"
+            )));
+        }
+    }
     Ok(parsed)
+}
+
+fn string_list(object: &Object, name: &str) -> Result<Vec<String>, ProjectFileError> {
+    let Some(value) = object.get(name) else {
+        return Ok(Vec::new());
+    };
+    value
+        .as_array()
+        .ok_or_else(|| invalid(format!("effect {name} must be an array")))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid(format!("effect {name} entries must be strings")))
+        })
+        .collect()
 }
 
 fn persisted_effect_name(name: &str) -> &str {
@@ -1879,6 +1918,8 @@ mod tests {
                     enabled: true,
                     parameters: crate::surge::effect_parameter_values(name),
                     parameter_overrides: Vec::new(),
+                    tempo_sync_parameters: Vec::new(),
+                    deactivated_parameters: Vec::new(),
                 };
                 crate::surge::effect_parameter_semantics(
                     &track.instrument,

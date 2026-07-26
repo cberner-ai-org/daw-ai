@@ -653,6 +653,8 @@ fn render_track(
                 enabled: true,
                 parameters: std::collections::BTreeMap::new(),
                 parameter_overrides: Vec::new(),
+                tempo_sync_parameters: Vec::new(),
+                deactivated_parameters: Vec::new(),
             },
         );
         effect_order.insert(0, input_id);
@@ -682,6 +684,22 @@ fn render_track(
         .filter_map(|(name, value)| value.map(|value| ((*name).to_owned(), value)))
         .collect::<HashMap<_, _>>();
     applied_instrument_parameters.insert("timbre".to_owned(), track.instrument.timbre);
+    let native_targets = render_state.automation.native_targets();
+    let native_automation = if native_targets.is_empty() {
+        Vec::new()
+    } else {
+        let parameters = crate::surge::instrument_parameters_for_instrument(&track.instrument);
+        native_targets
+            .into_iter()
+            .filter_map(|id| {
+                parameters
+                    .iter()
+                    .find(|parameter| parameter.id == id)
+                    .map(|parameter| (id, parameter.value))
+            })
+            .collect()
+    };
+    let mut applied_native_parameters = HashMap::new();
     let mut output_index = 0;
     while output_index < output.len() {
         let block_start = start_sample + output_index;
@@ -729,6 +747,17 @@ fn render_track(
             {
                 engine.set_parameter(name, value)?;
                 applied_instrument_parameters.insert(name.to_owned(), value);
+            }
+        }
+        for &(id, base) in &native_automation {
+            let target = format!("native:{id}");
+            let value = parameter_at(project, track, render_state, &target, base, time);
+            if applied_native_parameters
+                .get(&id)
+                .is_none_or(|applied: &f32| (*applied - value).abs() > f32::EPSILON)
+            {
+                engine.set_native_parameter(id, value)?;
+                applied_native_parameters.insert(id, value);
             }
         }
         set_surge_native_modulator_controls(&mut engine, track, render_state, time)?;
@@ -1173,6 +1202,13 @@ impl<'a> AutomationIndex<'a> {
                 .iter()
                 .fold(base, |value, span| span.value_at(time).unwrap_or(value))
         })
+    }
+
+    fn native_targets(&self) -> Vec<i32> {
+        self.lanes
+            .keys()
+            .filter_map(|target| target.strip_prefix("native:")?.parse().ok())
+            .collect()
     }
 
     fn maximum_value(&self, target: &str, base: f32) -> f32 {
@@ -2915,6 +2951,8 @@ mod tests {
             enabled: true,
             parameters: crate::surge::effect_parameter_values("Distortion"),
             parameter_overrides: Vec::new(),
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
         });
         project.tracks[1].routing.effect_order.push(9_002);
         let surge_driven =
@@ -2987,6 +3025,8 @@ mod tests {
             enabled: true,
             parameters: crate::surge::effect_parameter_values("Distortion"),
             parameter_overrides: Vec::new(),
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
         });
         project.tracks[0].routing.effect_order.push(9_101);
         let effected = render(&project);
@@ -3029,6 +3069,8 @@ mod tests {
             enabled: true,
             parameters: crate::surge::effect_parameter_values("Distortion"),
             parameter_overrides: Vec::new(),
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
         });
         project.tracks[0].routing.effect_order.push(9_112);
 

@@ -66,7 +66,7 @@ const STARTER_PATCH_BASE: &[(&str, f32)] = &[
 ];
 
 static SURGE_ENGINE_LOCK: Mutex<()> = Mutex::new(());
-type InstrumentParameterCache = HashMap<String, Arc<OnceLock<Vec<InstrumentParameter>>>>;
+type InstrumentParameterCache = HashMap<String, Arc<Mutex<Option<Vec<InstrumentParameter>>>>>;
 static INSTRUMENT_PARAMETER_CACHE: OnceLock<Mutex<InstrumentParameterCache>> = OnceLock::new();
 static EFFECT_PARAMETER_CACHE: OnceLock<Mutex<HashMap<String, BTreeMap<String, f32>>>> =
     OnceLock::new();
@@ -466,6 +466,16 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn set_native_parameter(&mut self, index: i32, value: f32) -> Result<(), String> {
+        let mut id = SurgeId::empty();
+        if !self.synth.from_synth_side_id(index, &mut id) {
+            return Err(format!("Surge XT parameter is unavailable: {index}"));
+        }
+        self.synth
+            .set_parameter01(&mut id, value.clamp(0.0, 1.0), None, None);
+        Ok(())
+    }
+
     fn set_drum_timbre(&mut self, value: f32) {
         if let Some((minimum, maximum)) = self.drum_pitch_range {
             self.drum_pitch = (f32::from(minimum)
@@ -572,6 +582,18 @@ impl Engine {
                 let native = format!("{slot} {parameter}");
                 if self.parameters.contains_key(&native) {
                     self.set_parameter(&native, *value)?;
+                    let index = self.parameters[&native];
+                    let mut id = SurgeId::empty();
+                    if self.synth.from_synth_side_id(index, &mut id) {
+                        self.synth.set_parameter_temposync(
+                            &id,
+                            effect.tempo_sync_parameters.contains(parameter),
+                        );
+                        self.synth.set_parameter_deactivated(
+                            &id,
+                            effect.deactivated_parameters.contains(parameter),
+                        );
+                    }
                     self.effect_parameters
                         .insert((effect.id, parameter.clone()), native);
                 }
@@ -684,61 +706,69 @@ pub(crate) fn instrument_parameters(preset: &str) -> Vec<InstrumentParameter> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(preset.to_owned())
-        .or_insert_with(|| Arc::new(OnceLock::new()))
+        .or_insert_with(|| Arc::new(Mutex::new(None)))
         .clone();
-    entry
-        .get_or_init(|| {
-            let instrument = Instrument {
-                id: 1,
-                engine: crate::model::SURGE_ENGINE.to_owned(),
-                preset: preset.to_owned(),
-                attack: 0.0,
-                decay: 0.0,
-                sustain: 0.0,
-                release: 0.0,
-                cutoff: 0.0,
-                resonance: 0.0,
-                pitch: 0.0,
-                timbre: 0.5,
-                output: 0.0,
-                parameter_overrides: Vec::new(),
-                native_overrides: std::collections::BTreeMap::new(),
-            };
-            let Ok(engine) = Engine::new(&instrument, &[], &[], &[], 1, 48_000.0) else {
-                return Vec::new();
-            };
-            (0..MAX_NATIVE_PARAMETERS)
-                .filter_map(|index| {
-                    let mut id = SurgeId::empty();
-                    engine.synth.from_synth_side_id(index, &mut id).then(|| {
-                        let name = engine.synth.get_parameter_accessible_name(&mut id);
-                        let common = is_common_parameter(&name);
-                        InstrumentParameter {
-                            id: index,
-                            name,
-                            value: engine.synth.get_parameter01(&mut id),
-                            preset_value: engine.synth.get_parameter01(&mut id),
-                            display: engine.synth.get_parameter_display(&mut id),
-                            common,
-                            boolean: engine.synth.parameter_is_boolean(&id),
-                            discrete: engine.synth.parameter_is_discrete(&id),
-                            bipolar: engine.synth.parameter_is_bipolar(&id),
-                            tempo_sync: engine.synth.parameter_can_temposync(&id),
-                            can_deactivate: engine.synth.parameter_can_deactivate(&id),
-                            deactivated: engine.synth.parameter_is_deactivated(&id),
-                            choices: engine.synth.parameter_choices(&id),
-                            voice_modulatable: engine
-                                .synth
-                                .is_valid_modulation(index, VOICE_LFO_SOURCE),
-                            scene_modulatable: engine
-                                .synth
-                                .is_valid_modulation(index, SCENE_LFO_SOURCE),
-                        }
-                    })
+    let mut cached = entry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(parameters) = cached.as_ref() {
+        return parameters.clone();
+    }
+    let parameters: Vec<InstrumentParameter> = {
+        let instrument = Instrument {
+            id: 1,
+            engine: crate::model::SURGE_ENGINE.to_owned(),
+            preset: preset.to_owned(),
+            attack: 0.0,
+            decay: 0.0,
+            sustain: 0.0,
+            release: 0.0,
+            cutoff: 0.0,
+            resonance: 0.0,
+            pitch: 0.0,
+            timbre: 0.5,
+            output: 0.0,
+            parameter_overrides: Vec::new(),
+            native_overrides: std::collections::BTreeMap::new(),
+        };
+        let Ok(engine) = Engine::new(&instrument, &[], &[], &[], 1, 48_000.0) else {
+            return Vec::new();
+        };
+        (0..MAX_NATIVE_PARAMETERS)
+            .filter_map(|index| {
+                let mut id = SurgeId::empty();
+                engine.synth.from_synth_side_id(index, &mut id).then(|| {
+                    let name = engine.synth.get_parameter_accessible_name(&mut id);
+                    let common = is_common_parameter(&name);
+                    InstrumentParameter {
+                        id: index,
+                        name,
+                        value: engine.synth.get_parameter01(&mut id),
+                        preset_value: engine.synth.get_parameter01(&mut id),
+                        display: engine.synth.get_parameter_display(&mut id),
+                        common,
+                        boolean: engine.synth.parameter_is_boolean(&id),
+                        discrete: engine.synth.parameter_is_discrete(&id),
+                        bipolar: engine.synth.parameter_is_bipolar(&id),
+                        tempo_sync: engine.synth.parameter_can_temposync(&id),
+                        can_deactivate: engine.synth.parameter_can_deactivate(&id),
+                        deactivated: engine.synth.parameter_is_deactivated(&id),
+                        choices: engine.synth.parameter_choices(&id),
+                        voice_modulatable: engine
+                            .synth
+                            .is_valid_modulation(index, VOICE_LFO_SOURCE),
+                        scene_modulatable: engine
+                            .synth
+                            .is_valid_modulation(index, SCENE_LFO_SOURCE),
+                    }
                 })
-                .collect()
-        })
-        .clone()
+            })
+            .collect()
+    };
+    if !parameters.is_empty() {
+        *cached = Some(parameters.clone());
+    }
+    parameters
 }
 
 pub(crate) fn instrument_parameters_for_instrument(
@@ -893,6 +923,8 @@ pub(crate) fn effect_control_semantics(name: &str) -> HashMap<String, EffectPara
         enabled: true,
         parameters: effect_parameter_values(name),
         parameter_overrides: Vec::new(),
+        tempo_sync_parameters: Vec::new(),
+        deactivated_parameters: Vec::new(),
     };
     let semantics =
         effect_parameter_semantics(&instrument, std::slice::from_ref(&effect), &[1], 1, 1);
@@ -936,7 +968,7 @@ pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
         let mix = engine
             .parameter_value(&format!("{slot} Mix"))
             .unwrap_or(1.0);
-        let parameters = engine
+        let parameters: BTreeMap<String, f32> = engine
             .parameters
             .keys()
             .filter_map(|native| {
@@ -952,6 +984,27 @@ pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
                     })
             })
             .collect();
+        let tempo_sync_parameters = parameters
+            .keys()
+            .filter(|name| {
+                let Some(index) = engine.parameters.get(&format!("{slot} {name}")) else {
+                    return false;
+                };
+                let mut id = SurgeId::empty();
+                engine.synth.from_synth_side_id(*index, &mut id)
+                    && engine.synth.parameter_is_temposync(&id)
+            })
+            .cloned()
+            .collect();
+        let deactivated_parameters = parameters
+            .keys()
+            .filter(|name| {
+                engine
+                    .parameter_semantics(&format!("{slot} {name}"))
+                    .is_some_and(|semantics| semantics.deactivated)
+            })
+            .cloned()
+            .collect();
         effects.push(Effect {
             id: 0,
             name: (*name).to_owned(),
@@ -962,6 +1015,8 @@ pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
             enabled: true,
             parameters,
             parameter_overrides: Vec::new(),
+            tempo_sync_parameters,
+            deactivated_parameters,
         });
     }
     Ok(effects)
@@ -1413,6 +1468,8 @@ mod tests {
             enabled: true,
             parameters: BTreeMap::new(),
             parameter_overrides: Vec::new(),
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
         };
         let mut effects = (0..SERIAL_EFFECT_SLOT_COUNT - 1)
             .map(|index| Effect {
@@ -1425,6 +1482,8 @@ mod tests {
                 enabled: true,
                 parameters: distortion_parameters.clone(),
                 parameter_overrides: Vec::new(),
+                tempo_sync_parameters: Vec::new(),
+                deactivated_parameters: Vec::new(),
             })
             .collect::<Vec<_>>();
         effects.insert(0, preset_effect);
@@ -1489,6 +1548,8 @@ mod tests {
             enabled: true,
             parameters: effect_parameter_values("Reverb 2"),
             parameter_overrides: Vec::new(),
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
         };
         let added = Effect {
             id: 91,
@@ -1500,6 +1561,8 @@ mod tests {
             enabled: true,
             parameters: effect_parameter_values("Distortion"),
             parameter_overrides: Vec::new(),
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
         };
         let effects = [preset, added];
         let first = Engine::new(
@@ -1557,6 +1620,8 @@ mod tests {
                 enabled: true,
                 parameters: crate::surge::effect_parameter_values(name),
                 parameter_overrides: Vec::new(),
+                tempo_sync_parameters: Vec::new(),
+                deactivated_parameters: Vec::new(),
             });
         }
         for (index, effect) in effects.iter_mut().enumerate() {
@@ -1617,6 +1682,8 @@ mod tests {
             enabled: true,
             parameters: crate::surge::effect_parameter_values("Distortion"),
             parameter_overrides: Vec::new(),
+            tempo_sync_parameters: Vec::new(),
+            deactivated_parameters: Vec::new(),
         };
         let engine = Engine::new(
             &instrument,
@@ -1656,6 +1723,8 @@ mod tests {
                 enabled: true,
                 parameters: crate::surge::effect_parameter_values(name),
                 parameter_overrides: Vec::new(),
+                tempo_sync_parameters: Vec::new(),
+                deactivated_parameters: Vec::new(),
             };
             let mut engine = Engine::new(&instrument, &[effect], &[77], &[], 1, 16_000.0)
                 .unwrap_or_else(|error| panic!("{name} did not load: {error}"));
