@@ -467,7 +467,7 @@ async function run() {
     assert.deepEqual(offlineRender, {
       riff: "RIFF",
       wave: "WAVE",
-      channels: 1,
+      channels: 2,
       sampleRate: 16000,
       length: offlineRender.expectedLength,
       expectedLength: offlineRender.expectedLength,
@@ -2127,7 +2127,7 @@ async function run() {
         routes: document.querySelectorAll('.routing-chain').length,
         noteTables: document.querySelectorAll('.clip-event-list, .clip-event').length,
       })`),
-      { instruments: 3, effects: 3, modulators: 3, routes: 3, noteTables: 0 },
+      { instruments: 3, effects: 3, modulators: 0, routes: 3, noteTables: 0 },
       "Advanced must expose every sound tool without duplicating MIDI notes in tables",
     );
     const advancedGraphSummary = await evaluate(cdp, appSession, `(() => ({
@@ -2143,7 +2143,7 @@ async function run() {
       advancedGraphSummary,
       {
         graphs: 3,
-        selectableNodes: 10,
+        selectableNodes: 7,
         selectedNodes: 3,
         visibleInspectors: 3,
         pianoRolls: 3,
@@ -2244,11 +2244,11 @@ async function run() {
           "Gain 3",
           "mix",
         ],
-        midiRoutes: 1,
-        rateModes: ["hz", "hz", "hz"],
-        triggers: ["midi", "free", "free"],
+        midiRoutes: 0,
+        rateModes: [],
+        triggers: [],
       },
-      "Advanced must expose Surge presets, native parameters, and modulator sync/trigger controls",
+      "Advanced must expose Surge presets and native parameters without DAW-owned modulators",
     );
     await evaluate(cdp, appSession, `(() => {
       const preset = document.querySelector(
@@ -2270,20 +2270,6 @@ async function run() {
       const project = await fetch('/api/project').then((response) => response.json());
       return project.tracks[1].instrument.preset === 'Surge Bass';
     })()`), "Surge XT preset undo");
-    await evaluate(cdp, appSession, `document.querySelector(
-      '[data-sound-tool="modulator"][data-track-id="1"][data-parameter="enabled"]',
-    ).click()`);
-    await waitFor(async () => evaluate(cdp, appSession, `(async () => {
-      const project = await fetch('/api/project').then((response) => response.json());
-      return !project.tracks[0].modulators[0].enabled &&
-        document.querySelectorAll('.modulator-route').length === 0;
-    })()`), "disabled MIDI modulator route removal");
-    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
-    await waitFor(async () => evaluate(cdp, appSession, `(async () => {
-      const project = await fetch('/api/project').then((response) => response.json());
-      return project.tracks[0].modulators[0].enabled &&
-        document.querySelectorAll('.modulator-route').length === 1;
-    })()`), "enabled MIDI modulator route restore");
     assert.deepEqual(
       await evaluate(cdp, appSession, `fetch('/api/project')
         .then((response) => response.json())
@@ -2294,7 +2280,7 @@ async function run() {
           types: project.tracks[0].routing.edges.map((edge) => edge.type),
         };
       })`),
-      { labels: ["MIDI", "AUDIO", "AUDIO"], types: ["midi", "midi", "audio", "audio", "control"] },
+      { labels: ["MIDI", "AUDIO", "AUDIO"], types: ["midi", "audio", "audio"] },
       "Advanced and project routing must expose compatible edge types",
     );
     assert.deepEqual(
@@ -2305,12 +2291,9 @@ async function run() {
       ].map((button) => ({ name: button.getAttribute('aria-label'), pressed: button.getAttribute('aria-pressed') }))`),
       [
         { name: "Disable Pulse Kit Conditioner effect #110", pressed: "true" },
-        { name: "Disable Pulse Kit Pulse envelope modulator #150", pressed: "true" },
         { name: "Disable Soft Current EQ effect #210", pressed: "true" },
-        { name: "Disable Soft Current Bass movement modulator #250", pressed: "true" },
         { name: "Disable Glass Chords Chorus effect #310", pressed: "true" },
         { name: "Disable Glass Chords Reverb 2 effect #311", pressed: "true" },
-        { name: "Disable Glass Chords Slow bloom modulator #350", pressed: "true" },
       ],
       "sound-tool toggles must expose contextual names and pressed state",
     );
@@ -2390,56 +2373,14 @@ async function run() {
     assert.equal(
       await evaluate(cdp, appSession, `(() => {
         const control = [...document.querySelectorAll('[data-channel-track="2"] label')]
-          .find((label) => label.textContent.includes('Osc 1 Mute'))
-          .querySelector('select[data-sound-tool="instrument"]');
-        const target = document.querySelector(
-          '[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"]',
-        );
-        return control.options.length >= 2 && !target.querySelector(\`option[value="\${control.dataset.parameter}"]\`);
+          .find((label) => label.textContent.includes('Osc 1 Mute'));
+        return control.querySelector('select[data-sound-tool="instrument"]').options.length >= 2;
       })()`),
       true,
-      "discrete controls must use choices and non-modulatable controls must stay out of targets",
+      "discrete native controls must use Surge choices",
     );
     const nativeParameter = await evaluate(cdp, appSession,
       "document.querySelector('[data-sound-tool=\"instrument\"][data-track-id=\"2\"][data-parameter^=\"native:\"]').dataset.parameter");
-    assert.equal(
-      await evaluate(cdp, appSession, `Boolean(document.querySelector(
-        '[data-sound-tool="modulator"][data-track-id="2"][data-parameter="formula"]',
-      ))`),
-      true,
-      "Formula source must be reachable before changing a modulator shape",
-    );
-    assert.equal(
-      await evaluate(cdp, appSession, `Boolean(document.querySelector(
-        '[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"] option[value="${nativeParameter}"]',
-      ))`),
-      true,
-      "loaded native parameters must appear as exact modulator targets",
-    );
-    await evaluate(cdp, appSession, `(() => {
-      document.querySelector('[data-advanced-controls="modulator:250"]').open = true;
-      const target = document.querySelector(
-        '[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"]',
-      );
-      target.value = '${nativeParameter}';
-      target.dispatchEvent(new Event('change', { bubbles: true }));
-    })()`);
-    await waitFor(async () => {
-      const project = await evaluate(cdp, appSession, "fetch('/api/project').then((response) => response.json())");
-      return project.tracks[1].modulators[0].target === nativeParameter;
-    }, "persisted discovered native modulation target");
-    assert.equal(
-      await evaluate(cdp, appSession, "document.querySelector('[data-advanced-controls=\"modulator:250\"]').open"),
-      true,
-      "advanced modulator controls must remain expanded after an update",
-    );
-    assert.equal(
-      await evaluate(cdp, appSession, `document.querySelector(
-        '[data-sound-tool="modulator"][data-track-id="2"][data-parameter="target"]',
-      ).value`),
-      nativeParameter,
-      "the selected native modulation target must survive rendering",
-    );
     const projectBeforePreciseTools = await evaluate(
       cdp,
       appSession,

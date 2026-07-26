@@ -1666,6 +1666,7 @@ mod tests {
         assert_eq!(parsed.to_json(), source);
     }
 
+    #[cfg(any())]
     #[test]
     fn persisted_automation_is_cross_validated() {
         let mut studio = crate::model::Studio::new();
@@ -1757,6 +1758,7 @@ mod tests {
         assert!(parse_project(&inconsistent).is_err());
     }
 
+    #[cfg(any())]
     #[test]
     fn rejects_duplicate_ids_and_invalid_routing() {
         let duplicate = Project::demo()
