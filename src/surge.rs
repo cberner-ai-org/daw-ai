@@ -1006,7 +1006,7 @@ pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
             .filter(|name| {
                 engine
                     .parameter_semantics(&format!("{slot} {name}"))
-                    .is_some_and(|semantics| semantics.deactivated)
+                    .is_some_and(|semantics| semantics.can_deactivate && semantics.deactivated)
             })
             .cloned()
             .collect();
