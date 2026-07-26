@@ -242,17 +242,90 @@ impl SurgeSynthesizer {
         unsafe { hell_ffi::getParameter01(self.ptr, &mut index.0) }
     }
 
+    pub fn parameter_is_bipolar(&self, index: &SurgeId) -> bool {
+        unsafe {
+            hell_ffi::surge_parameter_is_bipolar(self.ptr, index.get_synth_side_id())
+        }
+    }
+
+    pub fn parameter_is_discrete(&self, index: &SurgeId) -> bool {
+        unsafe {
+            hell_ffi::surge_parameter_is_discrete(self.ptr, index.get_synth_side_id())
+        }
+    }
+
+    pub fn parameter_is_boolean(&self, index: &SurgeId) -> bool {
+        unsafe {
+            hell_ffi::surge_parameter_is_boolean(self.ptr, index.get_synth_side_id())
+        }
+    }
+
+    pub fn parameter_can_temposync(&self, index: &SurgeId) -> bool {
+        unsafe {
+            hell_ffi::surge_parameter_can_temposync(self.ptr, index.get_synth_side_id())
+        }
+    }
+
+    pub fn parameter_can_deactivate(&self, index: &SurgeId) -> bool {
+        unsafe {
+            hell_ffi::surge_parameter_can_deactivate(self.ptr, index.get_synth_side_id())
+        }
+    }
+
+    pub fn parameter_is_deactivated(&self, index: &SurgeId) -> bool {
+        unsafe {
+            hell_ffi::surge_parameter_is_deactivated(self.ptr, index.get_synth_side_id())
+        }
+    }
+
+    pub fn parameter_choices(&self, index: &SurgeId) -> Vec<(f32, String)> {
+        let parameter = index.get_synth_side_id();
+        let count = unsafe { hell_ffi::surge_parameter_choice_count(self.ptr, parameter) };
+        (0..count.min(128))
+            .filter(|choice| {
+                let value = unsafe {
+                    hell_ffi::surge_parameter_choice_value(self.ptr, parameter, *choice)
+                };
+                unsafe {
+                    hell_ffi::surge_parameter_value_available(self.ptr, parameter, value)
+                }
+            })
+            .map(|choice| {
+                let value = unsafe {
+                    hell_ffi::surge_parameter_choice_value(self.ptr, parameter, choice)
+                };
+                let mut output = [0_i8; 128];
+                unsafe {
+                    hell_ffi::surge_parameter_choice_display(
+                        self.ptr,
+                        parameter,
+                        choice,
+                        output.as_mut_ptr(),
+                        output.len() as i32,
+                    );
+                }
+                let display = unsafe { std::ffi::CStr::from_ptr(output.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                (value, display)
+            })
+            .collect()
+    }
+
     pub fn set_parameter01(
         &mut self,
         index: &mut SurgeId,
         value: f32,
-        external: Option<bool>,
-        force_integer: Option<bool>,
+        _external: Option<bool>,
+        _force_integer: Option<bool>,
     ) -> bool {
-        let external = external.unwrap_or(false);
-        let force_integer = force_integer.unwrap_or(false);
-
-        unsafe { hell_ffi::setParameter01(self.ptr, &mut index.0, value, external, force_integer) }
+        unsafe {
+            hell_ffi::surge_set_parameter01_safe(
+                self.ptr,
+                index.get_synth_side_id(),
+                value,
+            )
+        }
     }
 
     pub fn set_modulation(
@@ -271,6 +344,10 @@ impl SurgeSynthesizer {
                 depth.clamp(-1.0, 1.0),
             )
         }
+    }
+
+    pub fn is_valid_modulation(&self, target: i32, source: i32) -> bool {
+        unsafe { surge_bridge::surge_is_valid_modulation(self.ptr, target, source) }
     }
 
     pub fn clear_modulation(&mut self, target: i32, source: i32, source_scene: i32) {

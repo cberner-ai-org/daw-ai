@@ -291,18 +291,22 @@ fn run_session_with_transport_reference(
         }
 
         let mut results = Vec::with_capacity(calls.len() * 2);
-        for call in calls {
+        for (index, call) in calls.into_iter().enumerate() {
             if is_cancelled() {
                 return Err(PlannerError::Interrupted);
             }
-            let output = execute_tool(
-                session,
-                sequence,
-                &call,
-                &mut state,
-                render_audio,
-                on_update,
-            )?;
+            let output = if index == 0 {
+                execute_tool(
+                    session,
+                    sequence,
+                    &call,
+                    &mut state,
+                    render_audio,
+                    on_update,
+                )?
+            } else {
+                ToolOutput::text("Tool error: call one tool at a time; retry this call".to_owned())
+            };
             results.push(serde_json::json!({
                 "type": "function_result",
                 "name": call.name,
@@ -1157,14 +1161,13 @@ fn role_from_name(name: &str) -> Result<Option<TrackRole>, PlannerError> {
 #[cfg(test)]
 fn effect_name(name: &str, allow_all: bool) -> Result<&'static str, PlannerError> {
     match name {
-        "Reverb" => Ok("Reverb"),
-        "Room" => Ok("Room"),
-        "Echo" => Ok("Echo"),
+        "Reverb 2" => Ok("Reverb 2"),
+        "Delay" => Ok("Delay"),
         "Chorus" => Ok("Chorus"),
-        "Low-pass filter" => Ok("Low-pass filter"),
-        "Punch compressor" => Ok("Punch compressor"),
-        "Drive" => Ok("Drive"),
-        "Shimmer" => Ok("Shimmer"),
+        "EQ" => Ok("EQ"),
+        "Conditioner" => Ok("Conditioner"),
+        "Distortion" => Ok("Distortion"),
+        "Nimbus" => Ok("Nimbus"),
         "Effects" if allow_all => Ok("Effects"),
         _ => Err(invalid("unknown effect name")),
     }
@@ -1589,6 +1592,55 @@ mod tests {
         assert_eq!(calls[0].id, "call-1");
         assert_eq!(calls[0].name, READ_TOOL_NAME);
     }
+
+    #[test]
+    fn producer_executes_only_one_returned_tool_call_per_interaction() {
+        let session =
+            EditSession::create(&Project::demo(), "shape the bass", 0.0, 4.0).expect("session");
+        let responses = [
+            serde_json::json!({
+                "id":"multi","status":"requires_action","steps":[
+                    {"type":"function_call","id":"edit-bass","name":"set_parameter",
+                     "arguments":preset_edit("Surge Lead")},
+                    {"type":"function_call","id":"tempo-early","name":"set_tempo",
+                     "arguments":{"bpm":140}}
+                ]
+            }),
+            serde_json::json!({
+                "id":"tempo","status":"requires_action","steps":[{
+                    "type":"function_call","id":"tempo-retry","name":"set_tempo",
+                    "arguments":{"bpm":140}
+                }]
+            }),
+            serde_json::json!({"id":"done","status":"completed","steps":[]}),
+        ];
+        let mut response_index = 0;
+        let mut saw_retry_message = false;
+        let result = run_session_with_transport(
+            &session,
+            "shape the bass",
+            0.0,
+            4.0,
+            &mut render_audio_request,
+            &mut |edit| Ok(edit.project),
+            &|| false,
+            &mut |sequence, request, _| {
+                if sequence == 2 {
+                    saw_retry_message = request
+                        .to_string()
+                        .contains("call one tool at a time; retry this call");
+                }
+                let response = responses[response_index].to_string();
+                response_index += 1;
+                Ok(response)
+            },
+        )
+        .expect("producer session");
+        assert!(saw_retry_message);
+        assert_eq!(result.project.bpm, 140);
+        assert_eq!(session.stats().unwrap().0, 2);
+    }
+
     #[test]
     fn producer_can_finish_immediately_after_listening() {
         let session =
@@ -1847,8 +1899,8 @@ mod tests {
                 "musicalPlan":"Darken the chord timbre and add a long ambient tail.",
                 "actions":[
                     {"kind":"filter","target":"chords","name":"None","value":-0.3},
-                    {"kind":"effect","target":"chords","name":"Reverb","value":0.42},
-                    {"kind":"effect","target":"chords","name":"Drive","value":0.2}
+                    {"kind":"effect","target":"chords","name":"Reverb 2","value":0.42},
+                    {"kind":"effect","target":"chords","name":"Distortion","value":0.2}
                 ]
             }"#,
         )
@@ -1862,12 +1914,12 @@ mod tests {
                         target: Some(TrackRole::Chords),
                     },
                     Action::Effect {
-                        name: "Reverb",
+                        name: "Reverb 2",
                         mix: 0.42,
                         target: Some(TrackRole::Chords),
                     },
                     Action::Effect {
-                        name: "Drive",
+                        name: "Distortion",
                         mix: 0.2,
                         target: Some(TrackRole::Chords),
                     },
@@ -2084,7 +2136,7 @@ mod tests {
             "summary": long_summary,
             "musicalPlan": long_plan,
             "actions": [{
-                "kind": "effect", "target": "bass", "name": "Drive", "value": 0.5
+                "kind": "effect", "target": "bass", "name": "Distortion", "value": 0.5
             }]
         })
         .to_string();

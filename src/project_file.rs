@@ -4,7 +4,6 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::model::{
     ChannelOperation, ChannelOperationAction, Clip, ClipEvent, Edit, EditOperation, Effect,
-    FILTER_CUTOFF_MAX_HZ, FILTER_CUTOFF_MIN_HZ, FILTER_RESONANCE_MAX, FILTER_RESONANCE_MIN,
     Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project, ProjectFileError, Routing, SURGE_ENGINE,
     Track, TrackRole, automation_target_range, valid_surge_preset,
 };
@@ -55,6 +54,9 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         })
     }) {
         return Err(invalid("modulator configuration is unsupported"));
+    }
+    for track in &tracks {
+        validate_modulator_targets(track)?;
     }
     let edit_values = array(root, "edits")?;
     if edit_values.len() > MAX_EDITS {
@@ -318,7 +320,6 @@ fn parse_track(
             "{context} exceeds Surge XT's serial effect capacity"
         )));
     }
-    validate_modulator_targets(&parsed)?;
     Ok(parsed)
 }
 
@@ -376,26 +377,39 @@ fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, Pro
     let effect = object(value, "effect")?;
     let id = unique_id(effect, "id", ids, "effect")?;
     expect_type(effect, "effect")?;
-    let name = limited_string(effect, "name", 1, 64)?;
+    let persisted_name = limited_string(effect, "name", 1, 64)?;
+    let name = persisted_effect_name(&persisted_name).to_owned();
     if !is_effect_name(&name) {
         return Err(invalid(format!("unsupported effect: {name}")));
     }
     let parameters = object(field(effect, "parameters")?, "effect parameters")?;
-    let is_filter = name == "Low-pass filter";
+    let native_parameters = crate::surge::effect_parameter_values(&name);
     let mut extra_parameters = std::collections::BTreeMap::new();
-    for spec in crate::model::effect_parameter_specs(&name) {
-        let value = parameters
-            .get(spec.name)
-            .and_then(JsonValue::as_f64)
-            .map(|value| value as f32)
-            .unwrap_or(spec.default);
+    for (persisted_parameter, value) in parameters {
+        if persisted_parameter == "mix" {
+            continue;
+        }
+        let Some(native_name) = persisted_effect_parameter(&persisted_name, persisted_parameter)
+        else {
+            continue;
+        };
+        let value = value.as_f64().ok_or_else(|| {
+            invalid(format!(
+                "effect parameter {persisted_parameter} must be numeric"
+            ))
+        })? as f32;
+        let value = migrate_effect_parameter_value(&persisted_name, persisted_parameter, value)?;
         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
             return Err(invalid(format!(
-                "effect parameter {} must be between 0 and 1",
-                spec.name
+                "effect parameter {persisted_parameter} must be between 0 and 1"
             )));
         }
-        extra_parameters.insert(spec.name.to_owned(), value);
+        if native_parameters.contains_key(native_name) {
+            extra_parameters.insert(native_name.to_owned(), value);
+        }
+    }
+    for (name, value) in native_parameters {
+        extra_parameters.entry(name).or_insert(value);
     }
     let parameter_overrides = effect
         .get("overrides")
@@ -403,47 +417,117 @@ fn parse_effect(value: &JsonValue, ids: &mut HashSet<u64>) -> Result<Effect, Pro
         .map(|values| {
             values
                 .iter()
-                .map(|value| {
-                    let name = value
+                .filter_map(|value| {
+                    let persisted_parameter = value
                         .as_str()
-                        .ok_or_else(|| invalid("effect overrides must be strings"))?;
-                    if !extra_parameters.contains_key(name) {
-                        return Err(invalid("effect override is unsupported"));
+                        .ok_or_else(|| invalid("effect overrides must be strings"));
+                    let persisted_parameter = match persisted_parameter {
+                        Ok(name) => name,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    let name = persisted_effect_parameter(&persisted_name, persisted_parameter)?;
+                    if name != "mix" && !extra_parameters.contains_key(name) {
+                        return None;
                     }
-                    Ok(name.to_owned())
+                    Some(Ok(name.to_owned()))
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?
         .unwrap_or_default();
+    let preset_slot = effect
+        .contains_key("presetSlot")
+        .then(|| {
+            bounded_integer(
+                effect,
+                "presetSlot",
+                1,
+                crate::surge::SERIAL_EFFECT_SLOT_COUNT as u64,
+            )
+            .map(|slot| (slot - 1) as usize)
+        })
+        .transpose()?;
     Ok(Effect {
         id,
         name,
+        preset_slot,
         mix: range(parameters, "mix", 0.0, 1.0)?,
-        cutoff_hz: if is_filter {
-            Some(range(
-                parameters,
-                "cutoff",
-                FILTER_CUTOFF_MIN_HZ,
-                FILTER_CUTOFF_MAX_HZ,
-            )?)
-        } else {
-            None
-        },
-        resonance: if is_filter {
-            Some(range(
-                parameters,
-                "resonance",
-                FILTER_RESONANCE_MIN,
-                FILTER_RESONANCE_MAX,
-            )?)
-        } else {
-            None
-        },
+        cutoff_hz: None,
+        resonance: None,
         enabled: boolean(effect, "enabled")?,
         parameters: extra_parameters,
         parameter_overrides,
     })
+}
+
+fn persisted_effect_name(name: &str) -> &str {
+    match name {
+        "Reverb" | "Room" => "Reverb 2",
+        "Echo" => "Delay",
+        "Low-pass filter" => "EQ",
+        "Punch compressor" => "Conditioner",
+        "Drive" => "Distortion",
+        "Shimmer" => "Nimbus",
+        name => name,
+    }
+}
+
+fn persisted_effect_parameter<'a>(effect_name: &str, parameter: &'a str) -> Option<&'a str> {
+    if parameter == "mix" {
+        return Some(parameter);
+    }
+    let native = match (persisted_effect_name(effect_name), parameter) {
+        ("Delay", "time") => "Left",
+        ("Delay", "feedback") => "Feedback",
+        ("Delay", "lowCut") => "Low Cut",
+        ("Delay", "highCut") => "High Cut",
+        ("Delay", "width") => "Width",
+        ("Reverb 2", "size") => "Room Size",
+        ("Reverb 2", "decay") => "Decay Time",
+        ("Reverb 2", "preDelay") => "Pre-Delay",
+        ("Reverb 2", "damping") => "HF Damping",
+        ("Reverb 2", "width") => "Width",
+        ("Distortion", "drive") => "Drive",
+        ("Distortion", "tone") => "Frequency",
+        ("Distortion", "output") => "Gain",
+        ("EQ", "lowGain") => "Gain 1",
+        ("EQ", "midGain") => "Gain 2",
+        ("EQ", "highGain" | "resonance") => "Gain 3",
+        ("EQ", "lowFrequency") => "Frequency 1",
+        ("EQ", "midFrequency") => "Frequency 2",
+        ("EQ", "highFrequency" | "cutoff") => "Frequency 3",
+        ("Conditioner", "threshold") => "Threshold",
+        ("Conditioner", "attack") => "Attack Rate",
+        ("Conditioner", "release") => "Release Rate",
+        ("Conditioner", "output") => "Gain",
+        _ => parameter,
+    };
+    Some(native)
+}
+
+fn migrate_effect_parameter_value(
+    effect_name: &str,
+    parameter: &str,
+    value: f32,
+) -> Result<f32, ProjectFileError> {
+    match (effect_name, parameter) {
+        ("Low-pass filter", "cutoff")
+            if (crate::model::FILTER_CUTOFF_MIN_HZ..=crate::model::FILTER_CUTOFF_MAX_HZ)
+                .contains(&value) =>
+        {
+            Ok(crate::surge::normalize_filter_cutoff(value))
+        }
+        ("Low-pass filter", "resonance")
+            if (crate::model::FILTER_RESONANCE_MIN..=crate::model::FILTER_RESONANCE_MAX)
+                .contains(&value) =>
+        {
+            Ok(crate::surge::normalize_filter_resonance(value))
+        }
+        ("Low-pass filter", "cutoff" | "resonance") => {
+            Err(invalid(format!("legacy {parameter} is out of range")))
+        }
+        _ => Ok(value),
+    }
 }
 
 fn parse_modulator(
@@ -1114,9 +1198,13 @@ fn parse_midi_note(value: &JsonValue, loop_beats: f32) -> Result<MidiNote, Proje
 
 fn validate_modulator_targets(track: &Track) -> Result<(), ProjectFileError> {
     for modulator in &track.modulators {
-        if !crate::model::valid_modulator_target(track, &modulator.target) {
+        if !crate::model::valid_modulator_target_for_trigger(
+            track,
+            &modulator.target,
+            &modulator.trigger,
+        ) {
             return Err(invalid(format!(
-                "modulator {} targets an unknown parameter",
+                "modulator {} targets an unavailable parameter",
                 modulator.id
             )));
         }
@@ -1211,14 +1299,19 @@ fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
 
 fn effect_name(value: &str, allow_all: bool) -> Result<&'static str, ProjectFileError> {
     match value {
-        "Reverb" => Ok("Reverb"),
-        "Room" => Ok("Room"),
-        "Echo" => Ok("Echo"),
+        "Reverb" | "Room" => Ok("Reverb 2"),
+        "Echo" => Ok("Delay"),
+        "Low-pass filter" => Ok("EQ"),
+        "Punch compressor" => Ok("Conditioner"),
+        "Drive" => Ok("Distortion"),
+        "Shimmer" => Ok("Nimbus"),
+        "Reverb 2" => Ok("Reverb 2"),
+        "Delay" => Ok("Delay"),
         "Chorus" => Ok("Chorus"),
-        "Low-pass filter" => Ok("Low-pass filter"),
-        "Punch compressor" => Ok("Punch compressor"),
-        "Drive" => Ok("Drive"),
-        "Shimmer" => Ok("Shimmer"),
+        "EQ" => Ok("EQ"),
+        "Conditioner" => Ok("Conditioner"),
+        "Distortion" => Ok("Distortion"),
+        "Nimbus" => Ok("Nimbus"),
         "Effects" if allow_all => Ok("Effects"),
         _ => Err(invalid(format!("unsupported effect: {value}"))),
     }
@@ -1447,6 +1540,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_explicit_preset_effect_slots() {
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(9),
+            serde_json::json!("1"),
+            serde_json::json!(1.5),
+            serde_json::Value::Null,
+        ] {
+            let mut project: serde_json::Value =
+                serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+            project["tracks"][1]["effects"][0]["presetSlot"] = value.clone();
+            let error = match parse_project(&project.to_string()) {
+                Ok(_) => panic!("accepted invalid presetSlot {value}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("presetSlot"));
+        }
+    }
+
+    #[test]
     fn rejects_native_modulators_beyond_surge_slot_capacity() {
         let mut project = Project::demo();
         let track = &mut project.tracks[1];
@@ -1601,5 +1714,51 @@ mod tests {
             1,
         );
         assert!(parse_project(&edge).is_err());
+    }
+
+    #[test]
+    fn migrates_legacy_effect_names_and_parameters_to_native_surge_state() {
+        for (legacy, native) in [
+            ("Reverb", "Reverb 2"),
+            ("Room", "Reverb 2"),
+            ("Echo", "Delay"),
+            ("Low-pass filter", "EQ"),
+            ("Punch compressor", "Conditioner"),
+            ("Drive", "Distortion"),
+            ("Shimmer", "Nimbus"),
+        ] {
+            assert_eq!(persisted_effect_name(legacy), native);
+            assert_eq!(
+                effect_name(legacy, false).expect("legacy edit action migration"),
+                native
+            );
+        }
+
+        let source = Project::demo()
+            .to_json()
+            .replacen("\"name\":\"EQ\"", "\"name\":\"Low-pass filter\"", 1)
+            .replacen(
+                "\"parameters\":{\"mix\":0.46,",
+                "\"parameters\":{\"mix\":0.46,\"cutoff\":640,\"resonance\":8.5,",
+                1,
+            )
+            .replacen("\"Frequency 1\"", "\"lowFrequency\"", 2)
+            .replacen("\"Gain 1\"", "\"lowGain\"", 2);
+        let migrated = parse_project(&source).expect("legacy effect migration");
+        let effect = &migrated.tracks[1].effects[0];
+        assert_eq!(effect.name, "EQ");
+        assert_eq!(
+            effect.parameters["Frequency 3"],
+            crate::surge::normalize_filter_cutoff(640.0)
+        );
+        assert_eq!(
+            effect.parameters["Gain 3"],
+            crate::surge::normalize_filter_resonance(8.5)
+        );
+        assert!(effect.parameters.contains_key("Frequency 1"));
+        assert!(effect.parameters.contains_key("Gain 1"));
+        assert!(!effect.parameters.contains_key("lowFrequency"));
+        assert!(!effect.parameters.contains_key("lowGain"));
+        assert!(!migrated.to_json().contains("Low-pass filter"));
     }
 }

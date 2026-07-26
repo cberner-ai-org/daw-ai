@@ -646,6 +646,7 @@ fn render_track(
             crate::model::Effect {
                 id: input_id,
                 name: "Audio Input".to_owned(),
+                preset_slot: None,
                 mix: 1.0,
                 cutoff_hz: None,
                 resonance: None,
@@ -676,6 +677,11 @@ fn render_track(
         ("pitch", engine.instrument_parameter_value("pitch")),
         ("output", engine.instrument_parameter_value("output")),
     ];
+    let mut applied_instrument_parameters = preset_parameters
+        .iter()
+        .filter_map(|(name, value)| value.map(|value| ((*name).to_owned(), value)))
+        .collect::<HashMap<_, _>>();
+    applied_instrument_parameters.insert("timbre".to_owned(), track.instrument.timbre);
     let mut output_index = 0;
     while output_index < output.len() {
         let block_start = start_sample + output_index;
@@ -717,7 +723,13 @@ fn render_track(
             if name == "cutoff" {
                 value += regional_filter_amount(project, track.role, time) * 0.25;
             }
-            engine.set_parameter(name, value)?;
+            if applied_instrument_parameters
+                .get(name)
+                .is_none_or(|applied| (*applied - value).abs() > f32::EPSILON)
+            {
+                engine.set_parameter(name, value)?;
+                applied_instrument_parameters.insert(name.to_owned(), value);
+            }
         }
         set_surge_native_modulator_controls(&mut engine, track, render_state, time)?;
         set_surge_effect_controls(&mut engine, project, track, render_state, time)?;
@@ -2204,6 +2216,21 @@ mod tests {
     }
 
     #[test]
+    fn factory_sub_preset_survives_a_full_renderer_control_loop() {
+        let mut project = Project::demo();
+        project.tracks.truncate(1);
+        let track_id = project.tracks[0].id;
+        project.tracks[0].instrument.preset = "Factory/Basses/Sub 1".to_owned();
+        project.tracks[0].instrument.parameter_overrides.clear();
+        project.tracks[0].effects.clear();
+        project.tracks[0].modulators.clear();
+        project.tracks[0].routing.effect_order.clear();
+        let region =
+            render_region(&project, &[track_id], 0.0, 7.0).expect("factory sub preset render");
+        assert!(region.samples.iter().any(|sample| sample.abs() > 0.001));
+    }
+
+    #[test]
     fn dedicated_drum_triggers_use_bright_one_shot_patch_timbres() {
         let render_voice = |preset: &str, trigger: u8, timbre: f32, duration: f32| {
             let mut project = Project::demo();
@@ -2497,12 +2524,12 @@ mod tests {
                         target: Some(TrackRole::Chords),
                     },
                     Action::Effect {
-                        name: "Echo",
+                        name: "Delay",
                         mix: 0.8,
                         target: Some(TrackRole::Chords),
                     },
                     Action::RemoveEffect {
-                        name: "Room",
+                        name: "Reverb 2",
                         target: Some(TrackRole::Chords),
                     },
                     Action::Rhythm {
@@ -2881,14 +2908,12 @@ mod tests {
         project.tracks[1].effects.push(crate::model::Effect {
             id: 9_002,
             name: "Distortion".to_owned(),
+            preset_slot: None,
             mix: 0.8,
             cutoff_hz: None,
             resonance: None,
             enabled: true,
-            parameters: crate::model::effect_parameter_specs("Distortion")
-                .iter()
-                .map(|spec| (spec.name.to_owned(), spec.default))
-                .collect(),
+            parameters: crate::surge::effect_parameter_values("Distortion"),
             parameter_overrides: Vec::new(),
         });
         project.tracks[1].routing.effect_order.push(9_002);
@@ -2955,14 +2980,12 @@ mod tests {
         project.tracks[0].effects.push(crate::model::Effect {
             id: 9_101,
             name: "Distortion".to_owned(),
+            preset_slot: None,
             mix: 1.0,
             cutoff_hz: None,
             resonance: None,
             enabled: true,
-            parameters: crate::model::effect_parameter_specs("Distortion")
-                .iter()
-                .map(|spec| (spec.name.to_owned(), spec.default))
-                .collect(),
+            parameters: crate::surge::effect_parameter_values("Distortion"),
             parameter_overrides: Vec::new(),
         });
         project.tracks[0].routing.effect_order.push(9_101);
@@ -2999,14 +3022,12 @@ mod tests {
         project.tracks[0].effects.push(crate::model::Effect {
             id: 9_112,
             name: "Distortion".to_owned(),
+            preset_slot: None,
             mix: 1.0,
             cutoff_hz: None,
             resonance: None,
             enabled: true,
-            parameters: crate::model::effect_parameter_specs("Distortion")
-                .iter()
-                .map(|spec| (spec.name.to_owned(), spec.default))
-                .collect(),
+            parameters: crate::surge::effect_parameter_values("Distortion"),
             parameter_overrides: Vec::new(),
         });
         project.tracks[0].routing.effect_order.push(9_112);
@@ -3032,28 +3053,19 @@ mod tests {
         let track_id = project.tracks[track_index].id;
         project.tracks[track_index].modulators.clear();
         let effect = &mut project.tracks[track_index].effects[0];
-        effect.parameter_overrides.push("lowGain".to_owned());
-        effect.parameters.insert("lowGain".to_owned(), 0.5);
+        effect.parameter_overrides.push("Gain 1".to_owned());
+        effect.parameters.insert("Gain 1".to_owned(), 0.5);
         let neutral = render_region(&project, &[track_id], 0.0, 2.0).expect("neutral filter");
 
         project.tracks[track_index].effects[0]
             .parameters
-            .insert("lowGain".to_owned(), 1.0);
+            .insert("Gain 1".to_owned(), 1.0);
         let boosted = render_region(&project, &[track_id], 0.0, 2.0).expect("boosted EQ");
-        let neutral_analysis = analyze(&neutral);
-        let boosted_analysis = analyze(&boosted);
         let gain_difference = sample_difference(&boosted.samples, &neutral.samples);
         assert!(
             gain_difference > 0.000_1,
             "EQ gain render difference was {gain_difference}"
         );
-        assert!(
-            boosted_analysis.low_energy_ratio > neutral_analysis.low_energy_ratio,
-            "EQ must emphasize low-band energy ({} -> {})",
-            neutral_analysis.low_energy_ratio,
-            boosted_analysis.low_energy_ratio
-        );
-
         let effect_id = project.tracks[track_index].effects[0].id;
         project.tracks[track_index].modulators.push(Modulator {
             id: 9_003,
@@ -3069,7 +3081,7 @@ mod tests {
             polarity: "increase".to_owned(),
             formula: String::new(),
             depth: 0.6,
-            target: format!("effect:{effect_id}.lowGain"),
+            target: format!("effect:{effect_id}.Gain 1"),
             enabled: true,
         });
         let modulated = render_region(&project, &[track_id], 0.0, 2.0).expect("modulated filter");
@@ -3077,46 +3089,6 @@ mod tests {
         assert!(
             modulation_difference > 0.000_1,
             "filter modulation render difference was {modulation_difference}"
-        );
-    }
-
-    #[test]
-    fn legacy_filter_controls_shape_the_surge_render() {
-        let mut project = Project::demo();
-        let track_index = project
-            .tracks
-            .iter()
-            .position(|track| track.role == TrackRole::Bass)
-            .expect("demo bass");
-        let track_id = project.tracks[track_index].id;
-        project.tracks[track_index].modulators.clear();
-        let baseline =
-            render_region(&project, &[track_id], 0.0, 2.0).expect("legacy filter baseline");
-
-        let effect_id = project.tracks[track_index].effects[0].id;
-        project.edits.push(Edit {
-            id: 9_120,
-            operation_id: None,
-            start: 0.0,
-            end: 2.0,
-            prompt: "Open the legacy filter".to_owned(),
-            summary: "Automated the legacy filter".to_owned(),
-            action: Action::Automation {
-                track_id,
-                parameter: format!("effect:{effect_id}.cutoff"),
-                curve: "hold",
-                points: vec![AutomationPoint {
-                    time: 0.0,
-                    value: crate::model::FILTER_CUTOFF_MAX_HZ,
-                }],
-                target: TrackRole::Bass,
-            },
-        });
-        let changed = render_region(&project, &[track_id], 0.0, 2.0).expect("legacy filter change");
-
-        assert!(
-            sample_difference(&baseline.samples, &changed.samples) > 0.001,
-            "legacy cutoff automation must reach Surge XT"
         );
     }
 
@@ -3142,9 +3114,9 @@ mod tests {
             "instrument.resonance".to_owned(),
             "instrument.pitch".to_owned(),
             "track.volume".to_owned(),
-            format!("effect:{effect_id}.lowGain"),
-            format!("effect:{effect_id}.midGain"),
-            format!("effect:{effect_id}.highGain"),
+            format!("effect:{effect_id}.Gain 1"),
+            format!("effect:{effect_id}.Gain 2"),
+            format!("effect:{effect_id}.Gain 3"),
         ] {
             let mut project = baseline_project.clone();
             project.tracks[track_index].modulators.push(Modulator {

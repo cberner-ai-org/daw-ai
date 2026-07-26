@@ -14,6 +14,11 @@ unsafe extern "C" {
         source_scene: i32,
         depth: f32,
     ) -> bool;
+    pub fn surge_is_valid_modulation(
+        surge: *mut SurgeSynthesizer,
+        target: i32,
+        source: i32,
+    ) -> bool;
     pub fn surge_clear_modulation(
         surge: *mut SurgeSynthesizer,
         target: i32,
@@ -43,5 +48,52 @@ unsafe extern "C" {
         lfo: i32,
         rate: f32,
         tempo_sync: bool,
+    ) -> bool;
+    pub fn surge_parameter_is_bipolar(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+    ) -> bool;
+    pub fn surge_parameter_is_discrete(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+    ) -> bool;
+    pub fn surge_parameter_is_boolean(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+    ) -> bool;
+    pub fn surge_parameter_can_temposync(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+    ) -> bool;
+    pub fn surge_parameter_can_deactivate(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+    ) -> bool;
+    pub fn surge_parameter_is_deactivated(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+    ) -> bool;
+    pub fn surge_parameter_choice_count(surge: *mut SurgeSynthesizer, parameter: i32) -> i32;
+    pub fn surge_parameter_choice_value(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+        choice: i32,
+    ) -> f32;
+    pub fn surge_parameter_choice_display(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+        choice: i32,
+        output: *mut std::ffi::c_char,
+        output_size: i32,
+    );
+    pub fn surge_set_parameter01_safe(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+        value: f32,
+    ) -> bool;
+    pub fn surge_parameter_value_available(
+        surge: *mut SurgeSynthesizer,
+        parameter: i32,
+        value: f32,
     ) -> bool;
 }

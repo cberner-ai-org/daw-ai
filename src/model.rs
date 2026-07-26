@@ -11,10 +11,8 @@ pub(crate) const EDIT_LOG_LIMIT: usize = 256;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
 pub(crate) const FILTER_CUTOFF_MIN_HZ: f32 = 80.0;
 pub(crate) const FILTER_CUTOFF_MAX_HZ: f32 = 16_000.0;
-pub(crate) const FILTER_CUTOFF_DEFAULT_HZ: f32 = 1_200.0;
 pub(crate) const FILTER_RESONANCE_MIN: f32 = 0.1;
 pub(crate) const FILTER_RESONANCE_MAX: f32 = 20.0;
-pub(crate) const FILTER_RESONANCE_DEFAULT: f32 = 0.7;
 pub(crate) const SURGE_ENGINE: &str = "Surge XT";
 pub(crate) const SURGE_PRESETS: &[&str] = &[
     "Init",
@@ -88,171 +86,13 @@ impl TrackRole {
 pub struct Effect {
     pub id: u64,
     pub name: String,
+    pub preset_slot: Option<usize>,
     pub mix: f32,
     pub cutoff_hz: Option<f32>,
     pub resonance: Option<f32>,
     pub enabled: bool,
     pub parameters: BTreeMap<String, f32>,
     pub parameter_overrides: Vec<String>,
-}
-
-pub(crate) struct EffectParameterSpec {
-    pub(crate) name: &'static str,
-    pub(crate) native: &'static str,
-    pub(crate) default: f32,
-}
-
-pub(crate) fn effect_parameter_specs(name: &str) -> &'static [EffectParameterSpec] {
-    match name {
-        "Delay" | "Echo" | "Floaty Delay" => &[
-            EffectParameterSpec {
-                name: "time",
-                native: "Left",
-                default: 0.35,
-            },
-            EffectParameterSpec {
-                name: "feedback",
-                native: "Feedback",
-                default: 0.3,
-            },
-            EffectParameterSpec {
-                name: "lowCut",
-                native: "Low Cut",
-                default: 0.15,
-            },
-            EffectParameterSpec {
-                name: "highCut",
-                native: "High Cut",
-                default: 0.8,
-            },
-            EffectParameterSpec {
-                name: "width",
-                native: "Width",
-                default: 0.75,
-            },
-        ],
-        "Reverb 1" | "Reverb 2" | "Reverb" | "Room" | "Spring Reverb" => &[
-            EffectParameterSpec {
-                name: "size",
-                native: "Room Size",
-                default: 0.55,
-            },
-            EffectParameterSpec {
-                name: "decay",
-                native: "Decay Time",
-                default: 0.5,
-            },
-            EffectParameterSpec {
-                name: "preDelay",
-                native: "Pre-Delay",
-                default: 0.15,
-            },
-            EffectParameterSpec {
-                name: "damping",
-                native: "HF Damping",
-                default: 0.55,
-            },
-            EffectParameterSpec {
-                name: "width",
-                native: "Width",
-                default: 0.8,
-            },
-        ],
-        "Distortion" | "Drive" | "Waveshaper" | "CHOW" | "Tape" => &[
-            EffectParameterSpec {
-                name: "drive",
-                native: "Drive",
-                default: 0.45,
-            },
-            EffectParameterSpec {
-                name: "tone",
-                native: "Frequency",
-                default: 0.55,
-            },
-            EffectParameterSpec {
-                name: "output",
-                native: "Gain",
-                default: 0.5,
-            },
-        ],
-        "EQ" | "Graphic EQ" | "Low-pass filter" => &[
-            EffectParameterSpec {
-                name: "lowGain",
-                native: "Gain 1",
-                default: 0.5,
-            },
-            EffectParameterSpec {
-                name: "midGain",
-                native: "Gain 2",
-                default: 0.5,
-            },
-            EffectParameterSpec {
-                name: "highGain",
-                native: "Gain 3",
-                default: 0.5,
-            },
-            EffectParameterSpec {
-                name: "lowFrequency",
-                native: "Frequency 1",
-                default: 0.3,
-            },
-            EffectParameterSpec {
-                name: "midFrequency",
-                native: "Frequency 2",
-                default: 0.5,
-            },
-            EffectParameterSpec {
-                name: "highFrequency",
-                native: "Frequency 3",
-                default: 0.7,
-            },
-        ],
-        "Conditioner" | "Punch compressor" => &[
-            EffectParameterSpec {
-                name: "threshold",
-                native: "Threshold",
-                default: 0.55,
-            },
-            EffectParameterSpec {
-                name: "attack",
-                native: "Attack Rate",
-                default: 0.35,
-            },
-            EffectParameterSpec {
-                name: "release",
-                native: "Release Rate",
-                default: 0.55,
-            },
-            EffectParameterSpec {
-                name: "output",
-                native: "Gain",
-                default: 0.5,
-            },
-        ],
-        "Phaser" | "Chorus" | "Flanger" | "Ensemble" => &[
-            EffectParameterSpec {
-                name: "rate",
-                native: "Rate",
-                default: 0.3,
-            },
-            EffectParameterSpec {
-                name: "depth",
-                native: "Depth",
-                default: 0.5,
-            },
-            EffectParameterSpec {
-                name: "feedback",
-                native: "Feedback",
-                default: 0.35,
-            },
-            EffectParameterSpec {
-                name: "width",
-                native: "Width",
-                default: 0.75,
-            },
-        ],
-        _ => &[],
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -329,6 +169,7 @@ pub(crate) struct ModulatorSpec<'a> {
     pub target: &'a str,
     pub shape: &'a str,
     pub rate: f32,
+    pub rate_mode: &'a str,
     pub depth: f32,
     pub trigger: &'a str,
     pub source_track_id: Option<u64>,
@@ -679,10 +520,15 @@ impl Track {
                 output,
                 concat!(
                     "{{\"id\":{},\"type\":\"effect\",\"name\":{},",
-                    "\"enabled\":{},\"parameters\":{{\"mix\":{}"
+                    "\"source\":{},\"enabled\":{},\"parameters\":{{\"mix\":{}"
                 ),
                 effect.id,
                 json_string(&effect.name),
+                json_string(if effect.preset_slot.is_some() {
+                    "preset"
+                } else {
+                    "added"
+                }),
                 effect.enabled,
                 decimal(effect.mix)
             )
@@ -700,13 +546,18 @@ impl Track {
                     .expect("writing to a string cannot fail");
             }
             output.push_str("},\"parameterOrder\":[");
-            for (index, parameter) in effect_parameter_specs(&effect.name).iter().enumerate() {
+            for (index, parameter) in effect.parameters.keys().enumerate() {
                 if index > 0 {
                     output.push(',');
                 }
-                output.push_str(&json_string(parameter.name));
+                output.push_str(&json_string(parameter));
             }
-            output.push_str("],\"overrides\":[");
+            output.push(']');
+            if let Some(slot) = effect.preset_slot {
+                write!(output, ",\"presetSlot\":{}", slot + 1)
+                    .expect("writing to a string cannot fail");
+            }
+            output.push_str(",\"overrides\":[");
             for (index, parameter) in effect.parameter_overrides.iter().enumerate() {
                 if index > 0 {
                     output.push(',');
@@ -752,7 +603,8 @@ impl Track {
             .expect("writing to a string cannot fail");
         }
 
-        output.push_str("],\"modulationTargets\":[");
+        output
+            .push_str("],\"modulationTargetIdType\":\"modulationTarget\",\"modulationTargets\":[");
         for (index, target) in modulation_targets(self).iter().enumerate() {
             if index > 0 {
                 output.push(',');
@@ -1023,6 +875,27 @@ impl ChannelOperation {
 }
 
 impl Action {
+    fn retain_valid_automation(
+        &mut self,
+        track_id: u64,
+        valid_targets: &std::collections::HashSet<String>,
+    ) -> bool {
+        match self {
+            Self::Compound { actions } => {
+                actions
+                    .retain_mut(|action| action.retain_valid_automation(track_id, valid_targets));
+                !actions.is_empty()
+            }
+            Self::Timed { action, .. } => action.retain_valid_automation(track_id, valid_targets),
+            Self::Automation {
+                track_id: owner_id,
+                parameter,
+                ..
+            } => *owner_id != track_id || valid_targets.contains(parameter),
+            _ => true,
+        }
+    }
+
     fn retain_after_track_deletion(
         &mut self,
         track_id: u64,
@@ -1292,6 +1165,7 @@ pub enum StudioError {
     UnknownTrack,
     InvalidMix,
     InvalidChannel,
+    LastTrack,
     UnknownSoundTool,
     InvalidSoundTool,
     EffectCapacity,
@@ -1767,7 +1641,7 @@ impl Studio {
             return Err(StudioError::UnknownTrack);
         };
         if self.project.tracks.len() == 1 {
-            return Err(StudioError::InvalidChannel);
+            return Err(StudioError::LastTrack);
         }
 
         let removed_modulator_ids = self
@@ -2211,13 +2085,16 @@ impl Studio {
             .iter()
             .position(|track| track.id == track_id)
             .ok_or(StudioError::UnknownTrack)?;
-        if !valid_modulator_target(&self.project.tracks[track_index], spec.target)
-            || !matches!(
-                spec.shape,
-                "sine" | "triangle" | "square" | "random" | "envelope" | "formula"
-            )
-            || !spec.rate.is_finite()
+        if !valid_modulator_target_for_trigger(
+            &self.project.tracks[track_index],
+            spec.target,
+            spec.trigger,
+        ) || !matches!(
+            spec.shape,
+            "sine" | "triangle" | "square" | "random" | "envelope" | "formula"
+        ) || !spec.rate.is_finite()
             || !(0.01..=20.0).contains(&spec.rate)
+            || !matches!(spec.rate_mode, "hz" | "tempo")
             || !spec.depth.is_finite()
             || !(0.0..=1.0).contains(&spec.depth)
             || !matches!(spec.trigger, "free" | "midi" | "audio")
@@ -2257,7 +2134,7 @@ impl Studio {
             name: "AI modulation".to_owned(),
             shape: spec.shape.to_owned(),
             rate: spec.rate,
-            rate_mode: "hz".to_owned(),
+            rate_mode: spec.rate_mode.to_owned(),
             trigger: spec.trigger.to_owned(),
             source_track_id: (spec.trigger != "free")
                 .then_some(spec.source_track_id.unwrap_or(track_id)),
@@ -2318,12 +2195,77 @@ impl Studio {
         value: &str,
     ) -> Result<(), StudioError> {
         let mut project = self.project.clone();
-        let track = project
+        let mut allocated_next_id = self.next_id;
+        let track_index = project
             .tracks
-            .iter_mut()
-            .find(|track| track.id == track_id)
+            .iter()
+            .position(|track| track.id == track_id)
             .ok_or(StudioError::UnknownTrack)?;
-        configure_track_tool(track, tool, tool_id, clip_id, parameter, value)?;
+        configure_track_tool(
+            &mut project.tracks[track_index],
+            tool,
+            tool_id,
+            clip_id,
+            parameter,
+            value,
+        )?;
+        if tool == "instrument" && parameter == "preset" {
+            let track = &mut project.tracks[track_index];
+            let previous_preset_ids = track
+                .effects
+                .iter()
+                .filter_map(|effect| effect.preset_slot.map(|slot| (slot, effect.id)))
+                .collect::<std::collections::HashMap<_, _>>();
+            let added = track
+                .effects
+                .iter()
+                .filter(|effect| effect.preset_slot.is_none())
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut preset =
+                crate::surge::preset_effects(value).map_err(|_| StudioError::InvalidSoundTool)?;
+            for effect in &mut preset {
+                if let Some(id) = effect
+                    .preset_slot
+                    .and_then(|slot| previous_preset_ids.get(&slot))
+                {
+                    effect.id = *id;
+                } else {
+                    effect.id = allocated_next_id;
+                    allocated_next_id = allocated_next_id
+                        .checked_add(1)
+                        .ok_or(StudioError::InvalidSoundTool)?;
+                }
+            }
+            preset.extend(added);
+            track.effects = preset;
+            track.routing.effect_order = track.effects.iter().map(|effect| effect.id).collect();
+            if !track_effects_fit(track, !track.audio_clips.is_empty()) {
+                return Err(StudioError::EffectCapacity);
+            }
+            let available_modulation_targets = modulation_targets(track)
+                .into_iter()
+                .map(|target| target.id)
+                .collect::<std::collections::HashSet<_>>();
+            let previous_effect_ids = previous_preset_ids
+                .values()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            track.modulators.retain(|modulator| {
+                let targets_previous_effect = previous_effect_ids
+                    .iter()
+                    .any(|id| modulator.target.starts_with(&format!("effect:{id}.")));
+                !targets_previous_effect || available_modulation_targets.contains(&modulator.target)
+            });
+            let valid_automation_targets = automation_targets(track)
+                .into_iter()
+                .map(|target| target.id)
+                .collect::<std::collections::HashSet<_>>();
+            project.edits.retain_mut(|edit| {
+                edit.action
+                    .retain_valid_automation(track_id, &valid_automation_targets)
+            });
+        }
         let track_ids = project
             .tracks
             .iter()
@@ -2350,6 +2292,7 @@ impl Studio {
         }
 
         self.remember();
+        self.next_id = allocated_next_id;
         project.version = self.project.version + 1;
         self.project = project;
         Ok(())
@@ -2573,13 +2516,17 @@ fn configure_track_tool(
                 .find(|effect| effect.id == tool_id)
                 .ok_or(StudioError::UnknownSoundTool)?;
             match parameter {
-                "mix" => effect.mix = parse_range(value, 0.0, 1.0)?,
+                "mix" => {
+                    effect.mix = parse_range(value, 0.0, 1.0)?;
+                    mark_effect_override(effect, parameter);
+                }
                 "cutoff" if effect.cutoff_hz.is_some() => {
                     effect.cutoff_hz = Some(parse_range(
                         value,
                         FILTER_CUTOFF_MIN_HZ,
                         FILTER_CUTOFF_MAX_HZ,
                     )?);
+                    mark_effect_override(effect, parameter);
                 }
                 "resonance" if effect.resonance.is_some() => {
                     effect.resonance = Some(parse_range(
@@ -2587,19 +2534,23 @@ fn configure_track_tool(
                         FILTER_RESONANCE_MIN,
                         FILTER_RESONANCE_MAX,
                     )?);
+                    mark_effect_override(effect, parameter);
                 }
                 "enabled" => effect.enabled = parse_bool(value)?,
                 parameter if effect.parameters.contains_key(parameter) => {
                     effect
                         .parameters
                         .insert(parameter.to_owned(), parse_range(value, 0.0, 1.0)?);
-                    if !effect
-                        .parameter_overrides
-                        .iter()
-                        .any(|candidate| candidate == parameter)
-                    {
-                        effect.parameter_overrides.push(parameter.to_owned());
-                    }
+                    mark_effect_override(effect, parameter);
+                }
+                parameter
+                    if crate::surge::effect_parameter_values(&effect.name)
+                        .contains_key(parameter) =>
+                {
+                    effect
+                        .parameters
+                        .insert(parameter.to_owned(), parse_range(value, 0.0, 1.0)?);
+                    mark_effect_override(effect, parameter);
                 }
                 _ => return Err(StudioError::InvalidSoundTool),
             }
@@ -2610,14 +2561,20 @@ fn configure_track_tool(
             }
         }
         "modulator" => {
-            if parameter == "target" && !valid_modulator_target(track, value) {
-                return Err(StudioError::InvalidSoundTool);
-            }
-            let modulator = track
+            let modulator_index = track
                 .modulators
                 .iter_mut()
-                .find(|modulator| modulator.id == tool_id)
+                .position(|modulator| modulator.id == tool_id)
                 .ok_or(StudioError::UnknownSoundTool)?;
+            let current = &track.modulators[modulator_index];
+            if (parameter == "target"
+                && !valid_modulator_target_for_trigger(track, value, &current.trigger))
+                || (parameter == "trigger"
+                    && !valid_modulator_target_for_trigger(track, &current.target, value))
+            {
+                return Err(StudioError::InvalidSoundTool);
+            }
+            let modulator = &mut track.modulators[modulator_index];
             match parameter {
                 "shape"
                     if matches!(
@@ -2702,6 +2659,16 @@ fn configure_track_tool(
     }
 }
 
+fn mark_effect_override(effect: &mut Effect, parameter: &str) {
+    if !effect
+        .parameter_overrides
+        .iter()
+        .any(|candidate| candidate == parameter)
+    {
+        effect.parameter_overrides.push(parameter.to_owned());
+    }
+}
+
 pub(crate) fn track_effects_fit(track: &Track, has_audio_input: bool) -> bool {
     let enabled = track.effects.iter().filter(|effect| effect.enabled).count();
     let input_slots =
@@ -2778,9 +2745,16 @@ fn configure_instrument(
             .parse::<i32>()
             .map_err(|_| StudioError::InvalidSoundTool)?;
         let value = parse_range(value, 0.0, 1.0)?;
-        if !crate::surge::instrument_parameters(&instrument.preset)
+        let semantics = crate::surge::instrument_parameters_for_instrument(instrument)
             .iter()
-            .any(|candidate| candidate.id == native_id)
+            .find(|candidate| candidate.id == native_id)
+            .cloned()
+            .ok_or(StudioError::InvalidSoundTool)?;
+        if !semantics.choices.is_empty()
+            && !semantics
+                .choices
+                .iter()
+                .any(|(choice, _)| (choice - value).abs() < 0.000_01)
         {
             return Err(StudioError::InvalidSoundTool);
         }
@@ -3044,6 +3018,16 @@ pub(crate) fn valid_modulator_target(track: &Track, value: &str) -> bool {
             })
 }
 
+pub(crate) fn valid_modulator_target_for_trigger(
+    track: &Track,
+    value: &str,
+    trigger: &str,
+) -> bool {
+    valid_modulator_target(track, value)
+        && (!is_instrument_modulation_target(value)
+            || crate::surge::instrument_parameter_is_modulatable(&track.instrument, value, trigger))
+}
+
 fn is_instrument_modulation_target(target: &str) -> bool {
     target.starts_with("instrument.") || target.starts_with("native:")
 }
@@ -3219,7 +3203,7 @@ fn demo_role_track(id: u64, role: TrackRole) -> Track {
             0.0,
             0.25,
             0.82,
-            vec![("Punch compressor", 0.34)],
+            vec![("Conditioner", 0.34)],
             ("Pulse envelope", "envelope", 2.0, 0.12, "instrument.cutoff"),
         ),
         TrackRole::Bass => (
@@ -3229,7 +3213,7 @@ fn demo_role_track(id: u64, role: TrackRole) -> Track {
             0.02,
             0.3,
             0.45,
-            vec![("Low-pass filter", 0.46)],
+            vec![("EQ", 0.46)],
             ("Bass movement", "sine", 0.25, 0.18, "instrument.cutoff"),
         ),
         TrackRole::Chords => (
@@ -3239,7 +3223,7 @@ fn demo_role_track(id: u64, role: TrackRole) -> Track {
             0.36,
             0.62,
             0.58,
-            vec![("Chorus", 0.28), ("Room", 0.2)],
+            vec![("Chorus", 0.28), ("Reverb 2", 0.2)],
             ("Slow bloom", "triangle", 0.125, 0.16, "instrument.cutoff"),
         ),
         TrackRole::Lead => (
@@ -3249,7 +3233,7 @@ fn demo_role_track(id: u64, role: TrackRole) -> Track {
             0.02,
             0.38,
             0.64,
-            vec![("Echo", 0.24)],
+            vec![("Delay", 0.24)],
             ("Lead vibrato", "sine", 5.0, 0.08, "instrument.pitch"),
         ),
         TrackRole::Texture => (
@@ -3259,7 +3243,7 @@ fn demo_role_track(id: u64, role: TrackRole) -> Track {
             0.58,
             0.74,
             0.7,
-            vec![("Shimmer", 0.38)],
+            vec![("Nimbus", 0.38)],
             (
                 "Atmosphere drift",
                 "random",
@@ -3403,17 +3387,14 @@ const fn tool_id(track_id: u64, offset: u64) -> u64 {
 }
 
 fn effect(id: u64, name: &str, mix: f32) -> Effect {
-    let is_filter = name == "Low-pass filter";
-    let parameters = effect_parameter_specs(name)
-        .iter()
-        .map(|spec| (spec.name.to_owned(), spec.default))
-        .collect();
+    let parameters = crate::surge::effect_parameter_values(name);
     Effect {
         id,
         name: name.to_owned(),
+        preset_slot: None,
         mix,
-        cutoff_hz: is_filter.then_some(FILTER_CUTOFF_DEFAULT_HZ),
-        resonance: is_filter.then_some(FILTER_RESONANCE_DEFAULT),
+        cutoff_hz: None,
+        resonance: None,
         enabled: true,
         parameters,
         parameter_overrides: Vec::new(),
@@ -3686,7 +3667,7 @@ mod tests {
 
         studio.delete_channel(2).expect("delete bass");
         studio.delete_channel(3).expect("delete chords");
-        assert_eq!(studio.delete_channel(1), Err(StudioError::InvalidChannel));
+        assert_eq!(studio.delete_channel(1), Err(StudioError::LastTrack));
     }
 
     #[test]
@@ -3725,11 +3706,11 @@ mod tests {
             .configure_sound_tool(bass_id, "effect", effect_id, None, "mix", "0.72")
             .expect("configurable effect");
         studio
-            .configure_sound_tool(bass_id, "effect", effect_id, None, "cutoff", "640")
-            .expect("configurable filter cutoff");
+            .configure_sound_tool(bass_id, "effect", effect_id, None, "Frequency 3", "0.64")
+            .expect("configurable native EQ frequency");
         studio
-            .configure_sound_tool(bass_id, "effect", effect_id, None, "resonance", "8.5")
-            .expect("configurable filter resonance");
+            .configure_sound_tool(bass_id, "effect", effect_id, None, "Gain 3", "0.85")
+            .expect("configurable native EQ gain");
         studio
             .configure_sound_tool(
                 bass_id,
@@ -3776,8 +3757,8 @@ mod tests {
         assert_eq!(bass.instrument.resonance, 0.27);
         assert_eq!(bass.instrument.pitch, 0.55);
         assert_eq!(bass.effects[0].mix, 0.72);
-        assert_eq!(bass.effects[0].cutoff_hz, Some(640.0));
-        assert_eq!(bass.effects[0].resonance, Some(8.5));
+        assert_eq!(bass.effects[0].parameters["Frequency 3"], 0.64);
+        assert_eq!(bass.effects[0].parameters["Gain 3"], 0.85);
         assert_eq!(bass.modulators[0].target, "track.volume");
         assert_eq!(bass.modulators[0].rate_mode, "tempo");
         assert_eq!(bass.modulators[0].trigger, "midi");
@@ -4016,21 +3997,20 @@ mod tests {
         assert!(!targets.contains(&"instrument.timbre".to_owned()));
         assert!(targets.contains(&"track.volume".to_owned()));
         assert!(targets.contains(&"effect:210.mix".to_owned()));
-        assert!(targets.contains(&"effect:210.cutoff".to_owned()));
-        assert!(targets.contains(&"effect:210.resonance".to_owned()));
-        assert!(targets.contains(&"effect:210.lowGain".to_owned()));
+        assert!(targets.contains(&"effect:210.Frequency 3".to_owned()));
+        assert!(targets.contains(&"effect:210.Gain 1".to_owned()));
 
         studio
-            .configure_sound_tool(bass_id, "effect", 210, None, "lowGain", "0.72")
+            .configure_sound_tool(bass_id, "effect", 210, None, "Gain 1", "0.72")
             .expect("detailed effect parameter");
         assert_eq!(
-            studio.project().tracks[1].effects[0].parameters["lowGain"],
+            studio.project().tracks[1].effects[0].parameters["Gain 1"],
             0.72
         );
         assert!(
             studio.project().tracks[1].effects[0]
                 .parameter_overrides
-                .contains(&"lowGain".to_owned())
+                .contains(&"Gain 1".to_owned())
         );
 
         for target in &targets {
@@ -4080,7 +4060,7 @@ mod tests {
             .map(|target| target.id)
             .collect::<Vec<_>>();
         assert!(targets.contains(&"track.volume".to_owned()));
-        assert!(targets.contains(&"effect:210.cutoff".to_owned()));
+        assert!(targets.contains(&"effect:210.Frequency 3".to_owned()));
         assert!(targets.contains(&format!("modulator:{modulator_id}.rate")));
         assert!(targets.contains(&format!("modulator:{modulator_id}.depth")));
         assert!(studio.to_json().contains("\"automationTargets\""));
@@ -4269,6 +4249,7 @@ mod tests {
             shape: "sine",
             formula: "",
             rate: 1.0,
+            rate_mode: "hz",
             depth: 0.5,
             trigger: "free",
             source_track_id: None,
@@ -4287,6 +4268,161 @@ mod tests {
             Err(StudioError::InvalidSoundTool)
         );
         assert_eq!(studio.project.tracks[0].modulators.len(), 6);
+    }
+
+    #[test]
+    fn native_modulators_reject_targets_surge_cannot_modulate() {
+        let mut studio = Studio::new();
+        let track_id = studio.project.tracks[1].id;
+        let modulator_id = studio.project.tracks[1].modulators[0].id;
+        let mute_id = crate::surge::instrument_parameters_for_instrument(
+            &studio.project.tracks[1].instrument,
+        )
+        .into_iter()
+        .find(|parameter| parameter.name.ends_with("Osc 1 Mute"))
+        .expect("oscillator mute")
+        .id;
+        let target = format!("native:{mute_id}");
+        let spec = ModulatorSpec {
+            target: &target,
+            shape: "sine",
+            formula: "",
+            rate: 1.0,
+            rate_mode: "hz",
+            depth: 0.5,
+            trigger: "free",
+            source_track_id: None,
+            attack_ms: 5.0,
+            release_ms: 180.0,
+            threshold: 0.1,
+            polarity: "increase",
+        };
+
+        assert_eq!(
+            studio.create_modulator(track_id, spec),
+            Err(StudioError::InvalidSoundTool)
+        );
+        assert_eq!(
+            studio.configure_sound_tool(
+                track_id,
+                "modulator",
+                modulator_id,
+                None,
+                "target",
+                &target,
+            ),
+            Err(StudioError::InvalidSoundTool)
+        );
+    }
+
+    #[test]
+    fn preset_refresh_preserves_slot_ids_and_prunes_removed_dependencies() {
+        let mut studio = Studio::new();
+        let track_id = studio.project.tracks[1].id;
+        let instrument_id = studio.project.tracks[1].instrument.id;
+        let modulator_id = studio.project.tracks[1].modulators[0].id;
+        let preset = "Factory/Basses/Evilous";
+        studio
+            .configure_sound_tool(
+                track_id,
+                "instrument",
+                instrument_id,
+                None,
+                "preset",
+                preset,
+            )
+            .expect("preset with embedded effects");
+        let preset_effect_id = studio.project.tracks[1]
+            .effects
+            .iter()
+            .find(|effect| effect.preset_slot.is_some())
+            .expect("embedded preset effect")
+            .id;
+        let effect_target = format!("effect:{preset_effect_id}.mix");
+        studio
+            .configure_sound_tool(
+                track_id,
+                "modulator",
+                modulator_id,
+                None,
+                "target",
+                &effect_target,
+            )
+            .expect("preset effect modulation");
+        studio.project.edits.push(Edit {
+            id: 9_801,
+            operation_id: None,
+            start: 0.0,
+            end: 4.0,
+            prompt: "Automate the preset effect".to_owned(),
+            summary: "Automated preset effect mix".to_owned(),
+            action: Action::Automation {
+                track_id,
+                parameter: effect_target.clone(),
+                curve: "linear",
+                points: vec![
+                    crate::prompt::AutomationPoint {
+                        time: 0.0,
+                        value: 0.5,
+                    },
+                    crate::prompt::AutomationPoint {
+                        time: 1.0,
+                        value: 0.8,
+                    },
+                ],
+                target: TrackRole::Bass,
+            },
+        });
+
+        studio
+            .configure_sound_tool(
+                track_id,
+                "instrument",
+                instrument_id,
+                None,
+                "preset",
+                preset,
+            )
+            .expect("refresh same preset");
+        assert!(
+            studio.project.tracks[1]
+                .effects
+                .iter()
+                .any(|effect| effect.id == preset_effect_id)
+        );
+        assert!(
+            studio.project.tracks[1]
+                .modulators
+                .iter()
+                .any(|modulator| modulator.target == effect_target)
+        );
+        assert!(studio.to_json().contains(&effect_target));
+        crate::project_file::parse_project(&studio.to_json()).expect("reopen refreshed preset");
+
+        studio
+            .configure_sound_tool(
+                track_id,
+                "instrument",
+                instrument_id,
+                None,
+                "preset",
+                "Init",
+            )
+            .expect("preset without embedded effects");
+        assert!(
+            !studio.project.tracks[1]
+                .effects
+                .iter()
+                .any(|effect| effect.id == preset_effect_id)
+        );
+        assert!(
+            !studio.project.tracks[1]
+                .modulators
+                .iter()
+                .any(|modulator| modulator.id == modulator_id)
+        );
+        assert!(!studio.to_json().contains(&effect_target));
+        crate::project_file::parse_project(&studio.to_json()).expect("reopen pruned preset");
     }
 
     #[test]

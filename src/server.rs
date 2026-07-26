@@ -2711,6 +2711,7 @@ const fn studio_error_message(error: StudioError) -> &'static str {
         StudioError::UnknownTrack => "track not found",
         StudioError::InvalidMix => "invalid mixer setting",
         StudioError::InvalidChannel => "invalid channel change",
+        StudioError::LastTrack => "create another track before deleting the only track",
         StudioError::UnknownSoundTool => "sound tool not found",
         StudioError::InvalidSoundTool => "invalid sound tool setting",
         StudioError::EffectCapacity => "Surge XT effect chain is full",

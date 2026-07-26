@@ -306,7 +306,7 @@ impl PromptEngine {
                 action: Action::Compound {
                     actions: vec![
                         Action::Effect {
-                            name: "Reverb",
+                            name: "Reverb 2",
                             mix: 0.42,
                             target,
                         },
@@ -362,7 +362,7 @@ impl PromptEngine {
         if wants_reverb {
             return EditPlan {
                 action: Action::Effect {
-                    name: "Reverb",
+                    name: "Reverb 2",
                     mix: 0.42,
                     target,
                 },
@@ -373,7 +373,7 @@ impl PromptEngine {
         if wants_echo {
             return EditPlan {
                 action: Action::Effect {
-                    name: "Echo",
+                    name: "Delay",
                     mix: 0.34,
                     target,
                 },
@@ -384,7 +384,7 @@ impl PromptEngine {
         if wants_drive {
             return EditPlan {
                 action: Action::Effect {
-                    name: "Drive",
+                    name: "Distortion",
                     mix: 0.58,
                     target,
                 },
@@ -589,12 +589,12 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
         });
     }
     actions.push(Action::Effect {
-        name: "Punch compressor",
+        name: "Conditioner",
         mix: 0.68,
         target: Some(TrackRole::Bass),
     });
     actions.push(Action::Effect {
-        name: "Drive",
+        name: "Distortion",
         mix: 0.72,
         target: Some(TrackRole::Bass),
     });
@@ -776,25 +776,25 @@ fn contains_term(value: &str, term: &str) -> bool {
 fn removable_effect_names(prompt: &str) -> Vec<&'static str> {
     let mut names = Vec::new();
     if contains_any(prompt, &["reverb"]) {
-        names.push("Reverb");
+        names.push("Reverb 2");
     }
     if contains_any(prompt, &["room"]) {
-        names.push("Room");
+        names.push("Reverb 2");
     }
     if contains_any(prompt, &["echo", "delay"]) {
-        names.push("Echo");
+        names.push("Delay");
     }
     if contains_any(prompt, &["chorus"]) {
         names.push("Chorus");
     }
     if contains_any(prompt, &["low-pass", "low pass", "filter"]) {
-        names.push("Low-pass filter");
+        names.push("EQ");
     }
     if contains_any(
         prompt,
         &["punch compressor", "compressor", "compression", "punch"],
     ) {
-        names.push("Punch compressor");
+        names.push("Conditioner");
     }
     if contains_any(
         prompt,
@@ -806,10 +806,10 @@ fn removable_effect_names(prompt: &str) -> Vec<&'static str> {
             "saturation",
         ],
     ) {
-        names.push("Drive");
+        names.push("Distortion");
     }
     if contains_any(prompt, &["shimmer"]) {
-        names.push("Shimmer");
+        names.push("Nimbus");
     }
     names
 }
@@ -837,7 +837,7 @@ fn creative_fallback(prompt: &str, target: Option<TrackRole>) -> EditPlan {
     match fingerprint % 3 {
         0 => EditPlan {
             action: Action::Effect {
-                name: "Shimmer",
+                name: "Nimbus",
                 mix: 0.28,
                 target,
             },
@@ -896,7 +896,7 @@ mod tests {
         assert!(actions.iter().any(|action| matches!(
             action,
             Action::Effect {
-                name: "Drive",
+                name: "Distortion",
                 target: Some(TrackRole::Bass),
                 ..
             }
@@ -926,7 +926,7 @@ mod tests {
         assert_eq!(
             PromptEngine::interpret("add reverb to the chords", 112).action,
             Action::Effect {
-                name: "Reverb",
+                name: "Reverb 2",
                 mix: 0.42,
                 target: Some(TrackRole::Chords),
             }
@@ -934,7 +934,7 @@ mod tests {
         assert_eq!(
             PromptEngine::interpret("add drive to the bass", 112).action,
             Action::Effect {
-                name: "Drive",
+                name: "Distortion",
                 mix: 0.58,
                 target: Some(TrackRole::Bass),
             }
@@ -946,7 +946,7 @@ mod tests {
         assert_eq!(
             PromptEngine::interpret("remove reverb from the chords", 112).action,
             Action::RemoveEffect {
-                name: "Reverb",
+                name: "Reverb 2",
                 target: Some(TrackRole::Chords),
             }
         );
@@ -958,21 +958,21 @@ mod tests {
         );
 
         for (prompt, name, target) in [
-            ("remove echo from the lead", "Echo", TrackRole::Lead),
-            ("remove room from the chords", "Room", TrackRole::Chords),
+            ("remove echo from the lead", "Delay", TrackRole::Lead),
+            ("remove room from the chords", "Reverb 2", TrackRole::Chords),
             ("remove chorus from the chords", "Chorus", TrackRole::Chords),
             (
                 "remove the low-pass filter from bass",
-                "Low-pass filter",
+                "EQ",
                 TrackRole::Bass,
             ),
             (
                 "remove punch compressor from drums",
-                "Punch compressor",
+                "Conditioner",
                 TrackRole::Drums,
             ),
-            ("remove drive from bass", "Drive", TrackRole::Bass),
-            ("remove shimmer from texture", "Shimmer", TrackRole::Texture),
+            ("remove drive from bass", "Distortion", TrackRole::Bass),
+            ("remove shimmer from texture", "Nimbus", TrackRole::Texture),
         ] {
             assert_eq!(
                 PromptEngine::interpret(prompt, 112).action,
@@ -999,7 +999,7 @@ mod tests {
             Action::Compound {
                 actions: vec![
                     Action::Effect {
-                        name: "Reverb",
+                        name: "Reverb 2",
                         mix: 0.42,
                         target: Some(TrackRole::Chords),
                     },

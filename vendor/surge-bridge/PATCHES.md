@@ -12,3 +12,10 @@ path and allocates a different leaked plugin layer for every engine.
 
 DAW-AI seeds the headless engine deterministically after construction so the
 same project range produces identical PCM across byte-range playback renders.
+
+DAW-AI exposes Surge XT's own parameter semantics used by compact model-facing
+discovery: integer and Boolean choices with formatted labels, bipolar range,
+tempo sync, and deactivation.
+
+Headless parameter writes reject oscillator types whose required wavetable data
+is absent from the current patch, preventing invalid native oscillator state.
