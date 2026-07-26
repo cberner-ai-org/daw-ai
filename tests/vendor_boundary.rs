@@ -22,6 +22,11 @@ fn vendored_surge_boundary_keeps_pins_and_patched_api() {
 
     let sys_patches = read(root, "vendor/surge-sys/PATCHES.md");
     assert!(sys_patches.contains(SURGE_XT_REVISION));
+    assert!(sys_patches.contains("Bindgen models"));
+    assert!(
+        read(root, "vendor/surge-sys/src/lib.rs").contains("improper_ctypes"),
+        "generated opaque u128 storage needs a scoped FFI lint allowance"
+    );
 
     let binding = read(root, "vendor/surge-rs/src/glue/synthesizer.rs");
     assert!(binding.contains("pub fn set_input_buffer"));
