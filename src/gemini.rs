@@ -401,10 +401,12 @@ fn execute_tool(
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
 ) -> Result<ToolOutput, PlannerError> {
     match call.name.as_str() {
-        READ_TOOL_NAME => Ok(ToolOutput::text(match read_sound_graph(session.path()) {
-            Ok(graph) => graph,
-            Err(error) => format!("Tool error: {error}"),
-        })),
+        READ_TOOL_NAME => Ok(ToolOutput::text(
+            match read_sound_graph(session.path(), &call.arguments) {
+                Ok(graph) => graph,
+                Err(error) => format!("Tool error: {error}"),
+            },
+        )),
         PRESET_TOOL_NAME => Ok(ToolOutput::text(
             list_surge_presets(&call.arguments)
                 .unwrap_or_else(|error| format!("Tool error: {error}")),

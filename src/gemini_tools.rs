@@ -11,7 +11,8 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::audio_analysis::{self, MAX_REGION_SECONDS};
 use crate::model::{
-    MidiClipSpec, ModulatorSpec, Project, Studio, StudioError, TrackRole, json_string,
+    MAX_LOOP_PLAYBACK_BEATS, MAX_MIDI_EVENTS_PER_CLIP, MAX_ONCE_PLAYBACK_BEATS, MidiClipSpec,
+    ModulatorSpec, Project, Studio, StudioError, TrackRole, json_string,
 };
 use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
 use crate::storage::{ProjectStore, replace_text_file};
@@ -371,10 +372,17 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "type": "function",
             "name": READ_TOOL_NAME,
-            "description": "Read the latest DAW-AI sound graph with stable channel, clip, event, instrument, effect, modulator, automation-target, and routing IDs. Call this before editing and after a create call when its returned IDs are needed.",
+            "description": "Read the latest compact sound-graph topology, or pass an exact returned nodeId to inspect that one track, instrument, MIDI clip, effect, or modulator in detail.",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "nodeId": {
+                        "type":"string",
+                        "pattern":"^(master|track:[1-9][0-9]*|instrument:[1-9][0-9]*|clip:[1-9][0-9]*|effect:[1-9][0-9]*|modulator:[1-9][0-9]*)$",
+                        "maxLength":64,
+                        "description":"Exact nodeId returned by a topology read. Omit for compact topology."
+                    }
+                },
                 "additionalProperties": false
             }
         }),
@@ -444,7 +452,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
     let id = || serde_json::json!({"type":"integer","minimum":1});
     let notes = || {
         serde_json::json!({
-            "type":"array","maxItems":128,"items":{"type":"object","properties":{
+            "type":"array","maxItems":MAX_MIDI_EVENTS_PER_CLIP,"items":{"type":"object","properties":{
                 "time":{"type":"number","minimum":0,"maximum":256,"description":"Beat offset from the clip start."},
                 "duration":{"type":"number","minimum":0.0625,"maximum":256},
                 "pitch":{"type":"integer","minimum":0,"maximum":127},
@@ -456,9 +464,9 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "trackId":id(), "label":{"type":"string","minLength":1,"maxLength":64},
             "startBeat":{"type":"number","minimum":0,"description":"Absolute beat from the start of the project."},
-            "durationBeats":{"type":"number","minimum":0.25,"maximum":256},
+            "durationBeats":{"type":"number","minimum":0.25,"maximum":MAX_ONCE_PLAYBACK_BEATS},
             "playback":{"oneOf":[
-                {"type":"object","properties":{"mode":{"type":"string","enum":["loop"]},"lengthBeats":{"type":"number","minimum":0.25,"maximum":16}},"required":["mode","lengthBeats"],"additionalProperties":false},
+                {"type":"object","properties":{"mode":{"type":"string","enum":["loop"]},"lengthBeats":{"type":"number","minimum":0.25,"maximum":MAX_LOOP_PLAYBACK_BEATS}},"required":["mode","lengthBeats"],"additionalProperties":false},
                 {"type":"object","properties":{"mode":{"type":"string","enum":["once"]}},"required":["mode"],"additionalProperties":false}
             ]},
             "events":notes()
@@ -552,7 +560,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "add_modulator",
-            "Add a native Surge XT modulator and return its stable ID. Copy target from sound-graph modulationTargets or an instrument leaf's modulationTarget field; never copy its parameter field.",
+            "Add a native Surge XT modulator and return its stable ID. Copy target from an instrument leaf's modulationTarget field; never copy its parameter field.",
             object_schema(
                 serde_json::json!({"trackId":id(),"target":{"type":"string","pattern":"^native:[0-9]+$","maxLength":96},"shape":{"type":"string","enum":["sine","triangle","square","random","envelope","formula"]},"formula":{"type":"string","minLength":1,"maxLength":8192},"rate":{"type":"number","minimum":0.01,"maximum":20},"rateMode":{"type":"string","enum":["hz","tempo"]},"depth":{"type":"number","minimum":0,"maximum":1},"trigger":{"type":"string","enum":["free","midi"]},"attackMs":{"type":"number","minimum":0,"maximum":1000},"releaseMs":{"type":"number","minimum":1,"maximum":5000},"polarity":{"type":"string","enum":["increase","decrease"]}}),
                 &[
@@ -592,7 +600,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         ),
         function(
             "set_track_volume",
-            "Set one track's static mix volume. Use the track.volume target in automationTargets instead when the level must change over time.",
+            "Set one track's static mix volume.",
             object_schema(
                 serde_json::json!({"trackId":id(),"volume":{"type":"number","minimum":0,"maximum":1.5}}),
                 &["trackId", "volume"],
@@ -654,28 +662,229 @@ pub(crate) struct AudioRenderRequest {
     pub(crate) description: String,
 }
 
-pub(crate) fn read_sound_graph(session_path: &Path) -> Result<String, String> {
+pub(crate) fn read_sound_graph(
+    session_path: &Path,
+    arguments: &JsonValue,
+) -> Result<String, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "sound graph arguments must be an object".to_owned())?;
     let project = current_project(session_path)?;
-    let mut graph = serde_json::from_str::<JsonValue>(&project.to_json())
-        .map_err(|error| format!("could not serialize current sound graph: {error}"))?;
-    let tracks = graph
-        .get_mut("tracks")
-        .and_then(JsonValue::as_array_mut)
-        .ok_or_else(|| "current sound graph has no tracks".to_owned())?;
-    for serialized in tracks {
-        let Some(object) = serialized.as_object_mut() else {
-            continue;
-        };
-        object.remove("name");
-        object.remove("role");
-        if let Some(instrument) = object
-            .get_mut("instrument")
-            .and_then(JsonValue::as_object_mut)
-        {
-            instrument.remove("nativeOverrides");
+    if let Some(node_id) = object.get("nodeId") {
+        let node_id = node_id
+            .as_str()
+            .ok_or_else(|| "nodeId must be a string".to_owned())?;
+        return read_sound_node(session_path, &project, node_id).map(|value| value.to_string());
+    }
+    Ok(sound_graph_topology(&project).to_string())
+}
+
+fn sound_graph_topology(project: &Project) -> JsonValue {
+    let mut nodes = vec![serde_json::json!({
+        "nodeId":"master",
+        "type":"master",
+        "name":project.name
+    })];
+    let mut connections = Vec::new();
+    for track in &project.tracks {
+        let track_node = format!("track:{}", track.id);
+        let instrument_node = format!("instrument:{}", track.instrument.id);
+        nodes.push(serde_json::json!({
+            "nodeId":track_node,
+            "type":"track",
+            "name":track.name,
+            "role":track.role.as_str(),
+            "volume":track.volume,
+            "muted":track.muted
+        }));
+        nodes.push(serde_json::json!({
+            "nodeId":instrument_node,
+            "type":"instrument",
+            "trackId":track.id,
+            "engine":track.instrument.engine,
+            "preset":track.instrument.preset
+        }));
+        connections.push(serde_json::json!({
+            "from":track_node,"to":instrument_node,"type":"owns"
+        }));
+        for clip in &track.clips {
+            let node_id = format!("clip:{}", clip.id);
+            nodes.push(serde_json::json!({
+                "nodeId":node_id,
+                "type":"midiClip",
+                "trackId":track.id,
+                "label":clip.label,
+                "start":clip.start,
+                "end":clip.end,
+                "eventCount":clip.events.len()
+            }));
+            connections.push(serde_json::json!({
+                "from":track_node,"to":node_id,"type":"owns"
+            }));
+            connections.push(serde_json::json!({
+                "from":node_id,"to":instrument_node,"type":"midi"
+            }));
+        }
+        let mut audio_source = instrument_node.clone();
+        for effect_id in &track.routing.effect_order {
+            let Some(effect) = track.effects.iter().find(|effect| effect.id == *effect_id) else {
+                continue;
+            };
+            let node_id = format!("effect:{}", effect.id);
+            nodes.push(serde_json::json!({
+                "nodeId":node_id,
+                "type":"effect",
+                "trackId":track.id,
+                "name":effect.name,
+                "source":if effect.preset_slot.is_some() {"preset"} else {"added"},
+                "enabled":effect.enabled
+            }));
+            connections.push(serde_json::json!({
+                "from":track_node,"to":node_id,"type":"owns"
+            }));
+            if effect.enabled {
+                connections.push(serde_json::json!({
+                    "from":audio_source,"to":node_id,"type":"audio"
+                }));
+                audio_source = node_id;
+            }
+        }
+        connections.push(serde_json::json!({
+            "from":audio_source,"to":"master","type":"audio","trackId":track.id
+        }));
+        for modulator in &track.modulators {
+            let node_id = format!("modulator:{}", modulator.id);
+            nodes.push(serde_json::json!({
+                "nodeId":node_id,
+                "type":"modulator",
+                "trackId":track.id,
+                "shape":modulator.shape,
+                "target":modulator.target,
+                "enabled":modulator.enabled
+            }));
+            connections.push(serde_json::json!({
+                "from":track_node,"to":node_id,"type":"owns"
+            }));
+            if modulator.enabled {
+                connections.push(serde_json::json!({
+                    "from":node_id,
+                    "to":instrument_node,
+                    "type":"modulation",
+                    "target":modulator.target
+                }));
+            }
         }
     }
-    Ok(graph.to_string())
+    serde_json::json!({
+        "schemaVersion":3,
+        "name":project.name,
+        "bpm":project.bpm,
+        "duration":project.duration,
+        "version":project.version,
+        "nodeIdType":"nodeId",
+        "nodes":nodes,
+        "connections":connections
+    })
+}
+
+fn read_sound_node(
+    session_path: &Path,
+    project: &Project,
+    node_id: &str,
+) -> Result<JsonValue, String> {
+    if node_id == "master" {
+        return Ok(serde_json::json!({
+            "nodeId":"master","type":"master","name":project.name,
+            "bpm":project.bpm,"duration":project.duration,"version":project.version,
+            "controls":[{"parameter":"bpm","value":project.bpm,"minimum":60,"maximum":180,"mutationTool":"set_tempo"}]
+        }));
+    }
+    let (kind, id) = node_id
+        .split_once(':')
+        .ok_or_else(|| "nodeId must be copied from read_sound_graph topology".to_owned())?;
+    let id = id
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| "nodeId must contain a positive stable ID".to_owned())?;
+    for track in &project.tracks {
+        match kind {
+            "track" if track.id == id => {
+                return Ok(serde_json::json!({
+                    "nodeId":node_id,"type":"track","id":track.id,"name":track.name,
+                    "role":track.role.as_str(),"color":track.color,"volume":track.volume,
+                    "muted":track.muted,
+                    "controls":[
+                        {"parameter":"volume","value":track.volume,"minimum":0,"maximum":1.5,"mutationTool":"set_track_volume"},
+                        {"parameter":"muted","value":track.muted,"mutationTool":"set_track_mute"}
+                    ],
+                    "children":std::iter::once(format!("instrument:{}", track.instrument.id))
+                        .chain(track.clips.iter().map(|clip| format!("clip:{}", clip.id)))
+                        .chain(track.effects.iter().map(|effect| format!("effect:{}", effect.id)))
+                        .chain(track.modulators.iter().map(|modulator| format!("modulator:{}", modulator.id)))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            "instrument" if track.instrument.id == id => {
+                return Ok(serde_json::json!({
+                    "nodeId":node_id,"type":"instrument","id":id,"trackId":track.id,
+                    "engine":track.instrument.engine,"preset":track.instrument.preset,
+                    "nativeOverrides":track.instrument.native_overrides,
+                    "parameterBrowser":{"tool":INSTRUMENT_PARAMETER_TOOL_NAME,"arguments":{"trackId":track.id}},
+                    "presetBrowser":{"tool":PRESET_TOOL_NAME,"arguments":{}}
+                }));
+            }
+            "clip" => {
+                if let Some(clip) = track.clips.iter().find(|clip| clip.id == id) {
+                    let beats_per_second = f32::from(project.bpm) / 60.0;
+                    return Ok(serde_json::json!({
+                        "nodeId":node_id,"type":"midiClip","id":id,"trackId":track.id,
+                        "label":clip.label,"startBeat":clip.start * beats_per_second,
+                        "durationBeats":(clip.end - clip.start) * beats_per_second,
+                        "playback":if clip.playback_mode == "loop" {
+                            serde_json::json!({"mode":"loop","lengthBeats":clip.loop_beats})
+                        } else { serde_json::json!({"mode":"once"}) },
+                        "events":clip.events.iter().map(|event| serde_json::json!({
+                            "id":event.id,"time":event.time,"duration":event.duration,
+                            "pitch":event.pitch,"velocity":event.velocity
+                        })).collect::<Vec<_>>()
+                    }));
+                }
+            }
+            "effect" => {
+                if let Some(effect) = track.effects.iter().find(|effect| effect.id == id) {
+                    let controls = serde_json::from_str::<JsonValue>(&list_sound_tool_parameters(
+                        session_path,
+                        &serde_json::json!({"trackId":track.id,"tool":"effect","toolId":id}),
+                    )?)
+                    .map_err(|error| format!("could not serialize effect controls: {error}"))?;
+                    return Ok(serde_json::json!({
+                        "nodeId":node_id,"type":"effect","id":id,"trackId":track.id,
+                        "name":effect.name,
+                        "source":if effect.preset_slot.is_some() {"preset"} else {"added"},
+                        "controls":controls["parameters"]
+                    }));
+                }
+            }
+            "modulator" => {
+                if let Some(modulator) = track.modulators.iter().find(|item| item.id == id) {
+                    let controls = serde_json::from_str::<JsonValue>(&list_sound_tool_parameters(
+                        session_path,
+                        &serde_json::json!({"trackId":track.id,"tool":"modulator","toolId":id}),
+                    )?)
+                    .map_err(|error| format!("could not serialize modulator controls: {error}"))?;
+                    return Ok(serde_json::json!({
+                        "nodeId":node_id,"type":"modulator","id":id,"trackId":track.id,
+                        "name":modulator.name,"controls":controls["parameters"]
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(format!(
+        "node {node_id} does not exist; call read_sound_graph without nodeId for current topology"
+    ))
 }
 
 pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String> {
@@ -843,10 +1052,6 @@ pub(crate) fn list_instrument_parameters(
                 },
                 "mutationTool":SET_INSTRUMENT_PARAMETER_TOOL_NAME
             });
-            value["automationTarget"] = serde_json::json!(format!("native:{}", parameter.id));
-            if parameter.boolean || parameter.discrete || !parameter.choices.is_empty() {
-                value["automationCurve"] = JsonValue::String("hold".to_owned());
-            }
             if parameter.voice_modulatable || parameter.scene_modulatable {
                 value["modulationTarget"] = serde_json::json!(format!("native:{}", parameter.id));
                 value["modulation"] = serde_json::json!({
@@ -1638,6 +1843,11 @@ fn clip_arguments(
     object: &Map<String, JsonValue>,
     bpm: u16,
 ) -> Result<(u64, MidiClipSpec), String> {
+    let label = required_string(object, "label")?;
+    let label_length = label.chars().count();
+    if !(1..=64).contains(&label_length) {
+        return Err("label must contain between 1 and 64 characters".to_owned());
+    }
     let events = object
         .get("events")
         .and_then(JsonValue::as_array)
@@ -1666,7 +1876,7 @@ fn clip_arguments(
         .and_then(JsonValue::as_object)
         .ok_or_else(|| "playback must be an object".to_owned())?;
     let playback_mode = required_string(playback, "mode")?;
-    let maximum_events = 128;
+    let maximum_events = MAX_MIDI_EVENTS_PER_CLIP;
     if events.len() > maximum_events {
         return Err(format!(
             "{playback_mode} has {} events; maximum is {maximum_events}",
@@ -1678,11 +1888,46 @@ fn clip_arguments(
         "once" => duration_beats,
         _ => return Err("playback mode must be loop or once".to_owned()),
     };
+    if start_beat < 0.0 {
+        return Err("startBeat must be at least 0".to_owned());
+    }
+    if !(0.25..=MAX_ONCE_PLAYBACK_BEATS).contains(&duration_beats) {
+        return Err(format!(
+            "durationBeats must be between 0.25 and {MAX_ONCE_PLAYBACK_BEATS}"
+        ));
+    }
+    let maximum_playback_beats = if playback_mode == "loop" {
+        MAX_LOOP_PLAYBACK_BEATS
+    } else {
+        MAX_ONCE_PLAYBACK_BEATS
+    };
+    if !(0.25..=maximum_playback_beats).contains(&loop_beats) {
+        return Err(format!(
+            "{playback_mode} playback length must be between 0.25 and {maximum_playback_beats} beats"
+        ));
+    }
+    for (index, note) in notes.iter().enumerate() {
+        if !(0.0..loop_beats).contains(&note.time) {
+            return Err(format!(
+                "events[{index}].time must be at least 0 and before the {loop_beats}-beat playback length"
+            ));
+        }
+        if !(0.0625..=loop_beats).contains(&note.duration) {
+            return Err(format!(
+                "events[{index}].duration must be between 0.0625 and {loop_beats} beats"
+            ));
+        }
+        if !(0.01..=1.0).contains(&note.velocity) {
+            return Err(format!(
+                "events[{index}].velocity must be between 0.01 and 1"
+            ));
+        }
+    }
     let seconds_per_beat = 60.0 / f32::from(bpm);
     Ok((
         required_id(object, "trackId")?,
         MidiClipSpec {
-            label: required_string(object, "label")?.to_owned(),
+            label: label.to_owned(),
             start: start_beat * seconds_per_beat,
             end: (start_beat + duration_beats) * seconds_per_beat,
             playback_mode: playback_mode.to_owned(),
@@ -2154,7 +2399,9 @@ fn studio_error_message(error: StudioError) -> String {
             "sound-tool ID not found; call read_sound_graph".to_owned()
         }
         StudioError::InvalidSoundTool => "invalid sound-tool parameter or value".to_owned(),
-        StudioError::EffectCapacity => "effect chain full: 8 slots; audio input uses 1".to_owned(),
+        StudioError::EffectCapacity => {
+            "effect chain full: Surge XT supports at most 8 enabled serial effects".to_owned()
+        }
     }
 }
 
@@ -2467,6 +2714,10 @@ mod tests {
             midi["description"],
             "Add a beat-positioned MIDI clip without changing other clips."
         );
+        assert_eq!(
+            midi["parameters"]["properties"]["durationBeats"]["maximum"],
+            MAX_ONCE_PLAYBACK_BEATS
+        );
         let new_track = declarations
             .iter()
             .find(|tool| tool["name"] == "new_track")
@@ -2489,22 +2740,53 @@ mod tests {
     }
 
     #[test]
-    fn sound_graph_hides_legacy_convenience_parameters() {
+    fn sound_graph_reads_compact_topology_and_one_node_at_a_time() {
         let project = Project::demo();
         let session =
             EditSession::create(&project, "inspect migrated controls", 0.0, 1.0).expect("session");
-        let response = read_sound_graph(session.path()).expect("sound graph");
-        let response: JsonValue = serde_json::from_str(&response).expect("graph JSON");
-        let track = &response["tracks"][1];
-        assert!(track.get("name").is_none());
-        assert!(track.get("role").is_none());
-        assert!(track["instrument"].get("parameters").is_none());
-        assert!(track["instrument"].get("overrides").is_none());
-        assert!(!response.to_string().contains("instrument.cutoff"));
+        let response = read_sound_graph(session.path(), &serde_json::json!({})).expect("topology");
         assert!(
-            track["modulators"][0]["target"]
-                .as_str()
-                .is_some_and(|target| target.starts_with("native:"))
+            response.len() < 8_000,
+            "topology was {} bytes",
+            response.len()
+        );
+        let response: JsonValue = serde_json::from_str(&response).expect("graph JSON");
+        assert!(response.get("tracks").is_none());
+        assert!(
+            response["nodes"]
+                .as_array()
+                .is_some_and(|nodes| !nodes.is_empty())
+        );
+        assert!(
+            response["connections"]
+                .as_array()
+                .is_some_and(|connections| !connections.is_empty())
+        );
+        assert!(!response.to_string().contains("modulationTargets"));
+
+        let track = &project.tracks[1];
+        let instrument = read_sound_graph(
+            session.path(),
+            &serde_json::json!({"nodeId":format!("instrument:{}", track.instrument.id)}),
+        )
+        .expect("instrument detail");
+        let instrument: JsonValue = serde_json::from_str(&instrument).expect("instrument JSON");
+        assert_eq!(instrument["preset"], track.instrument.preset);
+        assert_eq!(
+            instrument["parameterBrowser"]["tool"],
+            INSTRUMENT_PARAMETER_TOOL_NAME
+        );
+        assert!(instrument.get("modulationTargets").is_none());
+
+        let clip = read_sound_graph(
+            session.path(),
+            &serde_json::json!({"nodeId":format!("clip:{}", track.clips[0].id)}),
+        )
+        .expect("clip detail");
+        let clip: JsonValue = serde_json::from_str(&clip).expect("clip JSON");
+        assert_eq!(
+            clip["events"].as_array().map(Vec::len),
+            Some(track.clips[0].events.len())
         );
     }
 
@@ -2553,24 +2835,7 @@ mod tests {
             .expect("oscillator parameters"),
         )
         .expect("oscillator JSON");
-        assert!(
-            oscillator["parameters"]
-                .as_array()
-                .expect("oscillator parameters")
-                .iter()
-                .all(|parameter| parameter["automationTarget"] == parameter["parameter"])
-        );
-        assert!(
-            oscillator["parameters"]
-                .as_array()
-                .expect("oscillator parameters")
-                .iter()
-                .filter(|parameter| matches!(
-                    parameter["kind"].as_str(),
-                    Some("boolean" | "selection")
-                ))
-                .all(|parameter| parameter["automationCurve"] == "hold")
-        );
+        assert!(!oscillator.to_string().contains("automationTarget"));
         assert_eq!(
             oscillator["parameters"]
                 .as_array()
@@ -3212,6 +3477,62 @@ mod tests {
         .expect("dense loop");
         let (_, project) = session.take_update().unwrap().expect("loop update");
         assert_eq!(project.tracks[0].clips.last().unwrap().events.len(), 33);
+    }
+
+    #[test]
+    fn midi_tools_accept_schema_length_and_report_invalid_lengths_directly() {
+        let mut studio = Studio::from_project(Project::demo());
+        studio.set_tempo(128).expect("tempo");
+        let session = EditSession::create(studio.project(), "write a long arrangement", 0.0, 32.0)
+            .expect("session");
+        apply_agent_mutation(
+            session.path(),
+            "add_midi_clip",
+            &serde_json::json!({
+                "trackId":3,
+                "label":"Long phrase",
+                "startBeat":0,
+                "durationBeats":66,
+                "playback":{"mode":"once"},
+                "events":[{"time":65,"duration":0.5,"pitch":72,"velocity":0.8}]
+            }),
+        )
+        .expect("66-beat phrase accepted everywhere");
+        let (_, project) = session.take_update().unwrap().expect("phrase update");
+        assert_eq!(project.tracks[2].clips.last().unwrap().loop_beats, 66.0);
+
+        let error = apply_agent_mutation(
+            session.path(),
+            "add_midi_clip",
+            &serde_json::json!({
+                "trackId":3,
+                "label":"Too long",
+                "startBeat":0,
+                "durationBeats":257,
+                "playback":{"mode":"once"},
+                "events":[]
+            }),
+        )
+        .expect_err("oversized phrase");
+        assert_eq!(error, "durationBeats must be between 0.25 and 256");
+
+        let error = apply_agent_mutation(
+            session.path(),
+            "add_midi_clip",
+            &serde_json::json!({
+                "trackId":3,
+                "label":"Too long loop",
+                "startBeat":0,
+                "durationBeats":32,
+                "playback":{"mode":"loop","lengthBeats":17},
+                "events":[]
+            }),
+        )
+        .expect_err("oversized loop");
+        assert_eq!(
+            error,
+            "loop playback length must be between 0.25 and 16 beats"
+        );
     }
 
     #[test]
