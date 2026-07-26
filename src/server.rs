@@ -18,7 +18,9 @@ use crate::audio_stream::{
 use crate::concurrency::Limiter;
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
 use crate::gemini_tools::render_audio_request;
-use crate::model::{ChannelOperationAction, Project, Studio, StudioError, json_string};
+use crate::model::{
+    ChannelOperationAction, Project, Studio, StudioError, json_string, valid_operation_id,
+};
 #[cfg(test)]
 use crate::project_history::{MAX_HISTORY_BYTES, load_project_history};
 use crate::project_history::{
@@ -2342,14 +2344,6 @@ fn fallback_operation_id(id: u64) -> String {
         hasher.finish()
     };
     format!("{:016x}{:016x}", hash(0), hash(1))
-}
-
-fn valid_operation_id(operation_id: &str) -> bool {
-    !operation_id.is_empty()
-        && operation_id.len() <= 128
-        && operation_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn recovered_operation_json(operation: &crate::model::EditOperation) -> String {

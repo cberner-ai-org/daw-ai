@@ -15,7 +15,7 @@ use crate::model::{
     TrackRole, json_string,
 };
 use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
-use crate::storage::ProjectStore;
+use crate::storage::{ProjectStore, replace_text_file};
 
 pub(crate) const READ_TOOL_NAME: &str = "read_sound_graph";
 pub(crate) const AUDIO_TOOL_NAME: &str = "render_audio_region";
@@ -2763,21 +2763,7 @@ fn write_new_with(
 }
 
 fn write_replace(path: &Path, source: &str) -> io::Result<()> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        file.write_all(source.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    replace_text_file(path, &format!("{}\n", source.trim_end()))
 }
 
 #[cfg(test)]
