@@ -9,6 +9,7 @@ const HISTORY_LIMIT: usize = 50;
 const TRACK_LIMIT: usize = 128;
 pub(crate) const EDIT_LOG_LIMIT: usize = 256;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
+pub(crate) const PROJECT_SCHEMA_VERSION: u64 = 3;
 pub(crate) const MAX_MIDI_EVENTS_PER_CLIP: usize = 1_024;
 pub(crate) const MIN_MIDI_NOTE_BEATS: f32 = 0.0625;
 pub(crate) const MAX_LOOP_PLAYBACK_BEATS: f32 = 16.0;
@@ -397,7 +398,8 @@ impl Project {
     fn write_graph_json(&self, output: &mut String) {
         write!(
             output,
-            "{{\"schemaVersion\":3,\"name\":{},\"bpm\":{},\"duration\":{},\"version\":{},\"tracks\":[",
+            "{{\"schemaVersion\":{},\"name\":{},\"bpm\":{},\"duration\":{},\"version\":{},\"tracks\":[",
+            PROJECT_SCHEMA_VERSION,
             json_string(&self.name),
             self.bpm,
             decimal(self.duration),

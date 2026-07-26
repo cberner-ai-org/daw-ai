@@ -5,8 +5,8 @@ use serde_json::{Map, Value as JsonValue};
 use crate::model::{
     ChannelOperation, ChannelOperationAction, Clip, ClipEvent, Edit, EditOperation, Effect,
     Instrument, MAX_MIDI_EVENTS_PER_CLIP, MAX_PROMPT_CHARACTERS, MIN_MIDI_NOTE_BEATS, Modulator,
-    Project, ProjectFileError, Routing, SURGE_ENGINE, Track, TrackRole, automation_target_range,
-    valid_operation_id, valid_surge_preset,
+    PROJECT_SCHEMA_VERSION, Project, ProjectFileError, Routing, SURGE_ENGINE, Track, TrackRole,
+    automation_target_range, valid_operation_id, valid_surge_preset,
 };
 use crate::prompt::{Action, AutomationPoint, MAX_COMPOUND_ACTIONS, MidiNote};
 
@@ -22,7 +22,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     let value: JsonValue =
         serde_json::from_str(source).map_err(|error| invalid(format!("invalid JSON: {error}")))?;
     let root = object(&value, "sound graph")?;
-    if integer(root, "schemaVersion")? != 3 {
+    if integer(root, "schemaVersion")? != PROJECT_SCHEMA_VERSION {
         return Err(invalid("schemaVersion is unsupported"));
     }
     let name = limited_string(root, "name", 1, 160)?;
@@ -1526,6 +1526,9 @@ mod tests {
         assert!(parse_project(&project.to_string()).is_err());
 
         project["schemaVersion"] = JsonValue::from(1);
+        assert!(parse_project(&project.to_string()).is_err());
+
+        project["schemaVersion"] = JsonValue::from(2);
         assert!(parse_project(&project.to_string()).is_err());
     }
 
