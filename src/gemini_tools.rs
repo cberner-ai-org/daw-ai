@@ -14,8 +14,8 @@ use crate::audio_analysis::{self, MAX_REGION_SECONDS};
 use crate::model::TrackRole;
 use crate::model::{
     MAX_LOOP_PLAYBACK_BEATS, MAX_MIDI_EVENTS_PER_CLIP, MAX_ONCE_PLAYBACK_BEATS,
-    MIN_MIDI_NOTE_BEATS, MidiClipSpec, ModulatorSpec, Project, Studio, StudioError,
-    TRACK_COLOR_PALETTE, json_string,
+    MIN_MIDI_NOTE_BEATS, MidiClipSpec, ModulatorSpec, PROJECT_SCHEMA_VERSION, Project, Studio,
+    StudioError, TRACK_COLOR_PALETTE, json_string,
 };
 use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
 use crate::storage::{ProjectStore, replace_text_file};
@@ -785,7 +785,7 @@ fn sound_graph_topology(project: &Project) -> JsonValue {
         }
     }
     serde_json::json!({
-        "schemaVersion":3,
+        "schemaVersion":PROJECT_SCHEMA_VERSION,
         "name":project.name,
         "bpm":project.bpm,
         "duration":project.duration,
