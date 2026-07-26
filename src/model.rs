@@ -2491,6 +2491,7 @@ fn configure_track_preset(
         .iter()
         .filter_map(|effect| effect.preset_slot.map(|slot| (slot, effect.id)))
         .collect::<std::collections::HashMap<_, _>>();
+    let previous_order = track.routing.effect_order.clone();
     let added = track
         .effects
         .iter()
@@ -2512,9 +2513,27 @@ fn configure_track_preset(
                 .ok_or(StudioError::InvalidSoundTool)?;
         }
     }
+    let preset_order = preset_effects
+        .iter()
+        .map(|effect| effect.id)
+        .collect::<Vec<_>>();
+    let added_ids = added
+        .iter()
+        .map(|effect| effect.id)
+        .collect::<std::collections::HashSet<_>>();
     preset_effects.extend(added);
     track.effects = preset_effects;
-    track.routing.effect_order = track.effects.iter().map(|effect| effect.id).collect();
+    track.routing.effect_order = preset_order;
+    track.routing.effect_order.extend(
+        previous_order
+            .into_iter()
+            .filter(|effect_id| added_ids.contains(effect_id)),
+    );
+    let missing_added = added_ids
+        .into_iter()
+        .filter(|effect_id| !track.routing.effect_order.contains(effect_id))
+        .collect::<Vec<_>>();
+    track.routing.effect_order.extend(missing_added);
     if !track_effects_fit(track, !track.audio_clips.is_empty()) {
         return Err(StudioError::EffectCapacity);
     }
@@ -2526,12 +2545,15 @@ fn configure_track_preset(
         .values()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    track.modulators.retain(|modulator| {
+    let mut retained_modulators = std::mem::take(&mut track.modulators);
+    retained_modulators.retain(|modulator| {
         let targets_previous_effect = previous_effect_ids
             .iter()
             .any(|id| modulator.target.starts_with(&format!("effect:{id}.")));
-        !targets_previous_effect || available_modulation_targets.contains(&modulator.target)
+        (!targets_previous_effect || available_modulation_targets.contains(&modulator.target))
+            && valid_modulator_target_for_trigger(track, &modulator.target, &modulator.trigger)
     });
+    track.modulators = retained_modulators;
     let valid_automation_targets = automation_targets(track)
         .into_iter()
         .map(|target| target.id)
@@ -2554,6 +2576,13 @@ fn configure_track_tool(
     match tool {
         "instrument" => configure_instrument(&mut track.instrument, tool_id, parameter, value),
         "effect" => {
+            let semantics = crate::surge::effect_parameter_semantics(
+                &track.instrument,
+                &track.effects,
+                &track.routing.effect_order,
+                track.id,
+                tool_id,
+            );
             let effect = track
                 .effects
                 .iter_mut()
@@ -2582,18 +2611,34 @@ fn configure_track_tool(
                 }
                 "enabled" => effect.enabled = parse_bool(value)?,
                 parameter if effect.parameters.contains_key(parameter) => {
-                    effect
-                        .parameters
-                        .insert(parameter.to_owned(), parse_range(value, 0.0, 1.0)?);
+                    let value = parse_range(value, 0.0, 1.0)?;
+                    if semantics.get(parameter).is_some_and(|semantics| {
+                        !semantics.choices.is_empty()
+                            && !semantics
+                                .choices
+                                .iter()
+                                .any(|(choice, _)| (choice - value).abs() < 0.000_01)
+                    }) {
+                        return Err(StudioError::InvalidSoundTool);
+                    }
+                    effect.parameters.insert(parameter.to_owned(), value);
                     mark_effect_override(effect, parameter);
                 }
                 parameter
                     if crate::surge::effect_parameter_values(&effect.name)
                         .contains_key(parameter) =>
                 {
-                    effect
-                        .parameters
-                        .insert(parameter.to_owned(), parse_range(value, 0.0, 1.0)?);
+                    let value = parse_range(value, 0.0, 1.0)?;
+                    if semantics.get(parameter).is_some_and(|semantics| {
+                        !semantics.choices.is_empty()
+                            && !semantics
+                                .choices
+                                .iter()
+                                .any(|(choice, _)| (choice - value).abs() < 0.000_01)
+                    }) {
+                        return Err(StudioError::InvalidSoundTool);
+                    }
+                    effect.parameters.insert(parameter.to_owned(), value);
                     mark_effect_override(effect, parameter);
                 }
                 _ => return Err(StudioError::InvalidSoundTool),
@@ -4366,6 +4411,15 @@ mod tests {
         let instrument_id = studio.project.tracks[1].instrument.id;
         let modulator_id = studio.project.tracks[1].modulators[0].id;
         let preset = "Factory/Basses/Evilous";
+        let mut retained = studio.project.tracks[1].effects[0].clone();
+        retained.id = 9_802;
+        retained.preset_slot = None;
+        studio.project.tracks[1].effects.push(retained);
+        let added_order = [9_802, studio.project.tracks[1].effects[0].id];
+        studio.project.tracks[1]
+            .routing
+            .effect_order
+            .splice(.., added_order);
         studio
             .configure_sound_tool(
                 track_id,
@@ -4437,6 +4491,14 @@ mod tests {
                 },
             )
             .expect("plan-driven preset refresh");
+        let refreshed_added_order = studio.project.tracks[1]
+            .routing
+            .effect_order
+            .iter()
+            .filter(|effect_id| added_order.contains(effect_id))
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(refreshed_added_order, added_order);
         assert!(
             studio.project.tracks[1]
                 .effects
@@ -4480,6 +4542,39 @@ mod tests {
         );
         assert!(!studio.to_json().contains(&effect_target));
         crate::project_file::parse_project(&studio.to_json()).expect("reopen pruned preset");
+    }
+
+    #[test]
+    fn native_effect_selections_reject_values_between_surge_choices() {
+        let mut studio = Studio::new();
+        let track_id = studio.project.tracks[1].id;
+        let instrument = studio.project.tracks[1].instrument.clone();
+        let (effect_name, parameter) = crate::surge::SURGE_EFFECT_TYPES
+            .iter()
+            .filter(|name| **name != "Off" && **name != "Audio Input")
+            .find_map(|name| {
+                let candidate = effect(99_003, name, 0.5);
+                crate::surge::effect_parameter_semantics(
+                    &instrument,
+                    std::slice::from_ref(&candidate),
+                    &[candidate.id],
+                    track_id,
+                    candidate.id,
+                )
+                .into_iter()
+                .find(|(parameter, semantics)| parameter != "mix" && !semantics.choices.is_empty())
+                .map(|(parameter, _)| ((*name).to_owned(), parameter))
+            })
+            .expect("native effect selection parameter");
+        let effect_id = studio
+            .create_effect(track_id, &effect_name, 0.5)
+            .expect("effect with selection");
+
+        assert_eq!(
+            studio
+                .configure_sound_tool(track_id, "effect", effect_id, None, &parameter, "0.123456",),
+            Err(StudioError::InvalidSoundTool)
+        );
     }
 
     #[test]

@@ -240,6 +240,16 @@ fn parse_track(
         .iter()
         .map(|value| parse_effect(value, ids))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut preset_slots = HashSet::new();
+    if effects
+        .iter()
+        .filter_map(|effect| effect.preset_slot)
+        .any(|slot| !preset_slots.insert(slot))
+    {
+        return Err(invalid(format!(
+            "{context} has duplicate preset effect slots"
+        )));
+    }
 
     let modulator_values = array(track, "modulators")?;
     if modulator_values.len() > MAX_TOOLS_PER_TRACK {
@@ -1557,6 +1567,21 @@ mod tests {
             };
             assert!(error.to_string().contains("presetSlot"));
         }
+    }
+
+    #[test]
+    fn rejects_duplicate_preset_effect_slots() {
+        let mut project = Project::demo();
+        let track = &mut project.tracks[1];
+        let mut duplicate = track.effects[0].clone();
+        duplicate.id = 99_001;
+        duplicate.preset_slot = Some(0);
+        track.effects[0].preset_slot = Some(0);
+        track.effects.push(duplicate);
+        track.routing.effect_order.push(99_001);
+
+        let error = parse_project(&project.to_json()).expect_err("duplicate preset slot");
+        assert!(error.to_string().contains("duplicate preset effect slots"));
     }
 
     #[test]

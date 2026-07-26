@@ -739,28 +739,45 @@ pub(crate) fn instrument_parameters(preset: &str) -> Vec<InstrumentParameter> {
 pub(crate) fn instrument_parameters_for_instrument(
     instrument: &Instrument,
 ) -> Vec<InstrumentParameter> {
-    let mut parameters = instrument_parameters(&instrument.preset);
+    let parameters = instrument_parameters(&instrument.preset);
     if instrument.native_overrides.is_empty() && instrument.parameter_overrides.is_empty() {
         return parameters;
     }
     let Ok(engine) = Engine::new(instrument, &[], &[], &[], 1, 48_000.0) else {
         return parameters;
     };
-    for parameter in &mut parameters {
-        let mut id = SurgeId::empty();
-        if engine.synth.from_synth_side_id(parameter.id, &mut id) {
-            parameter.value = engine.synth.get_parameter01(&mut id);
-            parameter.display = engine.synth.get_parameter_display(&mut id);
-            parameter.deactivated = engine.synth.parameter_is_deactivated(&id);
-            parameter.voice_modulatable = engine
-                .synth
-                .is_valid_modulation(parameter.id, VOICE_LFO_SOURCE);
-            parameter.scene_modulatable = engine
-                .synth
-                .is_valid_modulation(parameter.id, SCENE_LFO_SOURCE);
-        }
-    }
-    parameters
+    let preset_values = parameters
+        .into_iter()
+        .map(|parameter| (parameter.id, parameter.preset_value))
+        .collect::<HashMap<_, _>>();
+    (0..MAX_NATIVE_PARAMETERS)
+        .filter_map(|index| {
+            let mut id = SurgeId::empty();
+            engine.synth.from_synth_side_id(index, &mut id).then(|| {
+                let name = engine.synth.get_parameter_accessible_name(&mut id);
+                InstrumentParameter {
+                    id: index,
+                    common: is_common_parameter(&name),
+                    name,
+                    value: engine.synth.get_parameter01(&mut id),
+                    preset_value: preset_values
+                        .get(&index)
+                        .copied()
+                        .unwrap_or_else(|| engine.synth.get_parameter01(&mut id)),
+                    display: engine.synth.get_parameter_display(&mut id),
+                    boolean: engine.synth.parameter_is_boolean(&id),
+                    discrete: engine.synth.parameter_is_discrete(&id),
+                    bipolar: engine.synth.parameter_is_bipolar(&id),
+                    tempo_sync: engine.synth.parameter_can_temposync(&id),
+                    can_deactivate: engine.synth.parameter_can_deactivate(&id),
+                    deactivated: engine.synth.parameter_is_deactivated(&id),
+                    choices: engine.synth.parameter_choices(&id),
+                    voice_modulatable: engine.synth.is_valid_modulation(index, VOICE_LFO_SOURCE),
+                    scene_modulatable: engine.synth.is_valid_modulation(index, SCENE_LFO_SOURCE),
+                }
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn instrument_parameter_is_modulatable(
@@ -773,7 +790,7 @@ pub(crate) fn instrument_parameter_is_modulatable(
         .and_then(|id| id.parse::<i32>().ok())
         .or_else(|| {
             let graph_name = target.strip_prefix("instrument.")?;
-            instrument_parameters(&instrument.preset)
+            instrument_parameters_for_instrument(instrument)
                 .into_iter()
                 .find(|parameter| {
                     instrument_graph_parameter(&instrument.preset, parameter.id) == Some(graph_name)
@@ -783,7 +800,7 @@ pub(crate) fn instrument_parameter_is_modulatable(
     let Some(id) = native_id else {
         return false;
     };
-    instrument_parameters(&instrument.preset)
+    instrument_parameters_for_instrument(instrument)
         .into_iter()
         .find(|parameter| parameter.id == id)
         .is_some_and(|parameter| match trigger {
@@ -800,7 +817,21 @@ pub(crate) fn effect_parameter_semantics(
     track_id: u64,
     effect_id: u64,
 ) -> HashMap<String, EffectParameterSemantics> {
-    let Ok(engine) = Engine::new(instrument, effects, effect_order, &[], track_id, 48_000.0) else {
+    let mut semantic_effects = effects.to_vec();
+    if let Some(effect) = semantic_effects
+        .iter_mut()
+        .find(|effect| effect.id == effect_id)
+    {
+        effect.enabled = true;
+    }
+    let Ok(engine) = Engine::new(
+        instrument,
+        &semantic_effects,
+        effect_order,
+        &[],
+        track_id,
+        48_000.0,
+    ) else {
         return HashMap::new();
     };
     let mut result = HashMap::new();
@@ -1577,6 +1608,28 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{name} did not load: {error}"));
             engine.process();
         }
+    }
+
+    #[test]
+    fn disabled_effects_keep_their_native_parameter_semantics() {
+        let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
+        let mut effect = crate::model::Project::demo().tracks[1].effects[0].clone();
+        effect.enabled = false;
+        let semantics = effect_parameter_semantics(
+            &instrument,
+            std::slice::from_ref(&effect),
+            &[effect.id],
+            1,
+            effect.id,
+        );
+
+        assert!(semantics.contains_key("mix"));
+        assert!(
+            effect
+                .parameters
+                .keys()
+                .any(|parameter| semantics.contains_key(parameter))
+        );
     }
 
     #[test]
