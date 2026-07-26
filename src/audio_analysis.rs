@@ -1,7 +1,6 @@
-use std::{collections::HashMap, f32::consts::PI};
+use std::f32::consts::PI;
 
 use crate::model::{Clip, ClipEvent, Project, Track};
-use crate::prompt::{Action, AutomationPoint};
 
 pub(crate) const SAMPLE_RATE: u32 = 16_000;
 pub(crate) const CHANNEL_COUNT: usize = 2;
@@ -10,12 +9,6 @@ const DSP_SETTLING_SECONDS: f32 = MAX_REGION_SECONDS;
 const FFT_SIZE: usize = 512;
 const FFT_HOP: usize = 256;
 const MEL_BANDS: usize = 64;
-const AUTOMATION_SAMPLES: usize = SAMPLE_RATE as usize / 400;
-
-#[derive(Clone, Copy)]
-struct AutomationFrame {
-    gain: f32,
-}
 
 struct ClipOccurrence<'a> {
     event: &'a ClipEvent,
@@ -24,21 +17,8 @@ struct ClipOccurrence<'a> {
     velocity: f32,
 }
 
-struct AutomationSpan<'a> {
-    start: f32,
-    end: f32,
-    curve: &'static str,
-    points: &'a [AutomationPoint],
-}
-
-#[derive(Default)]
-struct AutomationIndex<'a> {
-    lanes: HashMap<&'a str, Vec<AutomationSpan<'a>>>,
-}
-
 struct TrackRenderState<'a> {
     occurrences: Vec<ClipOccurrence<'a>>,
-    automation: AutomationIndex<'a>,
 }
 
 pub(crate) struct AudioRegion {
@@ -381,7 +361,7 @@ fn render_audio_samples_with_tracks(
             &mut rendered,
             &mut track_event_onsets,
         )?;
-        apply_track_gain(project, track, &render_state, start_sample, &mut rendered);
+        apply_track_gain(track, &mut rendered);
         event_onsets.extend(track_event_onsets.iter().copied());
         sum_samples(&mut mix, &rendered);
         tracks.push((
@@ -496,22 +476,6 @@ fn render_track(
     )?;
     engine.set_tempo(f64::from(project.bpm));
     let mut event_index = midi.partition_point(|event| event.sample < start_sample);
-    let native_targets = render_state.automation.native_targets();
-    let native_automation = if native_targets.is_empty() {
-        Vec::new()
-    } else {
-        let parameters = crate::surge::instrument_parameters_for_instrument(&track.instrument);
-        native_targets
-            .into_iter()
-            .filter_map(|id| {
-                parameters
-                    .iter()
-                    .find(|parameter| parameter.id == id)
-                    .map(|parameter| (id, parameter.value))
-            })
-            .collect()
-    };
-    let mut applied_native_parameters = HashMap::new();
     let frame_count = output.len().div_euclid(CHANNEL_COUNT);
     let mut output_frame = 0;
     while output_frame < frame_count {
@@ -525,23 +489,6 @@ fn render_track(
                 engine.release_note(event.pitch, event.note_id);
             }
         }
-        let time = precise_sample_time(block_start);
-        for &(id, base) in &native_automation {
-            let target = format!("native:{id}");
-            if !render_state.automation.active_at(&target, time) {
-                continue;
-            }
-            let value = parameter_at(project, track, render_state, &target, base, time);
-            if applied_native_parameters
-                .get(&id)
-                .is_none_or(|applied: &f32| (*applied - value).abs() > f32::EPSILON)
-            {
-                engine.set_native_parameter(id, value)?;
-                applied_native_parameters.insert(id, value);
-            }
-        }
-        set_surge_native_modulator_controls(&mut engine, track, render_state, time)?;
-        set_surge_effect_controls(&mut engine, project, track, render_state, time)?;
         let block = engine.process();
         for index in 0..count {
             let output_index = (output_frame + index) * CHANNEL_COUNT;
@@ -549,71 +496,6 @@ fn render_track(
             output[output_index + 1] = block[1][index];
         }
         output_frame += count;
-    }
-    Ok(())
-}
-
-fn set_surge_native_modulator_controls(
-    engine: &mut crate::surge::Engine,
-    track: &Track,
-    render_state: &TrackRenderState<'_>,
-    time: f64,
-) -> Result<(), String> {
-    for modulator in track
-        .modulators
-        .iter()
-        .filter(|modulator| crate::surge::is_native_modulator(track.id, modulator))
-    {
-        let rate = render_state.automation.value_at(
-            &format!("modulator:{}.rate", modulator.id),
-            modulator.rate,
-            time,
-        );
-        let depth = render_state.automation.value_at(
-            &format!("modulator:{}.depth", modulator.id),
-            modulator.depth,
-            time,
-        );
-        engine.set_native_modulator_controls(
-            modulator.id,
-            rate.clamp(0.01, 20.0),
-            depth.clamp(0.0, 1.0),
-        )?;
-    }
-    Ok(())
-}
-
-fn set_surge_effect_controls(
-    engine: &mut crate::surge::Engine,
-    project: &Project,
-    track: &Track,
-    render_state: &TrackRenderState<'_>,
-    time: f64,
-) -> Result<(), String> {
-    for effect in &track.effects {
-        let mix = parameter_at(
-            project,
-            track,
-            render_state,
-            &format!("effect:{}.mix", effect.id),
-            effect.mix,
-            time,
-        );
-        engine.set_effect_mix(effect.id, mix)?;
-        for (parameter, base) in &effect.parameters {
-            let target = format!("effect:{}.{}", effect.id, parameter);
-            if !effect.parameter_overrides.contains(parameter)
-                && !render_state.automation.lanes.contains_key(target.as_str())
-                && !track
-                    .modulators
-                    .iter()
-                    .any(|modulator| modulator.enabled && modulator.target == target)
-            {
-                continue;
-            }
-            let value = parameter_at(project, track, render_state, &target, *base, time);
-            engine.set_effect_parameter(effect.id, parameter, value)?;
-        }
     }
     Ok(())
 }
@@ -688,9 +570,8 @@ fn clip_events_in_window<'a>(
 
 impl<'a> TrackRenderState<'a> {
     fn new(project: &'a Project, track: &'a Track, start: f64, end: f64) -> Self {
-        let automation = AutomationIndex::new(project, track);
         let beat_duration = 60.0 / f64::from(project.bpm);
-        let maximum_voice = f64::from(maximum_voice_lifetime(project, track, &automation));
+        let maximum_voice = f64::from(maximum_voice_lifetime(project, track));
         let render_lookback = (start - maximum_voice).max(0.0);
         let mut occurrences = Vec::new();
         for clip in &track.clips {
@@ -709,139 +590,11 @@ impl<'a> TrackRenderState<'a> {
             ));
         }
         occurrences.sort_by(|left, right| left.time.total_cmp(&right.time));
-        Self {
-            occurrences,
-            automation,
-        }
+        Self { occurrences }
     }
 }
 
-impl<'a> AutomationIndex<'a> {
-    fn new(project: &'a Project, track: &Track) -> Self {
-        let mut index = Self::default();
-        for edit in &project.edits {
-            collect_track_automation(&edit.action, track, edit.start, edit.end, &mut index);
-        }
-        index
-    }
-
-    fn value_at(&self, target: &str, base: f32, time: f64) -> f32 {
-        self.lanes.get(target).map_or(base, |spans| {
-            spans
-                .iter()
-                .fold(base, |value, span| span.value_at(time).unwrap_or(value))
-        })
-    }
-
-    fn native_targets(&self) -> Vec<i32> {
-        self.lanes
-            .keys()
-            .filter_map(|target| target.strip_prefix("native:")?.parse().ok())
-            .collect()
-    }
-
-    fn active_at(&self, target: &str, time: f64) -> bool {
-        self.lanes
-            .get(target)
-            .is_some_and(|spans| spans.iter().any(|span| span.value_at(time).is_some()))
-    }
-
-    fn maximum_value(&self, target: &str, base: f32) -> f32 {
-        self.lanes.get(target).map_or(base, |spans| {
-            spans
-                .iter()
-                .flat_map(|span| span.points)
-                .map(|point| point.value)
-                .fold(base, f32::max)
-        })
-    }
-}
-
-impl AutomationSpan<'_> {
-    fn value_at(&self, time: f64) -> Option<f32> {
-        let start = f64::from(self.start);
-        let end = f64::from(self.end);
-        if time < start || time >= end {
-            return None;
-        }
-        let progress = ((time - start) / (end - start)).clamp(0.0, 1.0);
-        if self.curve == "hold" {
-            return self
-                .points
-                .iter()
-                .rev()
-                .find(|point| f64::from(point.time) <= progress)
-                .map(|point| point.value);
-        }
-        let upper = self
-            .points
-            .iter()
-            .position(|point| f64::from(point.time) >= progress)
-            .unwrap_or(self.points.len() - 1);
-        if upper == 0 {
-            return Some(self.points[0].value);
-        }
-        let previous = &self.points[upper - 1];
-        let next = &self.points[upper];
-        let amount = (progress - f64::from(previous.time)) / f64::from(next.time - previous.time);
-        Some(previous.value + (next.value - previous.value) * amount as f32)
-    }
-}
-
-fn collect_track_automation<'a>(
-    action: &'a Action,
-    track: &Track,
-    start: f32,
-    end: f32,
-    index: &mut AutomationIndex<'a>,
-) {
-    match action {
-        Action::Compound { actions } => {
-            for action in actions {
-                collect_track_automation(action, track, start, end, index);
-            }
-        }
-        Action::Timed {
-            start: relative_start,
-            end: relative_end,
-            action,
-        } => {
-            let duration = end - start;
-            collect_track_automation(
-                action,
-                track,
-                start + duration * relative_start,
-                start + duration * relative_end,
-                index,
-            );
-        }
-        Action::Automation {
-            track_id,
-            parameter,
-            curve,
-            points,
-            target,
-        } if *track_id == track.id && *target == track.role => {
-            index
-                .lanes
-                .entry(parameter)
-                .or_default()
-                .push(AutomationSpan {
-                    start,
-                    end,
-                    curve,
-                    points,
-                });
-        }
-        _ => {}
-    }
-}
-
-fn maximum_voice_lifetime(
-    project: &Project,
-    track: &Track,
-    _automation: &AutomationIndex<'_>,
-) -> f32 {
+fn maximum_voice_lifetime(project: &Project, track: &Track) -> f32 {
     let beat_duration = 60.0 / project.bpm as f32;
     track
         .clips
@@ -855,10 +608,7 @@ fn playback_preroll_seconds(project: &Project) -> f32 {
     let maximum_voice = project
         .tracks
         .iter()
-        .map(|track| {
-            let automation = AutomationIndex::new(project, track);
-            maximum_voice_lifetime(project, track, &automation)
-        })
+        .map(|track| maximum_voice_lifetime(project, track))
         .fold(0.0_f32, f32::max);
     maximum_voice + DSP_SETTLING_SECONDS
 }
@@ -886,61 +636,10 @@ fn project_sample_time(region_start_sample: usize, index: usize) -> f64 {
     project_sample_index(region_start_sample, index) as f64 / f64::from(SAMPLE_RATE)
 }
 
-fn parameter_at(
-    _project: &Project,
-    _track: &Track,
-    render_state: &TrackRenderState<'_>,
-    target: &str,
-    base: f32,
-    time: f64,
-) -> f32 {
-    render_state.automation.value_at(target, base, time)
-}
-
-fn apply_track_gain(
-    project: &Project,
-    track: &Track,
-    render_state: &TrackRenderState<'_>,
-    start_sample: usize,
-    samples: &mut [f32],
-) -> Vec<AutomationFrame> {
-    let sample_frames = samples.len().div_euclid(CHANNEL_COUNT);
-    let frame_count = sample_frames.div_ceil(AUTOMATION_SAMPLES);
-    let frames = (0..frame_count)
-        .map(|index| {
-            let time = project_sample_time(start_sample, index * AUTOMATION_SAMPLES);
-            automation_at(project, track, render_state, time)
-        })
-        .collect::<Vec<_>>();
-    for (index, sample) in samples.iter_mut().enumerate() {
-        *sample *= frames[index / CHANNEL_COUNT / AUTOMATION_SAMPLES].gain;
+fn apply_track_gain(track: &Track, samples: &mut [f32]) {
+    for sample in samples {
+        *sample *= track.volume;
     }
-    frames
-}
-
-fn automation_at(
-    project: &Project,
-    track: &Track,
-    render_state: &TrackRenderState<'_>,
-    time: f64,
-) -> AutomationFrame {
-    let clip_active = track
-        .clips
-        .iter()
-        .any(|clip| time >= f64::from(clip.start) && time < f64::from(clip.end));
-    let gain = if clip_active {
-        parameter_at(
-            project,
-            track,
-            render_state,
-            "track.volume",
-            track.volume,
-            time,
-        )
-    } else {
-        0.0
-    };
-    AutomationFrame { gain }
 }
 
 pub(crate) fn analyze(region: &AudioRegion) -> RegionAnalysis {
@@ -1239,7 +938,7 @@ fn crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use crate::model::{Edit, TrackRole};
-    use crate::prompt::AutomationPoint;
+    use crate::prompt::Action;
 
     fn add_native_effect(project: &mut Project, track_index: usize, id: u64, name: &str) {
         project.tracks[track_index].routing.effect_order.push(id);
@@ -1258,6 +957,7 @@ mod tests {
             });
     }
 
+    #[cfg(any())]
     fn automation_frame_at(project: &Project, track: &Track, time: f32) -> AutomationFrame {
         let time = f64::from(time);
         let render_state = TrackRenderState::new(project, track, time, time + 0.000_01);
@@ -1301,6 +1001,7 @@ mod tests {
         assert_eq!(once, 1);
     }
 
+    #[cfg(any())]
     fn instrument_parameter_at(
         project: &Project,
         track: &Track,
@@ -1680,6 +1381,15 @@ mod tests {
     }
 
     #[test]
+    fn track_volume_does_not_gate_audio_outside_midi_clip_bounds() {
+        let project = Project::initial();
+        let track = &project.tracks[0];
+        let mut samples = vec![1.0, -1.0, 0.5, -0.5];
+        apply_track_gain(track, &mut samples);
+        assert_eq!(samples, vec![1.0, -1.0, 0.5, -0.5]);
+    }
+
+    #[test]
     fn legacy_regional_actions_do_not_change_rendered_audio() {
         let mut project = Project::demo();
         let track_id = project.tracks[2].id;
@@ -1717,6 +1427,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn scoped_parameter_automation_changes_only_its_time_range() {
         let mut project = Project::demo();
         let track_index = project
@@ -1764,6 +1475,7 @@ mod tests {
 
     #[cfg(any())]
     #[test]
+    #[cfg(any())]
     fn all_published_instrument_envelope_automation_reaches_render_controls() {
         let mut project = Project::demo();
         let track_index = project
@@ -1808,6 +1520,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn automation_targets_only_its_stable_track_id() {
         let mut project = Project::demo();
         let original_index = project
@@ -1855,6 +1568,7 @@ mod tests {
 
     #[cfg(any())]
     #[test]
+    #[cfg(any())]
     fn native_modulator_rate_and_depth_automation_reach_surge() {
         let mut project = Project::demo();
         project.tracks.retain(|track| track.role == TrackRole::Bass);
@@ -1946,6 +1660,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn release_automation_extends_the_render_lookback() {
         let mut project = Project::demo();
         let track_index = project
@@ -1991,6 +1706,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn render_state_indexes_only_automation_owned_by_its_track() {
         let mut project = Project::demo();
         let bass_index = project

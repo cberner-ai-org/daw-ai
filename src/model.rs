@@ -34,6 +34,7 @@ struct ModulationTarget {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackRole {
+    Neutral,
     Drums,
     Bass,
     Chords,
@@ -45,6 +46,7 @@ impl TrackRole {
     #[must_use]
     pub fn from_name(value: &str) -> Option<Self> {
         match value {
+            "neutral" => Some(Self::Neutral),
             "drums" => Some(Self::Drums),
             "bass" => Some(Self::Bass),
             "chords" => Some(Self::Chords),
@@ -57,6 +59,7 @@ impl TrackRole {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Neutral => "neutral",
             Self::Drums => "drums",
             Self::Bass => "bass",
             Self::Chords => "chords",
@@ -68,6 +71,7 @@ impl TrackRole {
     #[must_use]
     pub const fn display_name(self) -> &'static str {
         match self {
+            Self::Neutral => "track",
             Self::Drums => "drums",
             Self::Bass => "bass",
             Self::Chords => "chords",
@@ -582,27 +586,6 @@ impl Track {
         output
             .push_str("],\"modulationTargetIdType\":\"modulationTarget\",\"modulationTargets\":[");
         for (index, target) in modulation_targets(self).iter().enumerate() {
-            if index > 0 {
-                output.push(',');
-            }
-            write!(
-                output,
-                concat!(
-                    "{{\"id\":{},\"label\":{},\"minimum\":{},",
-                    "\"maximum\":{},\"scale\":{},\"mode\":{}}}"
-                ),
-                json_string(&target.id),
-                json_string(&target.label),
-                decimal(target.minimum),
-                decimal(target.maximum),
-                decimal(target.scale),
-                json_string(target.mode)
-            )
-            .expect("writing to a string cannot fail");
-        }
-
-        output.push_str("],\"automationTargets\":[");
-        for (index, target) in automation_targets(self).iter().enumerate() {
             if index > 0 {
                 output.push(',');
             }
@@ -2854,6 +2837,7 @@ fn demo_track(id: u64, role: TrackRole, name: &str, color: &str) -> Track {
     track.clips = vec![clip(
         id + 10,
         match role {
+            TrackRole::Neutral => "MIDI",
             TrackRole::Drums => "Pocket beat",
             TrackRole::Bass => "Warm pulse",
             TrackRole::Chords => "Four-chord glow",
@@ -2893,7 +2877,7 @@ fn demo_track(id: u64, role: TrackRole, name: &str, color: &str) -> Track {
 }
 
 fn empty_track(id: u64) -> Track {
-    let mut track = generated_track(id, TrackRole::Lead);
+    let mut track = generated_track(id, TrackRole::Neutral);
     track.name = "Empty Track".to_owned();
     track.instrument.preset = "Init".to_owned();
     track.effects.clear();
@@ -2908,6 +2892,7 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
     Track {
         id,
         name: match role {
+            TrackRole::Neutral => "Track",
             TrackRole::Drums => "AI Drum Voice",
             TrackRole::Bass => "AI Bass",
             TrackRole::Chords => "AI Chords",
@@ -2917,6 +2902,7 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
         .to_owned(),
         role,
         color: match role {
+            TrackRole::Neutral => "#808080",
             TrackRole::Drums => "#ffb86b",
             TrackRole::Bass => "#74e0bc",
             TrackRole::Chords => "#8ca9ff",
@@ -2944,6 +2930,7 @@ fn generated_track(id: u64, role: TrackRole) -> Track {
 
 fn demo_role_track(id: u64, role: TrackRole) -> Track {
     let (name, color, preset) = match role {
+        TrackRole::Neutral => ("Track", "#808080", "Init"),
         TrackRole::Drums => ("AI Drums", "#ffb86b", "Factory/Percussion/Kick 909ish"),
         TrackRole::Bass => ("AI Bass", "#74e0bc", "Factory/Basses/Wide Bassline"),
         TrackRole::Chords => ("AI Chords", "#8ca9ff", "Factory/Polysynths/Anthemish 1"),
@@ -2959,6 +2946,7 @@ fn demo_role_track(id: u64, role: TrackRole) -> Track {
         role,
         color: color.to_owned(),
         volume: match role {
+            TrackRole::Neutral => 1.0,
             TrackRole::Drums => 0.78,
             TrackRole::Bass => 0.95,
             TrackRole::Chords => 0.85,
@@ -2998,6 +2986,7 @@ fn clip(id: u64, label: &str, start: f32, end: f32, style: &str, role: TrackRole
 
 fn pattern_events(clip_id: u64, role: TrackRole) -> Vec<ClipEvent> {
     let specs: Vec<(&str, f32, f32, u8, f32)> = match role {
+        TrackRole::Neutral => Vec::new(),
         TrackRole::Drums => vec![
             ("note", 0.0, 0.25, 36, 0.92),
             ("note", 1.0, 0.25, 36, 0.84),
@@ -3047,14 +3036,13 @@ const fn tool_id(track_id: u64, offset: u64) -> u64 {
 }
 
 fn effect(id: u64, name: &str, mix: f32) -> Effect {
-    let parameters = crate::surge::effect_parameter_values(name);
     Effect {
         id,
         name: name.to_owned(),
         preset_slot: None,
         mix,
         enabled: true,
-        parameters,
+        parameters: BTreeMap::new(),
         parameter_overrides: Vec::new(),
         tempo_sync_parameters: Vec::new(),
         deactivated_parameters: Vec::new(),
@@ -3110,6 +3098,7 @@ mod tests {
         assert_eq!(project.name, "Untitled Project");
         assert_eq!(project.tracks.len(), 1);
         let track = &project.tracks[0];
+        assert_eq!(track.role, TrackRole::Neutral);
         assert_eq!(track.name, "Empty Track");
         assert_eq!(track.instrument.preset, "Init");
         assert!(track.clips.is_empty());
@@ -4099,12 +4088,6 @@ mod tests {
         let effect_id = studio
             .create_effect(track_id, &effect_name, 0.5)
             .expect("effect with selection");
-        let json = studio.to_json();
-        assert!(json.contains(&format!(
-            "{}:{{\"kind\":\"selection\",\"choices\":[{{",
-            json_string(&parameter)
-        )));
-
         assert_eq!(
             studio
                 .configure_sound_tool(track_id, "effect", effect_id, None, &parameter, "0.123456",),

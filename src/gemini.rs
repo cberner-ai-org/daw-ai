@@ -1099,6 +1099,7 @@ fn midi_notes_field(object: &Object, loop_beats: f64) -> Result<Vec<MidiNote>, P
 fn role_from_name(name: &str) -> Result<Option<TrackRole>, PlannerError> {
     match name {
         "all" => Ok(None),
+        "neutral" => Ok(Some(TrackRole::Neutral)),
         "drums" => Ok(Some(TrackRole::Drums)),
         "bass" => Ok(Some(TrackRole::Bass)),
         "chords" => Ok(Some(TrackRole::Chords)),
