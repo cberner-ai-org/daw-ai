@@ -28,6 +28,11 @@ fn vendored_surge_boundary_keeps_pins_and_patched_api() {
         "generated opaque u128 storage needs a scoped FFI lint allowance"
     );
     assert!(
+        read(root, "vendor/surge-sys/build.rs")
+            .contains(r#".blocklist_function("SurgeSynthesizer::idForParameter")"#),
+        "the native by-value ID method must not be generated"
+    );
+    assert!(
         read(root, "vendor/surge-sys/cpp/plumber.h")
             .contains("void idForParameter\t\t\t(CSUR, const Parameter* p, ID* q)"),
         "opaque Surge IDs must cross the C boundary through pointers"
