@@ -5,6 +5,7 @@ use crate::model::{Clip, ClipEvent, Project, Track};
 pub(crate) const SAMPLE_RATE: u32 = 16_000;
 pub(crate) const CHANNEL_COUNT: usize = 2;
 pub(crate) const MAX_REGION_SECONDS: f32 = 16.0;
+pub(crate) const MAX_WAV_SECONDS: f32 = 67_108.0;
 const DSP_SETTLING_SECONDS: f32 = MAX_REGION_SECONDS;
 const FFT_SIZE: usize = 512;
 const FFT_HOP: usize = 256;
@@ -398,11 +399,14 @@ pub(crate) fn wav_bytes(samples: &[f32]) -> Vec<u8> {
 
 pub(crate) fn wav_header(sample_count: usize) -> Vec<u8> {
     let bytes_per_frame = CHANNEL_COUNT * 2;
-    let data_bytes =
-        u32::try_from(sample_count.saturating_mul(bytes_per_frame)).unwrap_or(u32::MAX);
+    let data_bytes = u32::try_from(sample_count.saturating_mul(bytes_per_frame))
+        .expect("project duration guarantees a valid RIFF payload");
+    let riff_bytes = 36_u32
+        .checked_add(data_bytes)
+        .expect("project duration guarantees a valid RIFF length");
     let mut wav = Vec::with_capacity(44);
     wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36_u32.saturating_add(data_bytes)).to_le_bytes());
+    wav.extend_from_slice(&riff_bytes.to_le_bytes());
     wav.extend_from_slice(b"WAVEfmt ");
     wav.extend_from_slice(&16_u32.to_le_bytes());
     wav.extend_from_slice(&1_u16.to_le_bytes());
@@ -1390,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_regional_actions_do_not_change_rendered_audio() {
+    fn persisted_legacy_regional_actions_do_not_change_rendered_audio() {
         let mut project = Project::demo();
         let track_id = project.tracks[2].id;
         let baseline = render_region(&project, &[track_id], 0.0, 2.0).expect("baseline render");

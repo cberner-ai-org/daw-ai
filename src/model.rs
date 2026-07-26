@@ -1510,9 +1510,22 @@ impl Studio {
                 }
                 Ok(())
             }
-            Action::Gain { target, .. }
-            | Action::Mute { target }
-            | Action::Effect { target, .. }
+            Action::Gain { amount, target } => {
+                let tracks = matching_action_tracks(&mut self.project, *target)?;
+                for track in tracks {
+                    track.volume =
+                        ((track.volume * amount * 100.0).round() / 100.0).clamp(0.0, 1.5);
+                }
+                Ok(())
+            }
+            Action::Mute { target } => {
+                let tracks = matching_action_tracks(&mut self.project, *target)?;
+                for track in tracks {
+                    track.muted = true;
+                }
+                Ok(())
+            }
+            Action::Effect { target, .. }
             | Action::RemoveEffect { target, .. }
             | Action::Filter { target, .. }
             | Action::Rhythm { target, .. } => {
@@ -2862,6 +2875,20 @@ fn role_action_track_index(
     })
 }
 
+fn matching_action_tracks(
+    project: &mut Project,
+    target: Option<TrackRole>,
+) -> Result<Vec<&mut Track>, StudioError> {
+    if target.is_some_and(|role| !project.tracks.iter().any(|track| track.role == role)) {
+        return Err(StudioError::UnknownTrack);
+    }
+    Ok(project
+        .tracks
+        .iter_mut()
+        .filter(|track| target.is_none_or(|role| track.role == role))
+        .collect())
+}
+
 fn demo_track(id: u64, role: TrackRole, name: &str, color: &str) -> Track {
     let mut track = demo_role_track(id, role);
     track.name = name.to_owned();
@@ -3074,7 +3101,7 @@ fn effect(id: u64, name: &str, mix: f32) -> Effect {
         preset_slot: None,
         mix,
         enabled: true,
-        parameters: BTreeMap::new(),
+        parameters: crate::surge::effect_parameter_values(name),
         parameter_overrides: Vec::new(),
         tempo_sync_parameters: Vec::new(),
         deactivated_parameters: Vec::new(),
@@ -4814,6 +4841,29 @@ mod tests {
             .expect("valid mix change");
         assert_eq!(studio.project().tracks[0].volume, 0.5);
         assert!(studio.project().tracks[0].muted);
+    }
+
+    #[test]
+    fn demo_gain_and_mute_plans_update_the_track_graph() {
+        let mut studio = Studio::new();
+        let initial_volume = studio.project().tracks[0].volume;
+        studio
+            .apply_prompt(0.0, 2.0, "increase volume")
+            .expect("demo gain plan");
+        let expected = (initial_volume * 1.28 * 100.0).round() / 100.0;
+        assert_eq!(studio.project().tracks[0].volume, expected);
+
+        studio
+            .apply_prompt(0.0, 2.0, "mute")
+            .expect("demo mute plan");
+        assert!(studio.project().tracks[0].muted);
+    }
+
+    #[test]
+    fn newly_added_effects_publish_native_surge_controls() {
+        let effect = effect(1, "Reverb 2", 0.5);
+        assert!(!effect.parameters.is_empty());
+        assert!(effect.parameters.keys().all(|parameter| parameter != "mix"));
     }
 
     #[test]

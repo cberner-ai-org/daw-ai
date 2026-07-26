@@ -734,13 +734,34 @@ pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
             preset_slot: Some(slot_index),
             mix,
             enabled: true,
-            parameters: BTreeMap::new(),
+            parameters: effect_parameters_for_slot(&engine, slot),
             parameter_overrides: Vec::new(),
             tempo_sync_parameters: Vec::new(),
             deactivated_parameters: Vec::new(),
         });
     }
     Ok(effects)
+}
+
+fn effect_parameters_for_slot(engine: &Engine, slot: &str) -> BTreeMap<String, f32> {
+    engine
+        .parameters
+        .keys()
+        .filter_map(|native| {
+            native
+                .strip_prefix(&format!("{slot} "))
+                .filter(|parameter| {
+                    *parameter != "FX Type"
+                        && *parameter != "Mix"
+                        && !is_generic_effect_parameter(parameter)
+                })
+                .and_then(|parameter| {
+                    engine
+                        .parameter_value(native)
+                        .map(|value| (parameter.to_owned(), value))
+                })
+        })
+        .collect()
 }
 
 pub(crate) fn effect_parameter_values(name: &str) -> BTreeMap<String, f32> {
@@ -1142,6 +1163,7 @@ mod tests {
         let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
         instrument.preset = "Factory/Basses/Evilous".to_owned();
         let mut effects = preset_effects(&instrument.preset).expect("factory preset effects");
+        assert!(effects.iter().any(|effect| !effect.parameters.is_empty()));
         for (index, name) in ["Flanger", "EQ", "CHOW", "Delay"].iter().enumerate() {
             effects.push(Effect {
                 id: 200 + index as u64,

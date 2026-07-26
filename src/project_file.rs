@@ -31,8 +31,11 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         return Err(invalid("bpm must be between 60 and 180"));
     }
     let duration = finite_number(root, "duration")?;
-    if !(0.25..=86_400.0).contains(&duration) {
-        return Err(invalid("duration must be between 0.25 and 86400 seconds"));
+    if duration < 0.25 {
+        return Err(invalid("duration must be at least 0.25 seconds"));
+    }
+    if duration > crate::audio_analysis::MAX_WAV_SECONDS {
+        return Err(invalid("duration exceeds the RIFF/WAV export limit"));
     }
     let version = integer(root, "version")?;
     let track_values = array(root, "tracks")?;
