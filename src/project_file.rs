@@ -5,7 +5,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::model::{
     ChannelOperation, ChannelOperationAction, Clip, ClipEvent, Edit, EditOperation, Effect,
     Instrument, MAX_PROMPT_CHARACTERS, Modulator, Project, ProjectFileError, Routing, SURGE_ENGINE,
-    Track, TrackRole, automation_target_range, valid_surge_preset,
+    Track, TrackRole, automation_target_range, valid_operation_id, valid_surge_preset,
 };
 use crate::prompt::{Action, AutomationPoint, MAX_COMPOUND_ACTIONS, MidiNote};
 
@@ -101,15 +101,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     {
         return Err(invalid("edit operation records must be unique"));
     }
-    let channel_operation_values = root
-        .get("channelOperations")
-        .map(|value| {
-            value
-                .as_array()
-                .ok_or_else(|| invalid("channelOperations must be an array"))
-        })
-        .transpose()?
-        .map_or(&[][..], Vec::as_slice);
+    let channel_operation_values = array(root, "channelOperations")?;
     if channel_operation_values.len() > MAX_EDITS {
         return Err(invalid(format!(
             "channelOperations supports at most {MAX_EDITS} entries"
@@ -176,39 +168,32 @@ fn parse_track(
         field(instrument_object, "parameters")?,
         "instrument parameters",
     )?;
-    let (default_decay, default_sustain, default_timbre, default_output) =
-        instrument_migration_defaults(preset);
-    let overrides = if let Some(value) = instrument_object.get("overrides") {
-        value
-            .as_array()
-            .ok_or_else(|| invalid("instrument overrides must be an array"))?
-            .iter()
-            .map(|value| {
-                let parameter = value
-                    .as_str()
-                    .ok_or_else(|| invalid("instrument overrides must be strings"))?;
-                if !matches!(
-                    parameter,
-                    "attack"
-                        | "decay"
-                        | "sustain"
-                        | "release"
-                        | "cutoff"
-                        | "resonance"
-                        | "pitch"
-                        | "timbre"
-                        | "output"
-                ) {
-                    return Err(invalid("instrument override is unsupported"));
-                }
-                Ok(parameter.to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    } else if crate::surge_presets::is_factory_id(preset) {
-        Vec::new()
-    } else {
-        crate::model::instrument_parameter_names()
-    };
+    let overrides = instrument_object
+        .get("overrides")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| invalid("instrument overrides must be an array"))?
+        .iter()
+        .map(|value| {
+            let parameter = value
+                .as_str()
+                .ok_or_else(|| invalid("instrument overrides must be strings"))?;
+            if !matches!(
+                parameter,
+                "attack"
+                    | "decay"
+                    | "sustain"
+                    | "release"
+                    | "cutoff"
+                    | "resonance"
+                    | "pitch"
+                    | "timbre"
+                    | "output"
+            ) {
+                return Err(invalid("instrument override is unsupported"));
+            }
+            Ok(parameter.to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if overrides
         .iter()
         .collect::<std::collections::HashSet<_>>()
@@ -222,14 +207,14 @@ fn parse_track(
         engine: SURGE_ENGINE.to_owned(),
         preset: preset.to_owned(),
         attack: range(instrument_parameters, "attack", 0.0, 1.0)?,
-        decay: optional_range(instrument_parameters, "decay", 0.0, 1.0, default_decay)?,
-        sustain: optional_range(instrument_parameters, "sustain", 0.0, 1.0, default_sustain)?,
+        decay: range(instrument_parameters, "decay", 0.0, 1.0)?,
+        sustain: range(instrument_parameters, "sustain", 0.0, 1.0)?,
         release: range(instrument_parameters, "release", 0.0, 1.0)?,
         cutoff: range(instrument_parameters, "cutoff", 0.0, 1.0)?,
         resonance: range(instrument_parameters, "resonance", 0.0, 1.0)?,
         pitch: range(instrument_parameters, "pitch", 0.0, 1.0)?,
-        timbre: optional_range(instrument_parameters, "timbre", 0.0, 1.0, default_timbre)?,
-        output: optional_range(instrument_parameters, "output", 0.0, 1.0, default_output)?,
+        timbre: range(instrument_parameters, "timbre", 0.0, 1.0)?,
+        output: range(instrument_parameters, "output", 0.0, 1.0)?,
         parameter_overrides: overrides,
         native_overrides: parse_native_overrides(instrument_object, preset)?,
     };
@@ -297,11 +282,7 @@ fn parse_track(
         .iter()
         .map(|value| parse_clip(value, project_duration, ids, event_ids))
         .collect::<Result<Vec<_>, _>>()?;
-    let audio_clip_values = track
-        .get("audioClips")
-        .and_then(JsonValue::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let audio_clip_values = array(track, "audioClips")?;
     if audio_clip_values.len() > MAX_CLIPS_PER_TRACK {
         return Err(invalid(format!(
             "{context} supports at most {MAX_CLIPS_PER_TRACK} audio clips"
@@ -335,18 +316,6 @@ fn parse_track(
         )));
     }
     Ok(parsed)
-}
-
-fn instrument_migration_defaults(preset: &str) -> (f32, f32, f32, f32) {
-    match preset {
-        "Surge Kick" => (0.4, 0.0, 0.4, 1.0),
-        "Surge Snare" => (0.38, 0.0, 0.78, 1.0),
-        "Surge Closed Hat" => (0.18, 0.0, 1.0, 1.0),
-        "Surge Open Hat" => (0.42, 0.0, 0.95, 1.0),
-        "Surge Crash" => (0.7, 0.0, 0.92, 1.0),
-        "Surge Percussion" => (0.35, 0.0, 0.72, 0.9),
-        _ => (0.4, 0.7, 0.5, 0.72),
-    }
 }
 
 fn parse_audio_clip(
@@ -423,29 +392,26 @@ fn parse_effect(
     for (name, value) in native_parameters {
         extra_parameters.entry(name).or_insert(value);
     }
-    let parameter_overrides = effect
+    let override_values = effect
         .get("overrides")
         .and_then(JsonValue::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| {
-                    let parameter = value
-                        .as_str()
-                        .ok_or_else(|| invalid("effect overrides must be strings"));
-                    let parameter = match parameter {
-                        Ok(name) => name,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    if parameter != "mix" && !extra_parameters.contains_key(parameter) {
-                        return None;
-                    }
-                    Some(Ok(parameter.to_owned()))
-                })
-                .collect::<Result<Vec<_>, _>>()
+        .ok_or_else(|| invalid("effect overrides must be an array"))?;
+    let parameter_overrides = override_values
+        .iter()
+        .filter_map(|value| {
+            let parameter = value
+                .as_str()
+                .ok_or_else(|| invalid("effect overrides must be strings"));
+            let parameter = match parameter {
+                Ok(name) => name,
+                Err(error) => return Some(Err(error)),
+            };
+            if parameter != "mix" && !extra_parameters.contains_key(parameter) {
+                return None;
+            }
+            Some(Ok(parameter.to_owned()))
         })
-        .transpose()?
-        .unwrap_or_default();
+        .collect::<Result<Vec<_>, _>>()?;
     let preset_slot = effect
         .contains_key("presetSlot")
         .then(|| {
@@ -955,14 +921,6 @@ fn parse_channel_operation(
     })
 }
 
-fn valid_operation_id(operation_id: &str) -> bool {
-    !operation_id.is_empty()
-        && operation_id.len() <= 128
-        && operation_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
 fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileError> {
     if depth > 8 {
         return Err(invalid("compound action nesting is too deep"));
@@ -1407,20 +1365,6 @@ fn range(object: &Object, name: &str, minimum: f32, maximum: f32) -> Result<f32,
     Ok(value)
 }
 
-fn optional_range(
-    object: &Object,
-    name: &str,
-    minimum: f32,
-    maximum: f32,
-    default: f32,
-) -> Result<f32, ProjectFileError> {
-    if object.contains_key(name) {
-        range(object, name, minimum, maximum)
-    } else {
-        Ok(default)
-    }
-}
-
 fn parse_native_overrides(
     object: &Object,
     preset: &str,
@@ -1551,6 +1495,30 @@ mod tests {
         project["tracks"][0]["instrument"]["nativeOverrides"] = serde_json::json!({"999999": 0.5});
         let error = parse_project(&project.to_string()).expect_err("unknown native parameter");
         assert!(error.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn rejects_projects_missing_current_schema_fields() {
+        for pointer in [
+            "/channelOperations",
+            "/tracks/0/audioClips",
+            "/tracks/0/instrument/overrides",
+            "/tracks/0/instrument/parameters/decay",
+            "/tracks/1/effects/0/overrides",
+        ] {
+            let mut project: JsonValue =
+                serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+            project
+                .pointer_mut(pointer.rsplit_once('/').expect("field pointer").0)
+                .and_then(JsonValue::as_object_mut)
+                .expect("field parent")
+                .remove(pointer.rsplit_once('/').expect("field pointer").1);
+
+            assert!(
+                parse_project(&project.to_string()).is_err(),
+                "accepted project without {pointer}"
+            );
+        }
     }
 
     #[test]

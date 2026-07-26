@@ -28,6 +28,14 @@ pub(crate) const SURGE_PRESETS: &[&str] = &[
     "Surge Atmosphere",
 ];
 
+pub(crate) fn valid_operation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 struct ModulationTarget {
     id: String,
     label: String,
