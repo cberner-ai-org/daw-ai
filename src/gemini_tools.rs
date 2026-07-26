@@ -457,7 +457,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "type":"array","maxItems":MAX_MIDI_EVENTS_PER_CLIP,"items":{"type":"object","properties":{
                 "time":{"type":"number","minimum":0,"maximum":256,"description":"Beat offset from the clip start. Differences between event times determine retrigger speed and may be smaller than note duration."},
-                "duration":{"type":"number","minimum":MIN_MIDI_NOTE_BEATS,"maximum":256,"description":"MIDI gate length in beats, independent of spacing between event times. 0.03125 beats is a 1/128 note."},
+                "duration":{"type":"number","minimum":MIN_MIDI_NOTE_BEATS,"maximum":256,"description":"MIDI gate length in beats, independent of spacing between event times. 0.0625 beats is a 1/64 note."},
                 "pitch":{"type":"integer","minimum":0,"maximum":127},
                 "velocity":{"type":"number","minimum":0.01,"maximum":1}
             },"required":["time","duration","pitch","velocity"],"additionalProperties":false}
@@ -3582,7 +3582,7 @@ mod tests {
     }
 
     #[test]
-    fn midi_tools_round_trip_1024_one_hundred_twenty_eighth_notes() {
+    fn midi_tools_round_trip_1024_densely_spaced_notes() {
         let original = Project::initial();
         let session =
             EditSession::create(&original, "write a dense roll", 0.0, 4.0).expect("session");

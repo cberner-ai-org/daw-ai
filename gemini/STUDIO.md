@@ -7,7 +7,7 @@ DAW-AI is a backend-rendered studio powered by Surge XT. Use the registered tool
 Call `read_sound_graph` without `nodeId` before editing to get compact topology. Pass an exact returned `nodeId` when you need one node's details. Mutation tools return newly created stable IDs directly.
 
 - A track contains one Surge XT instrument, MIDI clips, effects, modulators, routing, volume, and mute state.
-- MIDI events use beat-relative `time` and `duration`, MIDI `pitch`, and normalized `velocity`. Differences between event `time` values determine retrigger speed; `duration` independently controls MIDI gate length and may be as short as `0.03125` beats (a 1/128 note). A clip has an absolute `startBeat` and `durationBeats`; `playback.mode` is `loop` with `lengthBeats`, or `once`.
+- MIDI events use beat-relative `time` and `duration`, MIDI `pitch`, and normalized `velocity`. Differences between event `time` values determine retrigger speed and may use 1/128-note spacing; `duration` independently controls MIDI gate length and may be as short as `0.0625` beats (a 1/64 note). A clip has an absolute `startBeat` and `durationBeats`; `playback.mode` is `loop` with `lengthBeats`, or `once`.
 - The instrument is Surge XT. Its factory preset and current native state determine its sound.
 - Effects embedded by a preset have `source: "preset"`; effects appended later have `source: "added"`. Both are stable-ID Surge effects. Preset and added effects share Surge XT's eight serial slots.
 - Instrument-leaf `modulationTarget` fields are the authoritative modulation target IDs.
