@@ -26,6 +26,7 @@ The graph's IDs, current values, routing, and states are authoritative.
 ## Mutations
 
 - `new_track` creates a neutral track with one Surge XT instrument using Init and returns the track ID. Choose its required short `description` for its musical role or purpose and a `color` from the exposed palette; neither changes its sound.
+- `set_track_identity` gives any existing track, including the initial Empty Track, a short musical name and a color from the exposed palette. Use it once the track's role is known.
 - `delete_track` removes a track.
 - `set_surge_preset` loads an exact discovered preset ID.
 - `add_midi_clip`, `update_midi_clip`, and `delete_midi_clip` mutate MIDI clips.
