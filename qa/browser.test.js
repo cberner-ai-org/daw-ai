@@ -1078,6 +1078,18 @@ async function run() {
         ),
       "transport movement before prompted edit",
     );
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `[...document.querySelectorAll('.track-spectrum i')].some(
+            (bar) => Number.parseFloat(bar.style.getPropertyValue('--spectrum-level')) > 0.01
+          )`,
+        ),
+      "track FFT response to backend stem audio",
+      30_000,
+    );
     const promptSingleFlight = await evaluate(cdp, appSession, `(async () => {
       const originalFetch = window.fetch;
       const deferred = [];
@@ -1951,6 +1963,8 @@ async function run() {
         offlineContext: source.includes('OfflineAudioContext'),
         oscillator: source.includes('createOscillator'),
         backendEndpoint: source.includes('/api/audio-stream/'),
+        trackStemEndpoint: source.includes('/api/track-stems/'),
+        frequencyAnalyzer: engine.includes('createAnalyser') && engine.includes('getByteFrequencyData'),
         mediaClock: engine.includes('media.currentTime'),
         performanceClock: engine.includes('performance.now'),
         prefetch: engine.includes('beginPrefetch'),
@@ -1962,10 +1976,12 @@ async function run() {
       clientAudioBoundary,
       {
         apiNoStore: true,
-        audioContext: false,
+        audioContext: true,
         offlineContext: false,
         oscillator: false,
         backendEndpoint: true,
+        trackStemEndpoint: true,
+        frequencyAnalyzer: true,
         mediaClock: true,
         performanceClock: false,
         prefetch: false,

@@ -68,8 +68,6 @@
     clientIssues: [],
     geminiSessions: [],
     projectHistory: { current: 0, entries: [] },
-    spectrumPending: false,
-    spectrumUpdatedAt: 0,
   };
   let historyLoadQueue = Promise.resolve();
   let projectMutationQueue = Promise.resolve();
@@ -99,6 +97,14 @@
       this.retryTimer = null;
       this.retryAttempts = 0;
       this.seekTimer = null;
+      this.stemLoadGeneration = 0;
+      this.stemAbortController = null;
+      this.analysisContext = null;
+      this.stemBuffers = new Map();
+      this.stemStart = 0;
+      this.stemLoading = false;
+      this.analyzerSources = [];
+      this.analyzerFrame = null;
       this.media.addEventListener("ended", () => {
         if (this.isActive) this.stop(false);
       });
@@ -157,6 +163,7 @@
       this.playbackGeneration += 1;
       this.retryAttempts = 0;
       const generation = this.playbackGeneration;
+      void this.resumeAnalysisContext();
       updateTransport();
       return this.startStream(generation);
     }
@@ -190,6 +197,11 @@
             return;
           }
           this.playbackState = "playing";
+          if (this.hasStemAudioAt(this.playhead)) {
+            this.startAnalyzers();
+          } else {
+            void this.loadTrackStems(this.project, this.playhead);
+          }
           window.clearInterval(this.timer);
           this.timer = window.setInterval(() => this.tick(), 50);
           this.tick();
@@ -214,6 +226,7 @@
       this.media.pause();
       this.media.removeAttribute("src");
       this.media.load();
+      this.stopAnalyzers();
       this.audioUrl = null;
       this.audioVersion = null;
       if (!preservePosition) this.playhead = 0;
@@ -294,8 +307,178 @@
         this.stop(false);
         return;
       }
+      const stemDuration = this.stemBuffers.values().next().value?.duration ?? 0;
+      const stemEnd = this.stemStart + stemDuration;
+      if (
+        !this.stemLoading &&
+        (!this.hasStemAudioAt(this.playhead) ||
+          (stemEnd < this.project.duration - 0.01 && this.playhead > stemEnd - 2))
+      ) {
+        void this.loadTrackStems(this.project, this.playhead);
+      }
       updateTransport();
       renderPlayhead();
+    }
+
+    ensureAnalysisContext() {
+      if (!this.analysisContext) {
+        const Context = window.AudioContext || window.webkitAudioContext;
+        if (Context) this.analysisContext = new Context();
+      }
+      return this.analysisContext;
+    }
+
+    async resumeAnalysisContext() {
+      const context = this.ensureAnalysisContext();
+      if (context?.state === "suspended") await context.resume();
+    }
+
+    async loadTrackStems(project, start) {
+      const generation = (this.stemLoadGeneration += 1);
+      this.stemAbortController?.abort();
+      this.stemAbortController = new AbortController();
+      this.stemLoading = true;
+      if (!this.hasStemAudioAt(start)) {
+        this.stemBuffers = new Map();
+        this.stopAnalyzers();
+      }
+      if (!this.streamToken || !project?.tracks.length) return;
+      try {
+        const response = await fetch(
+          `/api/track-stems/${encodeURIComponent(this.streamToken)}/${project.version}/${Math.round(start * 1000)}`,
+          { cache: "no-store", signal: this.stemAbortController.signal },
+        );
+        if (!response.ok) throw new Error(`Track stem render failed with HTTP ${response.status}.`);
+        const buffers = this.decodeTrackStems(await response.arrayBuffer());
+        if (generation !== this.stemLoadGeneration || project.version !== this.project?.version) return;
+        this.stemBuffers = buffers;
+        this.stemStart = start;
+        if (this.isPlaying) this.startAnalyzers();
+      } catch (error) {
+        if (error?.name !== "AbortError") reportClientIssue("warning", error, "loading track analyzers");
+      } finally {
+        if (generation === this.stemLoadGeneration) this.stemLoading = false;
+      }
+    }
+
+    invalidateTrackStems() {
+      this.stemLoadGeneration += 1;
+      this.stemAbortController?.abort();
+      this.stemBuffers = new Map();
+      this.stemLoading = false;
+      this.stopAnalyzers();
+    }
+
+    hasStemAudioAt(time) {
+      const duration = this.stemBuffers.values().next().value?.duration ?? 0;
+      return this.stemBuffers.size > 0 && time >= this.stemStart && time < this.stemStart + duration;
+    }
+
+    decodeTrackStems(arrayBuffer) {
+      const bytes = new Uint8Array(arrayBuffer);
+      const view = new DataView(arrayBuffer);
+      const magic = String.fromCharCode(...bytes.subarray(0, 8));
+      if (magic !== "DAWSTEM1" || bytes.length < 28) throw new Error("The backend returned invalid track stems.");
+      const sampleRate = view.getUint32(8, true);
+      const trackCount = view.getUint32(12, true);
+      const sampleCount = Number(view.getBigUint64(16, true));
+      const chunkSize = view.getUint32(24, true);
+      if (!sampleRate || !trackCount || !sampleCount || !chunkSize || trackCount > 128) {
+        throw new Error("The backend returned invalid track stem dimensions.");
+      }
+      let offset = 28;
+      const trackIds = [];
+      for (let index = 0; index < trackCount; index += 1) {
+        if (offset + 8 > bytes.length) throw new Error("The track stem header was truncated.");
+        trackIds.push(Number(view.getBigUint64(offset, true)));
+        offset += 8;
+      }
+      const channels = trackIds.map(() => [new Float32Array(sampleCount), new Float32Array(sampleCount)]);
+      let frameOffset = 0;
+      while (frameOffset < sampleCount) {
+        if (offset + 4 > bytes.length) throw new Error("The track stem data was truncated.");
+        const frames = view.getUint32(offset, true);
+        offset += 4;
+        if (!frames || frames > chunkSize || frameOffset + frames > sampleCount) {
+          throw new Error("The backend returned an invalid track stem chunk.");
+        }
+        for (const [left, right] of channels) {
+          const byteCount = frames * 4;
+          if (offset + byteCount > bytes.length) throw new Error("The track stem samples were truncated.");
+          for (let frame = 0; frame < frames; frame += 1) {
+            left[frameOffset + frame] = view.getInt16(offset, true) / 32768;
+            right[frameOffset + frame] = view.getInt16(offset + 2, true) / 32768;
+            offset += 4;
+          }
+        }
+        frameOffset += frames;
+      }
+      if (offset !== bytes.length) throw new Error("The track stem response had trailing data.");
+      const context = this.ensureAnalysisContext();
+      if (!context) return new Map();
+      return new Map(
+        trackIds.map((trackId, index) => {
+          const buffer = context.createBuffer(2, sampleCount, sampleRate);
+          buffer.copyToChannel(channels[index][0], 0);
+          buffer.copyToChannel(channels[index][1], 1);
+          return [trackId, buffer];
+        }),
+      );
+    }
+
+    startAnalyzers() {
+      this.stopAnalyzers();
+      const context = this.ensureAnalysisContext();
+      if (!context || !this.isPlaying || !this.stemBuffers.size) return;
+      const offset = clamp(this.playhead - this.stemStart, 0, this.project.duration);
+      for (const [trackId, buffer] of this.stemBuffers) {
+        if (offset >= buffer.duration) continue;
+        const source = context.createBufferSource();
+        const analyzer = context.createAnalyser();
+        const silence = context.createGain();
+        source.buffer = buffer;
+        analyzer.fftSize = 1024;
+        analyzer.smoothingTimeConstant = 0.72;
+        silence.gain.value = 0;
+        source.connect(analyzer).connect(silence).connect(context.destination);
+        source.start(0, offset);
+        this.analyzerSources.push({ source, analyzer, trackId });
+      }
+      this.drawAnalyzers();
+    }
+
+    stopAnalyzers() {
+      window.cancelAnimationFrame(this.analyzerFrame);
+      this.analyzerFrame = null;
+      for (const { source } of this.analyzerSources) {
+        try { source.stop(); } catch (_) { /* The source may already have ended. */ }
+      }
+      this.analyzerSources = [];
+      elements.trackRows.querySelectorAll(".track-spectrum i").forEach((bar) => {
+        bar.style.setProperty("--spectrum-level", 0);
+      });
+    }
+
+    drawAnalyzers() {
+      if (!this.isPlaying) return;
+      for (const { analyzer, trackId } of this.analyzerSources) {
+        const bins = new Uint8Array(analyzer.frequencyBinCount);
+        analyzer.getByteFrequencyData(bins);
+        const bars = elements.trackRows.querySelectorAll(`[data-spectrum-track="${trackId}"] i`);
+        const minimum = 40;
+        const maximum = this.analysisContext.sampleRate / 2;
+        bars.forEach((bar, index) => {
+          const lowHz = minimum * Math.pow(maximum / minimum, index / bars.length);
+          const highHz = minimum * Math.pow(maximum / minimum, (index + 1) / bars.length);
+          const lowBin = Math.max(1, Math.floor((lowHz / maximum) * bins.length));
+          const highBin = Math.max(lowBin + 1, Math.ceil((highHz / maximum) * bins.length));
+          let sum = 0;
+          for (let bin = lowBin; bin < Math.min(highBin, bins.length); bin += 1) sum += bins[bin] ** 2;
+          const level = Math.sqrt(sum / Math.max(1, highBin - lowBin)) / 255;
+          bar.style.setProperty("--spectrum-level", level.toFixed(4));
+        });
+      }
+      this.analyzerFrame = window.requestAnimationFrame(() => this.drawAnalyzers());
     }
   }
 
@@ -423,7 +606,7 @@
     state.selectionEnd = clamp(state.selectionEnd, state.selectionStart + 0.25, project.duration);
     renderRuler();
     renderTracks();
-    void updateSpectrumAnalyzers(true);
+    audio.invalidateTrackStems();
     renderSelection();
     renderPlayhead();
     renderDebug();
@@ -598,31 +781,6 @@
     if (!state.project) return;
     const left = elements.rulerLane.offsetLeft + (audio.playhead / state.project.duration) * elements.rulerLane.offsetWidth;
     elements.playhead.style.left = `${left}px`;
-  }
-
-  async function updateSpectrumAnalyzers(force = false) {
-    const now = Date.now();
-    if ((!force && !audio.isPlaying) || state.spectrumPending || now - state.spectrumUpdatedAt < 1000) return;
-    state.spectrumPending = true;
-    state.spectrumUpdatedAt = now;
-    try {
-      const result = await api("/api/spectrum", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ start: String(audio.playhead) }),
-      });
-      for (const track of result.tracks || []) {
-        const analyzer = elements.trackRows.querySelector(`[data-spectrum-track="${track.trackId}"]`);
-        if (!analyzer) continue;
-        analyzer.querySelectorAll("i").forEach((bar, index) => {
-          bar.style.setProperty("--spectrum-level", clamp(Number(track.levels[index]) || 0, 0, 1));
-        });
-      }
-    } catch (error) {
-      reportClientIssue("warning", error, "updating spectrum analyzers");
-    } finally {
-      state.spectrumPending = false;
-    }
   }
 
   function centerSelectionOnNarrowTimeline() {
