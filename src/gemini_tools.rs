@@ -161,6 +161,13 @@ pub(crate) struct EditSession {
     persistent: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SessionVariants {
+    pub(crate) batch_parameter_tools: bool,
+    pub(crate) slim_prompt: bool,
+    pub(crate) dynamic_tools: bool,
+}
+
 impl EditSession {
     #[cfg(test)]
     pub(crate) fn create(
@@ -169,7 +176,14 @@ impl EditSession {
         start: f32,
         end: f32,
     ) -> io::Result<Self> {
-        Self::create_in(&session_root(), project, prompt, start, end, false, false)
+        Self::create_in(
+            &session_root(),
+            project,
+            prompt,
+            start,
+            end,
+            SessionVariants::default(),
+        )
     }
 
     pub(crate) fn create_in(
@@ -178,8 +192,7 @@ impl EditSession {
         prompt: &str,
         start: f32,
         end: f32,
-        batch_parameter_tools: bool,
-        trimmed_prompt: bool,
+        variants: SessionVariants,
     ) -> io::Result<Self> {
         apply_session_retention_with(root, SessionRetention::configured())?;
         let path = reserve_session_directory(root)?;
@@ -206,9 +219,9 @@ impl EditSession {
                     "end": end,
                     "appliedSteps": 0,
                     "audioListens": 0,
-                    "batchParameterTools": batch_parameter_tools,
-                    "trimmedPrompt": trimmed_prompt,
-                    "dynamicToolLoading": trimmed_prompt,
+                    "batchParameterTools": variants.batch_parameter_tools,
+                    "slimPrompt": variants.slim_prompt,
+                    "dynamicToolLoading": variants.dynamic_tools,
                     "detail": "Gemini session started"
                 })
                 .to_string(),
@@ -294,6 +307,17 @@ impl EditSession {
             MAX_SESSION_JSON_BYTES,
             "Gemini session metadata",
         )
+    }
+
+    pub(crate) fn update_metrics(&self, metrics: &JsonValue) -> io::Result<()> {
+        let source = self.metadata_source()?;
+        let mut value = serde_json::from_str::<JsonValue>(&source)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid session record"))?
+            .insert("metrics".to_owned(), metrics.clone());
+        write_replace(&self.path.join(SESSION_FILE), &value.to_string())
     }
 
     pub(crate) fn stats(&self) -> io::Result<(usize, usize)> {
@@ -4042,6 +4066,13 @@ mod tests {
         session
             .update_status("completed", "Done", 2, 1)
             .expect("session metadata");
+        session
+            .update_metrics(&serde_json::json!({
+                "durationMs": 1500,
+                "inputTokens": 1200,
+                "toolCalls": {"render_audio_region": 1}
+            }))
+            .expect("session metrics");
         let session_id = session.path().file_name().unwrap().to_string_lossy();
         let summaries = session_summaries().expect("session summaries");
         let summary = summaries
@@ -4051,6 +4082,8 @@ mod tests {
         assert_eq!(summary["status"], "completed");
         assert_eq!(summary["appliedSteps"], 2);
         assert_eq!(summary["audioListens"], 1);
+        assert_eq!(summary["metrics"]["durationMs"], 1500);
+        assert_eq!(summary["metrics"]["toolCalls"]["render_audio_region"], 1);
     }
 
     #[cfg(unix)]

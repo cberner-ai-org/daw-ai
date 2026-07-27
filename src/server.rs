@@ -426,9 +426,9 @@ struct EditRequest {
     start: f32,
     end: f32,
     project: crate::model::Project,
-    reference_audio: Option<crate::gemini::ReferenceAudio>,
     batch_parameter_tools: bool,
-    trimmed_prompt: bool,
+    slim_prompt: bool,
+    dynamic_tools: bool,
 }
 
 struct EditFailure {
@@ -1151,15 +1151,15 @@ impl Router {
         let Some(end) = form.get("end").and_then(|value| value.parse::<f32>().ok()) else {
             return Response::json(422, error_json("selection end is required"));
         };
-        let reference_audio = match parse_reference_audio(&form) {
-            Ok(audio) => audio,
-            Err(message) => return Response::json(422, error_json(message)),
-        };
         let batch_parameter_tools = match parse_optional_boolean(&form, "batch_parameter_tools") {
             Ok(value) => value,
             Err(message) => return Response::json(422, error_json(message)),
         };
-        let trimmed_prompt = match parse_optional_boolean(&form, "trimmed_prompt") {
+        let slim_prompt = match parse_optional_boolean(&form, "slim_prompt") {
+            Ok(value) => value,
+            Err(message) => return Response::json(422, error_json(message)),
+        };
+        let dynamic_tools = match parse_optional_boolean(&form, "dynamic_tools") {
             Ok(value) => value,
             Err(message) => return Response::json(422, error_json(message)),
         };
@@ -1202,9 +1202,9 @@ impl Router {
             start,
             end,
             project,
-            reference_audio,
             batch_parameter_tools,
-            trimmed_prompt,
+            slim_prompt,
+            dynamic_tools,
         };
         let worker = self.clone();
         let spawn = thread::Builder::new()
@@ -1535,15 +1535,15 @@ impl Router {
         let mut expected_version = edit.project.version;
         let mut published_update = false;
         let cancellation = self.edit_jobs.cancellation(job_id);
-        let completed = GeminiPlanner::interpret_with_reference_audio_updates(
+        let completed = GeminiPlanner::interpret_with_updates(
             &self.gemini_session_root(),
             &edit.prompt,
             edit.start,
             edit.end,
             &edit.project,
-            edit.reference_audio.clone(),
             edit.batch_parameter_tools,
-            edit.trimmed_prompt,
+            edit.slim_prompt,
+            edit.dynamic_tools,
             cancellation,
             |request| {
                 self.edit_jobs.set_running(
@@ -2393,95 +2393,6 @@ fn parse_optional_boolean(
     }
 }
 
-fn parse_reference_audio(
-    form: &HashMap<String, String>,
-) -> Result<Option<crate::gemini::ReferenceAudio>, &'static str> {
-    let Some(data) = form.get("reference_audio_data") else {
-        return Ok(None);
-    };
-    let mime_type = form
-        .get("reference_audio_type")
-        .map(String::as_str)
-        .unwrap_or("audio/wav");
-    if !matches!(
-        mime_type,
-        "audio/wav" | "audio/x-wav" | "audio/mpeg" | "audio/mp4" | "audio/ogg" | "audio/flac"
-    ) {
-        return Err("reference audio type is not supported");
-    }
-    let bytes = decode_base64(data).ok_or("reference audio is invalid")?;
-    if bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 {
-        return Err("reference audio must be between 1 byte and 2 MB");
-    }
-    let name = form
-        .get("reference_audio_name")
-        .map_or("reference audio", String::as_str)
-        .chars()
-        .take(160)
-        .collect();
-    Ok(Some(crate::gemini::ReferenceAudio {
-        name,
-        mime_type: mime_type.to_owned(),
-        bytes,
-    }))
-}
-
-fn decode_base64(value: &str) -> Option<Vec<u8>> {
-    fn digit(byte: u8) -> Option<u8> {
-        match byte {
-            b'A'..=b'Z' => Some(byte - b'A'),
-            b'a'..=b'z' => Some(byte - b'a' + 26),
-            b'0'..=b'9' => Some(byte - b'0' + 52),
-            b'+' => Some(62),
-            b'-' => Some(62),
-            b'/' => Some(63),
-            b'_' => Some(63),
-            _ => None,
-        }
-    }
-    if value.len() % 4 != 0 {
-        return None;
-    }
-    let mut output = Vec::with_capacity(value.len() / 4 * 3);
-    let chunks = value.as_bytes().chunks_exact(4);
-    let chunk_count = chunks.len();
-    for (index, chunk) in chunks.enumerate() {
-        let final_chunk = index + 1 == chunk_count;
-        if !final_chunk && (chunk[2] == b'=' || chunk[3] == b'=') {
-            return None;
-        }
-        let a = digit(chunk[0])?;
-        let b = digit(chunk[1])?;
-        let c = if chunk[2] == b'=' {
-            0
-        } else {
-            digit(chunk[2])?
-        };
-        let d = if chunk[3] == b'=' {
-            0
-        } else {
-            digit(chunk[3])?
-        };
-        if chunk[2] == b'=' && chunk[3] != b'=' {
-            return None;
-        }
-        if chunk[2] == b'=' && b & 0x0f != 0 {
-            return None;
-        }
-        if chunk[3] == b'=' && chunk[2] != b'=' && c & 0x03 != 0 {
-            return None;
-        }
-        output.push((a << 2) | (b >> 4));
-        if chunk[2] != b'=' {
-            output.push((b << 4) | (c >> 2));
-        }
-        if chunk[3] != b'=' {
-            output.push((c << 6) | d);
-        }
-    }
-    Some(output)
-}
-
 fn url_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
@@ -2994,9 +2905,9 @@ mod tests {
             start: 4.0,
             end: 8.0,
             project: project.clone(),
-            reference_audio: None,
             batch_parameter_tools: false,
-            trimmed_prompt: false,
+            slim_prompt: false,
+            dynamic_tools: false,
         };
         let plan = |preset: &str, summary: &str| EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3133,9 +3044,9 @@ mod tests {
             start: 4.0,
             end: 8.0,
             project: project.clone(),
-            reference_audio: None,
             batch_parameter_tools: false,
-            trimmed_prompt: false,
+            slim_prompt: false,
+            dynamic_tools: false,
         };
         let first_plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3267,9 +3178,9 @@ mod tests {
             start: 4.0,
             end: 8.0,
             project: project.clone(),
-            reference_audio: None,
             batch_parameter_tools: false,
-            trimmed_prompt: false,
+            slim_prompt: false,
+            dynamic_tools: false,
         };
         let plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3649,34 +3560,6 @@ mod tests {
     }
 
     #[test]
-    fn validates_reference_audio_without_external_credentials() {
-        let valid = parse_form(
-            "reference_audio_name=kick.wav&reference_audio_type=audio%2Fwav&reference_audio_data=UklGRg%3D%3D",
-        );
-        let audio = parse_reference_audio(&valid)
-            .expect("valid reference")
-            .expect("attached reference");
-        assert_eq!(audio.name, "kick.wav");
-        assert_eq!(audio.mime_type, "audio/wav");
-        assert_eq!(audio.bytes, b"RIFF");
-
-        let invalid = parse_form(
-            "reference_audio_type=application%2Foctet-stream&reference_audio_data=UklGRg%3D%3D",
-        );
-        assert_eq!(
-            parse_reference_audio(&invalid).unwrap_err(),
-            "reference audio type is not supported"
-        );
-        for malformed in ["RA==UklG", "Ukl=Rg==", "UklGR==="] {
-            assert!(
-                decode_base64(malformed).is_none(),
-                "accepted malformed base64 {malformed}"
-            );
-        }
-        assert_eq!(decode_base64("____"), Some(vec![255, 255, 255]));
-    }
-
-    #[test]
     fn validates_optional_batch_parameter_setting() {
         assert!(!parse_optional_boolean(&HashMap::new(), "batch_parameter_tools").unwrap());
         assert!(
@@ -3694,8 +3577,9 @@ mod tests {
             .unwrap_err(),
             "boolean setting must be true or false"
         );
+        assert!(parse_optional_boolean(&parse_form("slim_prompt=true"), "slim_prompt").unwrap());
         assert!(
-            parse_optional_boolean(&parse_form("trimmed_prompt=true"), "trimmed_prompt").unwrap()
+            parse_optional_boolean(&parse_form("dynamic_tools=true"), "dynamic_tools").unwrap()
         );
     }
 

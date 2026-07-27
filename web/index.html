@@ -111,11 +111,6 @@
                   <span class="button-arrow" aria-hidden="true">-&gt;</span>
                 </button>
               </div>
-              <label class="reference-audio-control" for="reference-audio">
-                <span>Reference audio (optional)</span>
-                <input id="reference-audio" type="file" accept="audio/wav,audio/x-wav,audio/mpeg,audio/mp4,audio/ogg,audio/flac">
-                <small id="reference-audio-name">Attach a sound for Gemini to listen to and match</small>
-              </label>
             </form>
             <div class="edit-progress" id="edit-progress" hidden>
               <div class="edit-progress-copy">
@@ -169,13 +164,23 @@
             <span>Enabled</span>
           </label>
         </section>
-        <section class="debug-settings" aria-labelledby="trimmed-prompt-heading">
+        <section class="debug-settings" aria-labelledby="slim-prompt-heading">
           <div>
-            <strong id="trimmed-prompt-heading">Trimmed Gemini prompt</strong>
-            <span>A/B experiment: use a minimal, neutral system prompt and dynamically load relevant tool groups. Off keeps the current prompt and tool interface.</span>
+            <strong id="slim-prompt-heading">Slim Gemini prompt</strong>
+            <span>A/B experiment: use concise, neutral instructions to inspect, listen, and iterate without prescribing musical choices.</span>
           </div>
           <label class="switch-control">
-            <input id="trimmed-prompt" type="checkbox">
+            <input id="slim-prompt" type="checkbox">
+            <span>Enabled</span>
+          </label>
+        </section>
+        <section class="debug-settings" aria-labelledby="dynamic-tools-heading">
+          <div>
+            <strong id="dynamic-tools-heading">Dynamic tools</strong>
+            <span>A/B experiment: expose a small core tool set and let Gemini switch between arrangement and sound editing groups.</span>
+          </div>
+          <label class="switch-control">
+            <input id="dynamic-tools" type="checkbox">
             <span>Enabled</span>
           </label>
         </section>

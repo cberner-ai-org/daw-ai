@@ -21,8 +21,6 @@
     promptRange: document.querySelector("#prompt-range"),
     promptForm: document.querySelector("#prompt-form"),
     promptInput: document.querySelector("#prompt-input"),
-    referenceAudio: document.querySelector("#reference-audio"),
-    referenceAudioName: document.querySelector("#reference-audio-name"),
     composeButton: document.querySelector("#compose-button"),
     editProgress: document.querySelector("#edit-progress"),
     editProgressLabel: document.querySelector("#edit-progress-label"),
@@ -42,7 +40,8 @@
     copyDebug: document.querySelector("#copy-debug"),
     clearDebug: document.querySelector("#clear-debug"),
     batchParameterTools: document.querySelector("#batch-parameter-tools"),
-    trimmedPrompt: document.querySelector("#trimmed-prompt"),
+    slimPrompt: document.querySelector("#slim-prompt"),
+    dynamicTools: document.querySelector("#dynamic-tools"),
     refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
     geminiSessionList: document.querySelector("#gemini-session-list"),
     sessionHistoryList: document.querySelector("#session-history-list"),
@@ -77,12 +76,12 @@
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
   const BATCH_PARAMETER_TOOLS_STORAGE_KEY = "daw-ai.batch-parameter-tools.v1";
-  const TRIMMED_PROMPT_STORAGE_KEY = "daw-ai.trimmed-prompt.v1";
+  const SLIM_PROMPT_STORAGE_KEY = "daw-ai.slim-prompt.v1";
+  const DYNAMIC_TOOLS_STORAGE_KEY = "daw-ai.dynamic-tools.v1";
   const AUDIO_RETRY_DELAYS_MS = [250, 500, 1000];
   const AUDIO_SEEK_DEBOUNCE_MS = 200;
   const TOAST_DISMISS_MS = 4200;
   const ERROR_TOAST_DISMISS_MS = 60_000;
-  const MAX_REFERENCE_AUDIO_BYTES = 2 * 1024 * 1024;
   const LONG_PRESS_MS = 500;
   const LONG_PRESS_MOVE_TOLERANCE_PX = 10;
   class AudioEngine {
@@ -1035,39 +1034,6 @@
     return `client-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
   }
 
-  function fileAsBase64(file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.addEventListener("error", () => reject(new Error("Could not read the reference audio")));
-      reader.addEventListener("load", () => resolve(
-        (String(reader.result).split(",", 2)[1] || "").replaceAll("+", "-").replaceAll("/", "_"),
-      ));
-      reader.readAsDataURL(file);
-    });
-  }
-
-  function referenceAudioType(file) {
-    const supported = ["audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/flac"];
-    if (supported.includes(file.type)) return file.type;
-    const extension = file.name.split(".").pop()?.toLowerCase();
-    return {
-      wav: "audio/wav",
-      wave: "audio/wav",
-      mp3: "audio/mpeg",
-      m4a: "audio/mp4",
-      mp4: "audio/mp4",
-      ogg: "audio/ogg",
-      oga: "audio/ogg",
-      flac: "audio/flac",
-    }[extension] || null;
-  }
-
-  function clearDraftReferenceAudio() {
-    elements.referenceAudio.value = "";
-    elements.referenceAudioName.textContent =
-      "Attach a sound for Gemini to listen to and match";
-  }
-
   function readPendingEdit() {
     try {
       const serialized = window.localStorage.getItem(PENDING_EDIT_STORAGE_KEY);
@@ -1087,20 +1053,16 @@
         (typeof pending.acceptedJob === "object" &&
           typeof pending.acceptedJob.id === "string" &&
           pending.acceptedJob.operationId === pending.operationId);
-      const validReference =
-        pending.referenceAudio == null ||
-        (pending.acceptedJob === null &&
-          typeof pending.referenceAudio === "object" &&
-          typeof pending.referenceAudio.name === "string" &&
-          typeof pending.referenceAudio.type === "string" &&
-          typeof pending.referenceAudio.data === "string");
       const validBatchSetting =
         pending.batchParameterTools === undefined || typeof pending.batchParameterTools === "boolean";
       const validPromptSetting =
-        pending.trimmedPrompt === undefined || typeof pending.trimmedPrompt === "boolean";
-      if (validOperationId && validRequest && validJob && validReference && validBatchSetting && validPromptSetting) {
+        pending.slimPrompt === undefined || typeof pending.slimPrompt === "boolean";
+      const validDynamicSetting =
+        pending.dynamicTools === undefined || typeof pending.dynamicTools === "boolean";
+      if (validOperationId && validRequest && validJob && validBatchSetting && validPromptSetting && validDynamicSetting) {
         pending.batchParameterTools = pending.batchParameterTools === true;
-        pending.trimmedPrompt = pending.trimmedPrompt === true;
+        pending.slimPrompt = pending.slimPrompt === true;
+        pending.dynamicTools = pending.dynamicTools === true;
         return pending;
       }
     } catch (_error) {
@@ -1116,9 +1078,7 @@
 
   function persistPendingEdit(pending) {
     try {
-      const recoverable = { ...pending };
-      if (pending.acceptedJob) delete recoverable.referenceAudio;
-      window.localStorage.setItem(PENDING_EDIT_STORAGE_KEY, JSON.stringify(recoverable));
+      window.localStorage.setItem(PENDING_EDIT_STORAGE_KEY, JSON.stringify(pending));
       return true;
     } catch (error) {
       reportClientIssue("warning", error, "persisting an active edit");
@@ -1457,13 +1417,9 @@
           start: String(selectionStart),
           end: String(selectionEnd),
         });
-        if (pending.referenceAudio) {
-          editBody.set("reference_audio_name", pending.referenceAudio.name);
-          editBody.set("reference_audio_type", pending.referenceAudio.type);
-          editBody.set("reference_audio_data", pending.referenceAudio.data);
-        }
         editBody.set("batch_parameter_tools", String(pending.batchParameterTools === true));
-        editBody.set("trimmed_prompt", String(pending.trimmedPrompt === true));
+        editBody.set("slim_prompt", String(pending.slimPrompt === true));
+        editBody.set("dynamic_tools", String(pending.dynamicTools === true));
         accepted = await acceptEdit(
           clientOperationId,
           editBody,
@@ -1546,33 +1502,12 @@
     const submittedText = elements.promptInput.value;
     const prompt = submittedText.trim();
     if (!prompt) return;
-    let referenceAudio = null;
-    const referenceFile = elements.referenceAudio.files[0];
-    let mimeType = null;
-    if (referenceFile) {
-      if (referenceFile.size > MAX_REFERENCE_AUDIO_BYTES) {
-        showToast("Reference audio must be 2 MB or smaller", true);
-        return;
-      }
-      mimeType = referenceAudioType(referenceFile);
-      if (!mimeType) {
-        showToast("Reference audio format is not supported", true);
-        return;
-      }
-    }
     state.promptSubmissionClaimed = true;
     state.promptPending = true;
     elements.composeButton.disabled = true;
-    elements.composeButton.querySelector("span").textContent = referenceFile ? "Reading audio..." : "Starting...";
+    elements.composeButton.querySelector("span").textContent = "Starting...";
     let handedOff = false;
     try {
-      if (referenceFile) {
-        referenceAudio = {
-          name: referenceFile.name,
-          type: mimeType,
-          data: await fileAsBase64(referenceFile),
-        };
-      }
       const pending = {
         operationId: operationId(),
         prompt,
@@ -1580,14 +1515,11 @@
         start: state.selectionStart,
         end: state.selectionEnd,
         acceptedJob: null,
-        referenceAudio,
         batchParameterTools: elements.batchParameterTools.checked,
-        trimmedPrompt: elements.trimmedPrompt.checked,
+        slimPrompt: elements.slimPrompt.checked,
+        dynamicTools: elements.dynamicTools.checked,
       };
-      if (!persistPendingEdit(pending) && referenceAudio) {
-        throw new Error("Could not preserve the reference audio for edit recovery");
-      }
-      clearDraftReferenceAudio();
+      persistPendingEdit(pending);
       handedOff = true;
       await runPendingEdit(pending, true);
     } catch (error) {
@@ -1706,7 +1638,8 @@
       `AI edit: ${state.promptPending ? "pending" : "idle"}`,
       `AI sessions: ${state.geminiSessions.length} retained locally`,
       `Batch parameter tools: ${elements.batchParameterTools.checked ? "enabled" : "disabled"}`,
-      `Trimmed Gemini prompt: ${elements.trimmedPrompt.checked ? "enabled" : "disabled"}`,
+      `Slim Gemini prompt: ${elements.slimPrompt.checked ? "enabled" : "disabled"}`,
+      `Dynamic tools: ${elements.dynamicTools.checked ? "enabled" : "disabled"}`,
       `Selection: ${state.selectionStart.toFixed(1)}s - ${state.selectionEnd.toFixed(1)}s`,
     ];
     if (project) {
@@ -1725,7 +1658,9 @@
       for (const session of state.geminiSessions.slice(0, 10)) {
         lines.push(
           `${new Date(Number(session.createdAt) || 0).toISOString()} [${session.model || "Unknown provider"}; ${session.status || "unknown"}] ` +
-            `${session.appliedSteps || 0} edit actions, ${session.audioListens || 0} listens, batch parameters ${session.batchParameterTools ? "on" : "off"}, trimmed prompt ${session.trimmedPrompt ? "on" : "off"}: ${session.prompt || ""}`,
+            `${session.appliedSteps || 0} edit actions, ${session.audioListens || 0} listens, batch ${session.batchParameterTools ? "on" : "off"}, slim ${session.slimPrompt ? "on" : "off"}, dynamic ${session.dynamicToolLoading ? "on" : "off"}: ${session.prompt || ""}`,
+          `  Metrics: ${sessionMetricsSummary(session)}`,
+          `  Tool calls: ${JSON.stringify(session.metrics?.toolCalls || {})}`,
         );
       }
     }
@@ -1741,6 +1676,13 @@
     return lines.join("\n");
   }
 
+  function sessionMetricsSummary(session) {
+    const metrics = session.metrics || {};
+    const seconds = Math.round((Number(metrics.durationMs) || 0) / 1000);
+    const applyRate = `${((Number(metrics.auditionApplyRate) || 0) * 100).toFixed(0)}%`;
+    return `${seconds}s, ${Number(metrics.inputTokens) || 0} input tokens, ${Number(metrics.outputTokens) || 0} output tokens, ${Number(metrics.thoughtTokens) || 0} thinking tokens, ${Number(metrics.totalToolCalls) || 0} tool calls, ${Number(metrics.failedToolCalls) || 0} failed, ${Number(metrics.mutationsBeforeFirstListen) || 0} mutations before first listen, ${Number(metrics.averageMutationsBetweenListens) || 0} average / ${Number(metrics.maxMutationsBetweenListens) || 0} max mutations between listens, ${Number(metrics.auditions) || 0} auditions, ${Number(metrics.appliedAuditions) || 0} applied (${applyRate})`;
+  }
+
   function renderDebug() {
     elements.debugReport.value = debugReport();
     if (state.geminiSessions.length === 0) {
@@ -1752,8 +1694,9 @@
       .map(
         (session) => `<article class="gemini-session-item">
           <div><strong>${escapeHtml(new Date(Number(session.createdAt) || 0).toLocaleString())}</strong>
-          <span>${escapeHtml(session.model || "Unknown provider")} &middot; ${escapeHtml(session.status || "unknown")} &middot; ${Number(session.appliedSteps) || 0} actions &middot; ${Number(session.audioListens) || 0} listens &middot; batch ${session.batchParameterTools ? "on" : "off"} &middot; trimmed ${session.trimmedPrompt ? "on" : "off"}</span></div>
+          <span>${escapeHtml(session.model || "Unknown provider")} &middot; ${escapeHtml(session.status || "unknown")} &middot; ${Number(session.appliedSteps) || 0} actions &middot; ${Number(session.audioListens) || 0} listens &middot; batch ${session.batchParameterTools ? "on" : "off"} &middot; slim ${session.slimPrompt ? "on" : "off"} &middot; dynamic ${session.dynamicToolLoading ? "on" : "off"}</span></div>
           <p>${escapeHtml(session.prompt || "Untitled edit")}</p>
+          <p>${escapeHtml(sessionMetricsSummary(session))}</p>
         </article>`,
       )
       .join("");
@@ -1850,12 +1793,6 @@
   elements.trackRows.addEventListener("contextmenu", keepLongPressForTimeline);
   elements.trackRows.addEventListener("keydown", handleTimelineKey);
   elements.promptForm.addEventListener("submit", submitPrompt);
-  elements.referenceAudio.addEventListener("change", () => {
-    const file = elements.referenceAudio.files[0];
-    elements.referenceAudioName.textContent = file
-      ? `${file.name} (${(file.size / 1024).toFixed(0)} KB)`
-      : "Attach a sound for Gemini to listen to and match";
-  });
   elements.playButton.addEventListener("click", () => void audio.toggle());
   elements.rewindButton.addEventListener("click", () => audio.seek(0));
   elements.undoButton.addEventListener("click", () => void undo());
@@ -1882,9 +1819,17 @@
     }
     renderDebug();
   });
-  elements.trimmedPrompt.addEventListener("change", () => {
+  elements.slimPrompt.addEventListener("change", () => {
     try {
-      window.localStorage.setItem(TRIMMED_PROMPT_STORAGE_KEY, String(elements.trimmedPrompt.checked));
+      window.localStorage.setItem(SLIM_PROMPT_STORAGE_KEY, String(elements.slimPrompt.checked));
+    } catch (_error) {
+      // An unavailable preference store must not prevent the experiment.
+    }
+    renderDebug();
+  });
+  elements.dynamicTools.addEventListener("change", () => {
+    try {
+      window.localStorage.setItem(DYNAMIC_TOOLS_STORAGE_KEY, String(elements.dynamicTools.checked));
     } catch (_error) {
       // An unavailable preference store must not prevent the experiment.
     }
@@ -1935,10 +1880,16 @@
       elements.batchParameterTools.checked = false;
     }
     try {
-      elements.trimmedPrompt.checked =
-        window.localStorage.getItem(TRIMMED_PROMPT_STORAGE_KEY) === "true";
+      elements.slimPrompt.checked =
+        window.localStorage.getItem(SLIM_PROMPT_STORAGE_KEY) === "true";
     } catch (_error) {
-      elements.trimmedPrompt.checked = false;
+      elements.slimPrompt.checked = false;
+    }
+    try {
+      elements.dynamicTools.checked =
+        window.localStorage.getItem(DYNAMIC_TOOLS_STORAGE_KEY) === "true";
+    } catch (_error) {
+      elements.dynamicTools.checked = false;
     }
     const pending = readPendingEdit();
     if (pending) {

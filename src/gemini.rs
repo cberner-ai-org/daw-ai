@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -17,8 +18,8 @@ use crate::gemini_tools::render_audio_request;
 use crate::gemini_tools::{
     ANALYZE_AUDIO_TOOL_NAME, AUDIO_TOOL_NAME, AUDITION_TOOL_NAME, AudioRender, AudioRenderRequest,
     EditSession, INSTRUMENT_PARAMETER_TOOL_NAME, LOAD_TOOL_GROUP_NAME, PRESET_TOOL_NAME,
-    READ_TOOL_NAME, SOUND_TOOL_PARAMETER_TOOL_NAME, apply_agent_mutation, base64_audio,
-    dynamic_tool_declarations, is_mutation_tool, list_instrument_parameters,
+    READ_TOOL_NAME, SOUND_TOOL_PARAMETER_TOOL_NAME, SessionVariants, apply_agent_mutation,
+    base64_audio, dynamic_tool_declarations, is_mutation_tool, list_instrument_parameters,
     list_sound_tool_parameters, list_surge_presets, prepare_audio_render,
     prepare_instrument_audition, read_sound_graph, tool_declarations,
 };
@@ -96,26 +97,82 @@ struct LoopState {
     plans: Vec<EditPlan>,
     audio_listens: usize,
     audio_artifacts: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    thought_tokens: u64,
+    tool_calls: BTreeMap<String, usize>,
+    failed_tool_calls: usize,
+    mutations_since_listen: usize,
+    mutations_before_first_listen: Option<usize>,
+    mutations_between_listens: Vec<usize>,
+    auditions: usize,
+    auditioned_presets: BTreeSet<String>,
+    applied_auditions: usize,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ReferenceAudio {
-    pub(crate) name: String,
-    pub(crate) mime_type: String,
-    pub(crate) bytes: Vec<u8>,
+impl LoopState {
+    fn record_usage(&mut self, response: &JsonValue) {
+        let usage = &response["usage"];
+        self.input_tokens += usage["total_input_tokens"].as_u64().unwrap_or(0);
+        self.output_tokens += usage["total_output_tokens"].as_u64().unwrap_or(0);
+        self.thought_tokens += usage["total_thought_tokens"].as_u64().unwrap_or(0);
+    }
+
+    fn record_call(&mut self, name: &str) {
+        *self.tool_calls.entry(name.to_owned()).or_default() += 1;
+    }
+
+    fn record_mutation(&mut self) {
+        self.mutations_since_listen += 1;
+    }
+
+    fn record_listen(&mut self) {
+        if self.audio_listens == 0 {
+            self.mutations_before_first_listen = Some(self.mutations_since_listen);
+        } else {
+            self.mutations_between_listens
+                .push(self.mutations_since_listen);
+        }
+        self.mutations_since_listen = 0;
+        self.audio_listens += 1;
+    }
+
+    fn metrics(&self, elapsed: Duration) -> JsonValue {
+        let average_between = if self.mutations_between_listens.is_empty() {
+            0.0
+        } else {
+            self.mutations_between_listens.iter().sum::<usize>() as f64
+                / self.mutations_between_listens.len() as f64
+        };
+        serde_json::json!({
+            "durationMs": elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            "inputTokens": self.input_tokens,
+            "outputTokens": self.output_tokens,
+            "thoughtTokens": self.thought_tokens,
+            "totalToolCalls": self.tool_calls.values().sum::<usize>(),
+            "failedToolCalls": self.failed_tool_calls,
+            "toolCalls": self.tool_calls,
+            "mutationsBeforeFirstListen": self.mutations_before_first_listen.unwrap_or(self.mutations_since_listen),
+            "averageMutationsBetweenListens": average_between,
+            "maxMutationsBetweenListens": self.mutations_between_listens.iter().copied().max().unwrap_or(0),
+            "auditions": self.auditions,
+            "appliedAuditions": self.applied_auditions,
+            "auditionApplyRate": if self.auditions == 0 { 0.0 } else { self.applied_auditions as f64 / self.auditions as f64 }
+        })
+    }
 }
 
 impl GeminiPlanner {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn interpret_with_reference_audio_updates(
+    pub(crate) fn interpret_with_updates(
         session_root: &std::path::Path,
         prompt: &str,
         start: f32,
         end: f32,
         project: &Project,
-        reference_audio: Option<ReferenceAudio>,
         batch_parameter_tools: bool,
-        trimmed_prompt: bool,
+        slim_prompt: bool,
+        dynamic_tools: bool,
         cancellation: Arc<AtomicBool>,
         mut render_audio: impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
         mut on_update: impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -126,18 +183,21 @@ impl GeminiPlanner {
             prompt,
             start,
             end,
-            batch_parameter_tools,
-            trimmed_prompt,
+            SessionVariants {
+                batch_parameter_tools,
+                slim_prompt,
+                dynamic_tools,
+            },
         )
         .map_err(PlannerError::Io)?;
-        let result = run_session_with_reference(
+        let result = run_session(
             &session,
             prompt,
             start,
             end,
-            reference_audio.as_ref(),
             batch_parameter_tools,
-            trimmed_prompt,
+            slim_prompt,
+            dynamic_tools,
             cancellation,
             &mut render_audio,
             &mut on_update,
@@ -159,14 +219,14 @@ impl GeminiPlanner {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_session_with_reference(
+fn run_session(
     session: &EditSession,
     prompt: &str,
     start: f32,
     end: f32,
-    reference_audio: Option<&ReferenceAudio>,
     batch_parameter_tools: bool,
-    trimmed_prompt: bool,
+    slim_prompt: bool,
+    dynamic_tools: bool,
     cancellation: Arc<AtomicBool>,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -174,14 +234,14 @@ fn run_session_with_reference(
     let api_key = load_api_key()?;
     let endpoint = std::env::var("DAW_AI_GEMINI_ENDPOINT")
         .unwrap_or_else(|_| DEFAULT_INTERACTIONS_ENDPOINT.to_owned());
-    run_session_with_transport_reference(
+    run_session_with_transport_options(
         session,
         prompt,
         start,
         end,
-        reference_audio,
         batch_parameter_tools,
-        trimmed_prompt,
+        slim_prompt,
+        dynamic_tools,
         render_audio,
         on_update,
         &|| cancellation.load(Ordering::SeqCst),
@@ -212,12 +272,12 @@ fn run_session_with_transport(
     is_cancelled: &impl Fn() -> bool,
     transport: &mut impl FnMut(usize, &JsonValue, Duration) -> Result<String, PlannerError>,
 ) -> Result<GeminiEdit, PlannerError> {
-    run_session_with_transport_reference(
+    run_session_with_transport_options(
         session,
         prompt,
         start,
         end,
-        None,
+        false,
         false,
         false,
         render_audio,
@@ -228,14 +288,14 @@ fn run_session_with_transport(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_session_with_transport_reference(
+fn run_session_with_transport_options(
     session: &EditSession,
     prompt: &str,
     start: f32,
     end: f32,
-    reference_audio: Option<&ReferenceAudio>,
     batch_parameter_tools: bool,
-    trimmed_prompt: bool,
+    slim_prompt: bool,
+    dynamic_tools: bool,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     is_cancelled: &impl Fn() -> bool,
@@ -243,22 +303,7 @@ fn run_session_with_transport_reference(
 ) -> Result<GeminiEdit, PlannerError> {
     let started = Instant::now();
     let mut loaded_tool_group: Option<String> = None;
-    let mut input = reference_audio.map_or_else(
-        || JsonValue::String(planner_task(prompt, start, end, trimmed_prompt)),
-        |audio| {
-            serde_json::json!([{
-                "type": "user_input",
-                "content": [
-                    {"type": "text", "text": format!(
-                        "{}\n\nThe user attached reference audio named {:?}. Listen to it and use it as the audible reference for the requested match or comparison.",
-                        planner_task(prompt, start, end, trimmed_prompt),
-                        audio.name
-                    )},
-                    {"type": "audio", "mime_type": audio.mime_type, "data": base64_audio(&audio.bytes)}
-                ]
-            }])
-        },
-    );
+    let mut input = JsonValue::String(planner_task(prompt, start, end, slim_prompt));
     let mut previous_interaction_id: Option<String> = None;
     let mut sequence = 0_usize;
     let mut state = LoopState::default();
@@ -271,7 +316,7 @@ fn run_session_with_transport_reference(
             .checked_sub(started.elapsed())
             .ok_or(PlannerError::TimedOut)?;
         sequence += 1;
-        let tools = if trimmed_prompt {
+        let tools = if dynamic_tools {
             dynamic_tool_declarations(batch_parameter_tools, loaded_tool_group.as_deref())
         } else {
             tool_declarations(batch_parameter_tools)
@@ -280,7 +325,7 @@ fn run_session_with_transport_reference(
             "model": GEMINI_MODEL,
             "input": input,
             "tools": &tools,
-            "system_instruction": system_instruction(trimmed_prompt),
+            "system_instruction": system_instruction(slim_prompt),
             "generation_config": {"thinking_level": "high"},
             "store": true
         });
@@ -296,6 +341,7 @@ fn run_session_with_transport_reference(
         let response_source = transport(sequence, &request, remaining)?;
         let response = serde_json::from_str::<JsonValue>(&response_source)
             .map_err(|error| invalid(&format!("interaction response was not JSON: {error}")))?;
+        state.record_usage(&response);
         previous_interaction_id = Some(
             response
                 .get("id")
@@ -305,6 +351,9 @@ fn run_session_with_transport_reference(
         );
         let calls = function_calls(&response)?;
         if calls.is_empty() {
+            session
+                .update_metrics(&state.metrics(started.elapsed()))
+                .map_err(PlannerError::Io)?;
             if state.plans.is_empty() {
                 input = JsonValue::String(format!(
                     "You have not made an edit. Call {READ_TOOL_NAME}, then use a concrete CRUD graph mutation such as new_track, add_midi_clip, or set_instrument_parameter. {AUDIO_TOOL_NAME} is available whenever listening would help you decide."
@@ -322,7 +371,8 @@ fn run_session_with_transport_reference(
             if is_cancelled() {
                 return Err(PlannerError::Interrupted);
             }
-            let output = if index == 0 && trimmed_prompt && call.name == LOAD_TOOL_GROUP_NAME {
+            state.record_call(&call.name);
+            let output = if index == 0 && dynamic_tools && call.name == LOAD_TOOL_GROUP_NAME {
                 let group = call
                     .arguments
                     .get("group")
@@ -349,6 +399,9 @@ fn run_session_with_transport_reference(
             } else {
                 ToolOutput::text("Tool error: call one tool at a time; retry this call".to_owned())
             };
+            if output.failed() {
+                state.failed_tool_calls += 1;
+            }
             results.push(serde_json::json!({
                 "type": "function_result",
                 "name": call.name,
@@ -364,6 +417,9 @@ fn run_session_with_transport_reference(
                 applied_steps(&state),
                 state.audio_listens,
             )
+            .map_err(PlannerError::Io)?;
+        session
+            .update_metrics(&state.metrics(started.elapsed()))
             .map_err(PlannerError::Io)?;
         input = JsonValue::Array(results);
     }
@@ -386,6 +442,14 @@ impl ToolOutput {
             result: vec![serde_json::json!({"type": "text", "text": message})],
             supplemental_input: Vec::new(),
         }
+    }
+
+    fn failed(&self) -> bool {
+        self.result.iter().any(|part| {
+            part.get("text")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|text| text.starts_with("Tool error:"))
+        })
     }
 }
 
@@ -479,7 +543,13 @@ fn execute_tool(
             };
             match prepared.and_then(render_audio) {
                 Ok(audio) => {
-                    state.audio_listens += 1;
+                    state.record_listen();
+                    if call.name == AUDITION_TOOL_NAME {
+                        state.auditions += 1;
+                        if let Some(preset) = call.arguments["presetId"].as_str() {
+                            state.auditioned_presets.insert(preset.to_owned());
+                        }
+                    }
                     state.audio_artifacts += 1;
                     let audio_name = session
                         .record_audio(sequence * 1_000_000 + state.audio_artifacts, &audio.wav)
@@ -542,6 +612,14 @@ fn apply_and_commit_mutation(
                 .synchronize_project(&committed)
                 .map_err(|message| invalid(&message))?;
             state.plans.push(plan);
+            state.record_mutation();
+            if name == "set_surge_preset"
+                && arguments["presetId"]
+                    .as_str()
+                    .is_some_and(|preset| state.auditioned_presets.contains(preset))
+            {
+                state.applied_auditions += 1;
+            }
             Ok(message)
         }
         Err(error) => Ok(format!("Tool error: {error}")),
@@ -828,10 +906,10 @@ fn missing_credentials(path: Option<&Path>) -> PlannerError {
     ))
 }
 
-fn planner_task(prompt: &str, start: f32, end: f32, trimmed_prompt: bool) -> String {
-    if trimmed_prompt {
+fn planner_task(prompt: &str, start: f32, end: f32, slim_prompt: bool) -> String {
+    if slim_prompt {
         return format!(
-            "Selected edit region: {start:.3} to {end:.3} seconds.\nUser request: {prompt}"
+            "Selected edit region: {start:.3} to {end:.3} seconds.\nUser request: {prompt}\n\nInspect the current project, use the available tools to make the requested change, listen to candidate and edited sounds, and iterate based on the rendered audio."
         );
     }
     format!(
@@ -839,9 +917,9 @@ fn planner_task(prompt: &str, start: f32, end: f32, trimmed_prompt: bool) -> Str
     )
 }
 
-fn system_instruction(trimmed_prompt: bool) -> String {
-    if trimmed_prompt {
-        return "You are interacting with a DAW-like environment powered by Surge XT. Perform the user's request using the available tools.".to_owned();
+fn system_instruction(slim_prompt: bool) -> String {
+    if slim_prompt {
+        return "You are interacting with a DAW-like environment powered by Surge XT. Perform the user's request using the available tools. Inspect the project, listen to relevant candidate and edited sounds, and iterate from the rendered audio until the request is complete.".to_owned();
     }
     format!(
         concat!(
@@ -1596,60 +1674,11 @@ mod tests {
             "Factory/Leads/Classic Lead 1"
         );
         assert_eq!(session.stats().unwrap(), (1, 1));
-    }
-
-    #[test]
-    fn attached_reference_audio_reaches_the_editing_interaction() {
-        let session =
-            EditSession::create(&Project::demo(), "match this bass", 0.0, 4.0).expect("session");
-        let reference = ReferenceAudio {
-            name: "reference.wav".to_owned(),
-            mime_type: "audio/wav".to_owned(),
-            bytes: b"RIFF".to_vec(),
-        };
-        let responses = [
-            serde_json::json!({
-                "id":"edit","status":"requires_action","steps":[{
-                    "type":"function_call","id":"edit-bass","name":"set_parameter",
-                    "arguments":preset_edit("Factory/Leads/Classic Lead 1")
-                }]
-            }),
-            serde_json::json!({"id":"done","status":"completed","steps":[]}),
-        ];
-        let mut response_index = 0;
-        let mut editing_input = None;
-        run_session_with_transport_reference(
-            &session,
-            "match this bass",
-            0.0,
-            4.0,
-            Some(&reference),
-            false,
-            false,
-            &mut render_audio_request,
-            &mut |edit| Ok(edit.project),
-            &|| false,
-            &mut |sequence, request, _| {
-                if sequence == 1 {
-                    editing_input = Some(request["input"].clone());
-                }
-                let response = responses[response_index].to_string();
-                response_index += 1;
-                Ok(response)
-            },
-        )
-        .expect("producer session with reference audio");
-
-        let input = editing_input.expect("editing request");
-        assert!(
-            input[0]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("reference.wav")
-        );
-        assert_eq!(input[0]["content"][1]["type"], "audio");
-        assert_eq!(input[0]["content"][1]["mime_type"], "audio/wav");
-        assert_eq!(input[0]["content"][1]["data"], "UklGRg==");
+        let metadata: JsonValue =
+            serde_json::from_str(&session.metadata_source().unwrap()).expect("session metadata");
+        assert_eq!(metadata["metrics"]["totalToolCalls"], 2);
+        assert_eq!(metadata["metrics"]["toolCalls"][AUDIO_TOOL_NAME], 1);
+        assert_eq!(metadata["metrics"]["mutationsBeforeFirstListen"], 1);
     }
 
     #[test]
@@ -1751,12 +1780,42 @@ mod tests {
         assert!(instruction.contains("no predetermined tool-call or iteration limit"));
         assert_eq!(
             system_instruction(true),
-            "You are interacting with a DAW-like environment powered by Surge XT. Perform the user's request using the available tools."
+            "You are interacting with a DAW-like environment powered by Surge XT. Perform the user's request using the available tools. Inspect the project, listen to relevant candidate and edited sounds, and iterate from the rendered audio until the request is complete."
         );
         assert!(!system_instruction(true).contains("rhythmic subdivision"));
         let trimmed_task = planner_task("make the bass hit harder", 4.0, 8.0, true);
         assert!(trimmed_task.contains("User request: make the bass hit harder"));
+        assert!(trimmed_task.contains("listen to candidate and edited sounds"));
         assert!(!trimmed_task.contains("musical plan"));
+    }
+
+    #[test]
+    fn session_metrics_capture_cost_and_iteration_behavior() {
+        let mut state = LoopState::default();
+        state.record_usage(&serde_json::json!({"usage":{
+            "total_input_tokens":1200,
+            "total_output_tokens":80,
+            "total_thought_tokens":240
+        }}));
+        state.record_call("set_instrument_parameter");
+        state.record_mutation();
+        state.record_mutation();
+        state.record_listen();
+        state.record_mutation();
+        state.record_listen();
+        state.failed_tool_calls = 1;
+        state.auditions = 2;
+        state.applied_auditions = 1;
+        let metrics = state.metrics(Duration::from_millis(1500));
+        assert_eq!(metrics["durationMs"], 1500);
+        assert_eq!(metrics["inputTokens"], 1200);
+        assert_eq!(metrics["thoughtTokens"], 240);
+        assert_eq!(metrics["toolCalls"]["set_instrument_parameter"], 1);
+        assert_eq!(metrics["failedToolCalls"], 1);
+        assert_eq!(metrics["mutationsBeforeFirstListen"], 2);
+        assert_eq!(metrics["averageMutationsBetweenListens"], 1.0);
+        assert_eq!(metrics["maxMutationsBetweenListens"], 1);
+        assert_eq!(metrics["auditionApplyRate"], 0.5);
     }
 
     #[test]
