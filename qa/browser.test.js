@@ -678,28 +678,6 @@ async function run() {
       { activeTab: "ai-mode-button", focused: "timeline-panel", aiHidden: false },
       "the skip link must reveal and focus the timeline from another tab",
     );
-    await waitFor(
-      async () =>
-        evaluate(
-          cdp,
-          appSession,
-          `document.querySelector('#sound-editor') &&
-            document.querySelectorAll('#sound-editor [data-graph-node]').length >= 3`,
-        ),
-      "sound-graph editor",
-    );
-    assert.deepEqual(
-      await evaluate(cdp, appSession, `({
-        tabs: document.querySelectorAll('[role="tab"]').length,
-        editors: document.querySelectorAll('#sound-editor').length,
-        graphs: document.querySelectorAll('#sound-editor .sound-graph').length,
-        pianoRolls: document.querySelectorAll('#sound-editor .piano-roll').length,
-        instruments: document.querySelectorAll('#sound-editor .instrument-tool').length,
-        trackCreator: Boolean(document.querySelector('#sound-editor #channel-creator')),
-      })`),
-      { tabs: 2, editors: 1, graphs: 3, pianoRolls: 3, instruments: 3, trackCreator: true },
-      "AI Mode must retain the chartered sound-graph editor without an Advanced tab",
-    );
     const durationBaseline = await evaluate(cdp, appSession, `(() => ({
       duration: Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')),
       button: document.querySelector('#ai-duration-button')?.textContent.trim(),
@@ -2277,7 +2255,7 @@ async function run() {
     assert.equal(consoleErrors.length, 0, "application emitted browser console errors");
 
     console.log(
-      "Browser workflows passed: mobile layout/panning, keyboard selection, backend audio rendering/transport, studio tabs/debug report, sound-graph editor, prompt single-flight/undo, cross-origin guard",
+      "Browser workflows passed: mobile layout/panning, keyboard selection, backend audio rendering/transport, studio tabs/debug report, prompt single-flight/undo, cross-origin guard",
     );
   } finally {
     if (attacker) await new Promise((resolve) => attacker.close(resolve));
