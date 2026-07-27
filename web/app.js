@@ -36,6 +36,11 @@
     historyCount: document.querySelector("#history-count"),
     aiModeButton: document.querySelector("#ai-mode-button"),
     aiModePanel: document.querySelector("#ai-mode-panel"),
+    soundEditor: document.querySelector("#sound-editor"),
+    channelCreator: document.querySelector("#channel-creator"),
+    channelRole: document.querySelector("#channel-role"),
+    addChannel: document.querySelector("#add-channel"),
+    channelList: document.querySelector("#channel-list"),
     debugButton: document.querySelector("#debug-button"),
     debugPanel: document.querySelector("#debug-panel"),
     debugReport: document.querySelector("#debug-report"),
@@ -63,12 +68,17 @@
     activeEditJobId: null,
     interruptPending: false,
     editProgressPercent: 0,
+    channelMutationPending: false,
     centeredInitialSelection: false,
     toastTimer: null,
     activeView: "ai",
     clientIssues: [],
     geminiSessions: [],
     projectHistory: { current: 0, entries: [] },
+    graphNodeSelection: {},
+    midiEventSelection: {},
+    instrumentParameters: {},
+    surgePresets: ["Init"],
   };
   let historyLoadQueue = Promise.resolve();
   let projectMutationQueue = Promise.resolve();
@@ -394,6 +404,40 @@
   }
 
   function adoptProject(project) {
+    const previousProject = state.project;
+    for (const [key, parameters] of Object.entries(state.instrumentParameters)) {
+      const trackId = Number(key.split(":", 1)[0]);
+      const previousTrack = previousProject?.tracks.find((track) => track.id === trackId);
+      const track = project?.tracks.find((candidate) => candidate.id === trackId);
+      if (
+        !previousTrack ||
+        !track ||
+        previousTrack.instrument.id !== track.instrument.id ||
+        previousTrack.instrument.preset !== track.instrument.preset ||
+        JSON.stringify(previousTrack.instrument.nativeOverrides || {}) !==
+          JSON.stringify(track.instrument.nativeOverrides || {})
+      ) {
+        delete state.instrumentParameters[key];
+        continue;
+      }
+      const overrides = track.instrument.nativeOverrides || {};
+      for (const parameter of parameters) {
+        const id = parameter.parameter?.startsWith("native:")
+          ? parameter.parameter.slice("native:".length)
+          : null;
+        if (id == null) continue;
+        const overridden = Object.prototype.hasOwnProperty.call(overrides, id);
+        const legacyOverridden =
+          parameter.graphParameter &&
+          (track.instrument.overrides || []).includes(parameter.graphParameter);
+        parameter.value = overridden
+          ? Number(overrides[id])
+          : legacyOverridden
+            ? Number(track.instrument.parameters?.[parameter.graphParameter])
+            : parameter.presetValue;
+        parameter.overridden = overridden || legacyOverridden;
+      }
+    }
     state.project = project;
     audio.playhead = clamp(audio.playhead, 0, project.duration);
     return project;
@@ -403,9 +447,20 @@
     try {
       adoptProject(await api("/api/project"));
       renderProject();
+      void loadSurgePresets();
     } catch (error) {
       showError(error, "loading the project");
       elements.savedState.textContent = "Offline";
+    }
+  }
+
+  async function loadSurgePresets() {
+    try {
+      const catalog = await api("/api/surge-presets");
+      state.surgePresets = ["Init", ...catalog.presets];
+      renderSoundEditor();
+    } catch (error) {
+      reportClientIssue("warning", error, "loading the Surge XT preset catalog");
     }
   }
 
@@ -425,6 +480,7 @@
     renderTracks();
     renderSelection();
     renderPlayhead();
+    renderSoundEditor();
     renderDebug();
     updateTransport();
     if (!state.centeredInitialSelection) {
@@ -608,6 +664,546 @@
     scroll.scrollLeft = Math.max(0, centerPosition - sidebarWidth - availableWidth / 2);
   }
 
+  function renderSoundEditor() {
+    const uiState = captureSoundEditorUiState();
+    elements.channelList.innerHTML = state.project.tracks
+      .map((track) => {
+        const selectedNode = selectedGraphNode(track);
+        const regionalEffects = regionalEffectsForTrack(track)
+          .map((effect) => {
+            return `<span class="effect-pill is-regional">${escapeHtml(effect.name)} <b>${escapeHtml(effect.detail)} &middot; ${effect.start.toFixed(1)}-${effect.end.toFixed(1)}s</b></span>`;
+          })
+          .join("");
+        const orderedEffects = track.routing.audio
+          .filter((node) => node.startsWith("effect:"))
+          .map((node) => track.effects.find((effect) => effect.id === Number(node.slice(7))))
+          .filter(Boolean);
+        return `<section class="channel-card" data-channel-track="${track.id}" tabindex="-1" style="--track-color:${track.color}">
+          <div class="channel-heading">
+            <div class="channel-name"><i></i>${escapeHtml(track.name)}</div>
+            <div class="channel-actions">
+              <button class="mute-button ${track.muted ? "is-muted" : ""}" type="button" data-mute-track="${track.id}" data-muted="${track.muted}">${track.muted ? "MUTED" : "MUTE"}</button>
+              <button class="delete-channel-button" type="button" data-delete-track="${track.id}" data-track-name="${escapeHtml(track.name)}" aria-label="${escapeHtml(`Delete ${track.name} track`)}" ${state.channelMutationPending ? "disabled" : ""}>Delete</button>
+            </div>
+          </div>
+          <label class="volume-control">LEVEL
+            <input type="range" min="0" max="1.5" step="0.01" value="${track.volume}" data-volume-track="${track.id}" aria-label="${escapeHtml(track.name)} volume">
+            <output>${Math.round(track.volume * 100)}%</output>
+          </label>
+          <div class="track-workspace">
+            <div class="track-editor-column">
+              <div class="sound-graph-panel">
+                <div class="tool-heading"><div><span>Sound graph</span><strong>Click a node to inspect it</strong></div></div>
+                ${renderSoundGraph(track, orderedEffects, selectedNode)}
+              </div>
+              <div class="sound-tool clips-tool">
+                <div class="tool-heading"><div><span>MIDI Clips</span><strong>Piano roll and event editor</strong></div></div>
+                ${track.clips.map((clip) => renderClipTimeline(track, clip)).join("")}
+                ${track.clips.length === 0 ? '<span class="effect-pill">No clips</span>' : ""}
+              </div>
+            </div>
+            <aside class="node-inspector-column" aria-label="${escapeHtml(`${track.name} selected node parameters`)}">
+              <div class="inspector-label">Selected node</div>
+              <div class="sound-tool instrument-tool node-inspector" data-node-pane="instrument:${track.instrument.id}" ${selectedNode === `instrument:${track.instrument.id}` ? "" : "hidden"}>
+                <div class="tool-heading"><div><span>Instrument</span><strong>${escapeHtml(track.instrument.engine)}</strong></div><code>#${track.instrument.id}</code></div>
+                <div class="tool-controls instrument-preset-controls">
+                  <label class="tool-control">Preset
+                    <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="preset" data-control-key="${track.id}-instrument-${track.instrument.id}-preset" aria-label="${escapeHtml(`${track.name} instrument #${track.instrument.id} Surge XT preset`)}">
+                      ${selectOptions(state.surgePresets.includes(track.instrument.preset) ? state.surgePresets : [track.instrument.preset, ...state.surgePresets], track.instrument.preset)}
+                    </select>
+                  </label>
+                </div>
+                <h4>Common controls</h4>
+                <div class="tool-controls instrument-envelope-controls">
+                  ${(state.instrumentParameters[`${track.id}:common`] || []).map((parameter) =>
+                    instrumentControl(track, parameter)
+                  ).join("")}
+                  ${state.instrumentParameters[`${track.id}:common`] ? "" : `<button type="button" data-load-instrument-parameters="${track.id}:common">Show common controls</button>`}
+                </div>
+                <details class="instrument-advanced-controls">
+                  <summary>Advanced controls</summary>
+                  <div class="tool-controls">
+                    ${(state.instrumentParameters[`${track.id}:advanced`] || []).map((parameter) =>
+                      instrumentControl(track, parameter)
+                    ).join("")}
+                    ${state.instrumentParameters[`${track.id}:advanced`] ? "" : `<button type="button" data-load-instrument-parameters="${track.id}:advanced">Show advanced controls</button>`}
+                  </div>
+                </details>
+              </div>
+              <div class="sound-tool effects-tool node-inspector" data-node-pane="effects" ${selectedNode.startsWith("effect:") ? "" : "hidden"}>
+                <div class="tool-heading"><div><span>Effect</span><strong>Audio processor parameters</strong></div></div>
+                <div class="effect-stack">${orderedEffects.map((effect, index) => `<div data-effect-pane="effect:${effect.id}" ${selectedNode === `effect:${effect.id}` ? "" : "hidden"}>${renderEffect(track, effect, index, orderedEffects.length)}</div>`).join("")}</div>
+                <div class="effects-list">${regionalEffects || '<span class="effect-pill">No regional effects</span>'}</div>
+              </div>
+              <div class="sound-tool modulators-tool node-inspector" data-node-pane="modulators" ${selectedNode.startsWith("modulator:") ? "" : "hidden"}>
+                <div class="tool-heading"><div><span>Modulator</span><strong>Control signal parameters</strong></div></div>
+                ${track.modulators.map((modulator) => `<div data-modulator-pane="modulator:${modulator.id}" ${selectedNode === `modulator:${modulator.id}` ? "" : "hidden"}>${renderModulator(track, modulator)}</div>`).join("")}
+              </div>
+            </aside>
+          </div>
+        </section>`;
+      })
+      .join("");
+    restoreSoundEditorUiState(uiState);
+
+    elements.channelList.querySelectorAll("[data-volume-track]").forEach((input) => {
+      input.addEventListener("input", () => {
+        input.nextElementSibling.value = `${Math.round(Number(input.value) * 100)}%`;
+      });
+      input.addEventListener("change", () => {
+        void changeMix(input.dataset.volumeTrack, { volume: input.value }, "volume");
+      });
+    });
+    elements.channelList.querySelectorAll("[data-mute-track]").forEach((button) => {
+      button.addEventListener("click", () => {
+        void changeMix(button.dataset.muteTrack, { muted: String(button.dataset.muted !== "true") }, "mute");
+      });
+    });
+    elements.channelList.querySelectorAll("[data-delete-track]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (!window.confirm(`Delete the ${button.dataset.trackName} track and all of its sound tools?`)) return;
+        void changeChannel("delete", { track_id: button.dataset.deleteTrack });
+      });
+    });
+    elements.channelList.querySelectorAll("[data-load-instrument-parameters]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const [trackId, group] = button.dataset.loadInstrumentParameters.split(":");
+        button.disabled = true;
+        try {
+          const response = await api(`/api/instrument-parameters/${trackId}/${group}`);
+          state.instrumentParameters[`${trackId}:${group}`] = response.parameters;
+          renderSoundEditor();
+        } catch (error) {
+          button.disabled = false;
+          showError(error, `loading ${group} instrument controls`);
+        }
+      });
+    });
+    elements.channelList.querySelectorAll("[data-graph-node]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.graphNodeSelection[button.dataset.trackId] = button.dataset.graphNode;
+        const trackId = button.dataset.trackId;
+        const node = button.dataset.graphNode;
+        renderSoundEditor();
+        [...elements.channelList.querySelectorAll("[data-graph-node]")]
+          .find((candidate) => candidate.dataset.trackId === trackId && candidate.dataset.graphNode === node)
+          ?.focus({ preventScroll: true });
+      });
+    });
+    elements.channelList.querySelectorAll("[data-midi-event]").forEach((note) => {
+      note.addEventListener("click", () => {
+        const clipKey = note.closest("[data-clip-key]").dataset.clipKey;
+        state.midiEventSelection[clipKey] = Number(note.dataset.midiEvent);
+        renderSoundEditor();
+        elements.channelList
+          .querySelector(`[data-clip-key="${clipKey}"] [data-tool-id="${note.dataset.midiEvent}"][data-parameter="pitch"]`)
+          ?.focus({ preventScroll: true });
+      });
+    });
+    elements.channelList.querySelectorAll("[data-sound-tool]").forEach((control) => {
+      validateSoundToolControl(control);
+      if (control.matches('input[type="range"]')) {
+        control.addEventListener("input", () => {
+          validateSoundToolControl(control);
+          const output = control.nextElementSibling;
+          if (output?.matches("output")) output.value = formatSoundValue(control.value, control.dataset.unit);
+        });
+      }
+      control.addEventListener("change", () => {
+        validateSoundToolControl(control);
+        void changeSoundTool(control, control.value);
+      });
+    });
+    elements.channelList.querySelectorAll("[data-sound-value]").forEach((button) => {
+      button.addEventListener("click", () => {
+        void changeSoundTool(button, button.dataset.soundValue);
+      });
+    });
+  }
+
+  function selectedGraphNode(track) {
+    const available = [
+      `instrument:${track.instrument.id}`,
+      ...track.effects.map((effect) => `effect:${effect.id}`),
+      ...track.modulators.map((modulator) => `modulator:${modulator.id}`),
+    ];
+    const selected = state.graphNodeSelection[track.id];
+    if (available.includes(selected)) return selected;
+    state.graphNodeSelection[track.id] = available[0];
+    return available[0];
+  }
+
+  function renderSoundGraph(track, orderedEffects, selectedNode) {
+    const routeNodes = [
+      { label: "MIDI Clips", type: "clip" },
+      { label: track.instrument.engine, type: "instrument", key: `instrument:${track.instrument.id}` },
+      ...orderedEffects.map((effect) => ({ label: effect.name, type: "effect", key: `effect:${effect.id}` })),
+      { label: "Master", type: "output" },
+    ];
+    const route = routeNodes
+      .map((node, index) => {
+        const signal = index === 0 ? "MIDI" : "AUDIO";
+        const edge = index < routeNodes.length - 1
+          ? `<i aria-hidden="true"><b>${signal}</b>&rarr;</i>`
+          : "";
+        const content = node.key
+          ? `<button type="button" class="graph-node graph-node-${node.type} ${selectedNode === node.key ? "is-selected" : ""}" data-graph-node="${node.key}" data-track-id="${track.id}" aria-pressed="${selectedNode === node.key}"><span>${escapeHtml(node.label)}</span><small>${escapeHtml(node.type)}</small></button>`
+          : `<span class="graph-terminal graph-node-${node.type}">${escapeHtml(node.label)}</span>`;
+        return `${content}${edge}`;
+      })
+      .join("");
+    const modulators = track.modulators
+      .map((modulator) => `<button type="button" class="graph-node graph-node-modulator ${selectedNode === `modulator:${modulator.id}` ? "is-selected" : ""}" data-graph-node="modulator:${modulator.id}" data-track-id="${track.id}" aria-pressed="${selectedNode === `modulator:${modulator.id}`}"><span>${escapeHtml(modulator.name)}</span><small>CONTROL &rarr; ${escapeHtml(modulator.target)}</small></button>`)
+      .join("");
+    return `<div class="sound-graph" role="group" aria-label="${escapeHtml(`${track.name} sound graph`)}">
+      <div class="routing-chain" aria-label="${escapeHtml(`${track.name} typed sound routing`)}">${route}</div>
+      <div class="graph-control-nodes">${modulators}</div>
+    </div>`;
+  }
+
+  function captureSoundEditorUiState() {
+    const clips = new Map();
+    const advancedControls = new Map();
+    for (const editor of elements.channelList.querySelectorAll("[data-clip-key]")) {
+      clips.set(editor.dataset.clipKey, { open: editor.open });
+    }
+    for (const details of elements.channelList.querySelectorAll("[data-advanced-controls]")) {
+      advancedControls.set(details.dataset.advancedControls, details.open);
+    }
+    return { drawerScrollTop: elements.soundEditor.scrollTop, clips, advancedControls };
+  }
+
+  function restoreSoundEditorUiState(uiState) {
+    elements.soundEditor.scrollTop = uiState.drawerScrollTop;
+    for (const editor of elements.channelList.querySelectorAll("[data-clip-key]")) {
+      const clipState = uiState.clips.get(editor.dataset.clipKey);
+      if (!clipState) continue;
+      editor.open = clipState.open;
+    }
+    for (const details of elements.channelList.querySelectorAll("[data-advanced-controls]")) {
+      details.open = uiState.advancedControls.get(details.dataset.advancedControls) || false;
+    }
+  }
+
+  function soundRange(
+    track,
+    tool,
+    toolId,
+    ownerName,
+    parameter,
+    value,
+    minimum,
+    maximum,
+    unit,
+    clipId = "",
+    label = parameter,
+  ) {
+    const key = `${track.id}-${tool}-${toolId}-${parameter}`;
+    const clipAttribute = clipId === "" ? "" : ` data-clip-id="${clipId}"`;
+    const owner = tool === "instrument" ? "instrument" : `${ownerName} ${tool}`;
+    const accessibleName = `${track.name} ${owner} #${toolId} ${parameter}`;
+    return `<label class="tool-control">${escapeHtml(label)}
+      <span class="range-with-output"><input type="range" min="${minimum}" max="${maximum}" step="any" value="${value}" data-sound-tool="${tool}" data-track-id="${track.id}" data-tool-id="${toolId}" data-parameter="${parameter}" data-unit="${unit}" data-control-key="${key}"${clipAttribute} aria-label="${escapeHtml(accessibleName)}"><output>${formatSoundValue(value, unit)}</output></span>
+    </label>`;
+  }
+
+  function instrumentControl(track, parameter) {
+    const label = `${parameter.name}${parameter.overridden ? " (overridden)" : ` - preset: ${parameter.display}`}`;
+    const choices = parameter.choices?.length
+      ? parameter.choices
+      : parameter.kind === "boolean"
+        ? [{ value: 0, display: "Off" }, { value: 1, display: "On" }]
+        : [];
+    if (choices.length === 0) {
+      return soundRange(
+        track,
+        "instrument",
+        track.instrument.id,
+        "instrument",
+        parameter.parameter,
+        parameter.value,
+        0,
+        1,
+        "%",
+        "",
+        label,
+      );
+    }
+    const key = `${track.id}-instrument-${track.instrument.id}-${parameter.parameter}`;
+    const accessibleName = `${track.name} instrument #${track.instrument.id} ${parameter.parameter}`;
+    const options = choices
+      .map((choice) => `<option value="${choice.value}" ${Math.abs(choice.value - parameter.value) < 0.00001 ? "selected" : ""}>${escapeHtml(choice.display)}</option>`)
+      .join("");
+    return `<label class="tool-control">${escapeHtml(label)}
+      <select data-sound-tool="instrument" data-track-id="${track.id}" data-tool-id="${track.instrument.id}" data-parameter="${parameter.parameter}" data-control-key="${key}" aria-label="${escapeHtml(accessibleName)}">${options}</select>
+    </label>`;
+  }
+
+  function soundToggle(track, tool, toolId, name, enabled) {
+    const action = enabled ? "Disable" : "Enable";
+    const accessibleName = `${action} ${track.name} ${name} ${tool} #${toolId}`;
+    return `<button type="button" aria-label="${escapeHtml(accessibleName)}" aria-pressed="${String(enabled)}" data-sound-tool="${tool}" data-track-id="${track.id}" data-tool-id="${toolId}" data-parameter="enabled" data-sound-value="${String(!enabled)}" data-control-key="${track.id}-${tool}-${toolId}-enabled">${enabled ? "On" : "Off"}</button>`;
+  }
+
+  function renderEffect(track, effect, index, effectCount) {
+    const filterControls = Number.isFinite(effect.parameters.cutoff)
+      ? [
+          soundRange(
+            track,
+            "effect",
+            effect.id,
+            effect.name,
+            "cutoff",
+            effect.parameters.cutoff,
+            80,
+            16000,
+            "Hz",
+            "",
+            "Cutoff",
+          ),
+          soundRange(
+            track,
+            "effect",
+            effect.id,
+            effect.name,
+            "resonance",
+            effect.parameters.resonance,
+            0.1,
+            20,
+            "Q",
+            "",
+            "Resonance",
+          ),
+        ].join("")
+      : "";
+    const detailedParameters = (effect.parameterOrder || Object.keys(effect.parameters))
+      .filter((parameter) => !["mix", "cutoff", "resonance"].includes(parameter))
+      .map((parameter) => [parameter, effect.parameters[parameter]])
+      .filter(([, value]) => Number.isFinite(value));
+    const renderDetailed = ([parameter, value]) => effectControl(
+        track,
+        effect,
+        parameter,
+        value,
+      );
+    const commonControls = detailedParameters.slice(0, 2).map(renderDetailed).join("");
+    const advancedControls = detailedParameters.slice(2).map(renderDetailed).join("");
+    return `<div class="effect-card ${effect.enabled ? "" : "is-disabled"}">
+      <div class="effect-card-heading"><span class="effect-pill"><strong>${escapeHtml(effect.name)}</strong> <b>${formatSoundValue(effect.parameters.mix, "%")}</b></span><code>#${effect.id}</code></div>
+      ${soundRange(track, "effect", effect.id, effect.name, "mix", effect.parameters.mix, 0, 1, "%")}
+      ${filterControls}
+      ${commonControls}
+      ${advancedControls ? `<details data-advanced-controls="effect:${effect.id}"><summary>Advanced controls</summary><div class="tool-controls">${advancedControls}</div></details>` : ""}
+      <div class="tool-actions">
+        ${soundToggle(track, "effect", effect.id, effect.name, effect.enabled)}
+        <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} earlier`)}" ${index === 0 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.max(0, index - 1)}" data-control-key="${track.id}-routing-${effect.id}-up">&uarr;</button>
+        <button type="button" aria-label="${escapeHtml(`Move ${track.name} ${effect.name} effect #${effect.id} later`)}" ${index === effectCount - 1 ? "disabled" : ""} data-sound-tool="routing" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="position" data-sound-value="${Math.min(effectCount - 1, index + 1)}" data-control-key="${track.id}-routing-${effect.id}-down">&darr;</button>
+      </div>
+    </div>`;
+  }
+
+  function effectControl(track, effect, parameter, value) {
+    const semantics = effect.parameterSemantics?.[parameter];
+    const label = parameter.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase());
+    const choices = semantics?.choices?.length
+      ? semantics.choices
+      : semantics?.kind === "boolean"
+        ? [{ value: 0, display: "Off" }, { value: 1, display: "On" }]
+        : [];
+    if (choices.length === 0) {
+      return soundRange(
+        track,
+        "effect",
+        effect.id,
+        effect.name,
+        parameter,
+        value,
+        0,
+        1,
+        "%",
+        "",
+        label,
+      );
+    }
+    const selected = choices.reduce((closest, choice) =>
+      Math.abs(choice.value - value) < Math.abs(closest.value - value) ? choice : closest
+    );
+    const key = `${track.id}-effect-${effect.id}-${parameter}`;
+    const accessibleName = `${track.name} ${effect.name} effect #${effect.id} ${parameter}`;
+    return `<label class="tool-control">${escapeHtml(label)}
+      <select data-sound-tool="effect" data-track-id="${track.id}" data-tool-id="${effect.id}" data-parameter="${parameter}" data-control-key="${key}" aria-label="${escapeHtml(accessibleName)}">${choices
+        .map((choice) => `<option value="${choice.value}" ${choice === selected ? "selected" : ""}>${escapeHtml(choice.display)}</option>`)
+        .join("")}</select>
+    </label>`;
+  }
+
+  function renderModulator(track, modulator) {
+    const nativeTargets = ["common", "advanced"]
+      .flatMap((group) => state.instrumentParameters[`${track.id}:${group}`] || [])
+      .filter((parameter) => modulator.trigger !== "audio" && parameter.modulation?.[modulator.trigger])
+      .map((parameter) => [parameter.parameter, `Surge: ${parameter.name}`]);
+    const targets = [...track.modulationTargets.map((target) => [target.id, target.label]), ...nativeTargets];
+    if (!targets.some(([value]) => value === modulator.target)) {
+      targets.push([modulator.target, modulator.target]);
+    }
+    const sourceTrackId = modulator.sourceTrackId ?? track.id;
+    return `<div class="modulator-card ${modulator.enabled ? "" : "is-disabled"}">
+      <div class="effect-card-heading"><strong>${escapeHtml(modulator.name)}</strong><code>#${modulator.id}</code></div>
+      ${modulator.enabled && modulator.trigger !== "free" ? `<div class="modulator-route"><b>${escapeHtml(state.project.tracks.find((source) => source.id === sourceTrackId)?.name ?? "Unknown source")}</b><i aria-hidden="true">${modulator.trigger.toUpperCase()} &rarr;</i><b>Modulator</b></div>` : ""}
+      <h4>Common controls</h4>
+      <div class="tool-controls">
+        <label class="tool-control">Shape
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="shape" data-control-key="${track.id}-modulator-${modulator.id}-shape" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} shape`)}">${selectOptions(["sine", "triangle", "square", "random", "envelope", "formula"], modulator.shape)}</select>
+        </label>
+        <label class="tool-control">Target
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="target" data-control-key="${track.id}-modulator-${modulator.id}-target" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} target`)}">${targets.map(([value, label]) => `<option value="${value}" ${value === modulator.target ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select>
+        </label>
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "rate", modulator.parameters.rate, 0.01, 20, modulator.rateMode === "tempo" ? "x/beat" : "Hz")}
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "depth", modulator.parameters.depth, 0, 1, "%")}
+      </div>
+      <details data-advanced-controls="modulator:${modulator.id}">
+        <summary>Advanced controls</summary>
+        <div class="tool-controls">
+        <label class="tool-control">Rate mode
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="rateMode" data-control-key="${track.id}-modulator-${modulator.id}-rateMode" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} rate mode`)}">${selectOptions(["hz", "tempo"], modulator.rateMode)}</select>
+        </label>
+        <label class="tool-control">Trigger
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="trigger" data-control-key="${track.id}-modulator-${modulator.id}-trigger" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} trigger`)}">${selectOptions(["free", "midi"], modulator.trigger)}</select>
+        </label>
+        ${modulator.trigger !== "free" ? `<label>Source track
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="sourceTrackId" data-control-key="${track.id}-modulator-${modulator.id}-sourceTrackId" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} source track`)}"><option value="${track.id}" selected>${escapeHtml(track.name)} (#${track.id})</option></select>
+        </label>` : ""}
+        <label class="tool-control">Polarity
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="polarity" data-control-key="${track.id}-modulator-${modulator.id}-polarity" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} polarity`)}">${selectOptions(["increase", "decrease"], modulator.polarity)}</select>
+        </label>
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "attackMs", modulator.parameters.attackMs, 0, 1000, "ms")}
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "releaseMs", modulator.parameters.releaseMs, 1, 5000, "ms")}
+        <label class="tool-control">Surge Formula (Lua)
+          <textarea data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="formula" data-control-key="${track.id}-modulator-${modulator.id}-formula" aria-label="${escapeHtml(`${track.name} ${modulator.name} formula`)}">${escapeHtml(modulator.formula || "")}</textarea>
+        </label>
+        </div>
+      </details>
+      <div class="tool-actions">${soundToggle(track, "modulator", modulator.id, modulator.name, modulator.enabled)}</div>
+    </div>`;
+  }
+
+  function renderClipTimeline(track, clip) {
+    const playback = clip.playback?.mode === "once"
+      ? `${clip.playback.lengthBeats} beat phrase`
+      : `${clip.playback?.lengthBeats ?? clip.loopBeats} beat loop`;
+    const clipKey = `${track.id}-${clip.id}`;
+    const selectedId = state.midiEventSelection[clipKey];
+    const selected = clip.events.find((event) => event.id === selectedId);
+    return `<details class="clip-editor" data-clip-key="${clipKey}" open><summary><span>${escapeHtml(clip.label)}</span><b>${clip.events.length} events &middot; ${playback}</b></summary>${renderPianoRoll(track, clip, selectedId)}${selected ? renderMidiNoteInspector(track, clip, selected) : ""}</details>`;
+  }
+
+  function renderPianoRoll(track, clip, selectedId) {
+    if (clip.events.length === 0) return '<div class="empty-piano-roll">No notes in this clip</div>';
+    const pitches = clip.events.map((event) => event.pitch);
+    const minimum = Math.max(0, Math.floor(Math.min(...pitches) / 12) * 12);
+    const maximum = Math.min(127, Math.max(minimum + 11, Math.ceil((Math.max(...pitches) + 1) / 12) * 12 - 1));
+    const pitchCount = maximum - minimum + 1;
+    const rowHeight = 100 / pitchCount;
+    const playbackBeats = clip.playback?.lengthBeats ?? clip.loopBeats;
+    const beatWidth = 100 / playbackBeats;
+    const keys = Array.from({ length: pitchCount }, (_, index) => maximum - index)
+      .map((pitch) => {
+        const pitchClass = pitch % 12;
+        const isBlack = [1, 3, 6, 8, 10].includes(pitchClass);
+        const label = pitchClass === 0 ? midiNoteName(pitch) : "";
+        return `<span class="piano-key ${isBlack ? "is-black" : ""}">${label}</span>`;
+      })
+      .join("");
+    const notes = clip.events
+      .map((event) => {
+        const left = (event.time / playbackBeats) * 100;
+        const width = Math.max(0.8, (event.duration / playbackBeats) * 100);
+        const top = (maximum - event.pitch) * rowHeight;
+        return `<button type="button" class="midi-note ${event.id === selectedId ? "is-selected" : ""}" data-midi-event="${event.id}" aria-pressed="${String(event.id === selectedId)}" style="--note-left:${left}%;--note-width:${width}%;--note-top:${top}%;--note-height:${rowHeight}%;--note-velocity:${event.velocity}" aria-label="${escapeHtml(`Edit ${midiNoteName(event.pitch)} at beat ${event.time}, length ${event.duration}, velocity ${event.velocity}`)}"><span>${escapeHtml(midiNoteName(event.pitch))}</span></button>`;
+      })
+      .join("");
+    return `<div class="piano-roll" role="group" aria-label="${escapeHtml(`${track.name} ${clip.label} piano roll`)}">
+      <div class="piano-keyboard" aria-hidden="true">${keys}</div>
+      <div class="piano-grid" style="--pitch-row-height:${rowHeight}%;--beat-width:${beatWidth}%">${notes}</div>
+    </div>`;
+  }
+
+  function renderMidiNoteInspector(track, clip, event) {
+    const key = `${track.id}-clip-${clip.id}-event-${event.id}`;
+    const name = `${track.name} ${clip.label} note #${event.id}`;
+    const input = (label, parameter, value, minimum, maximum, step, exclusive = false) =>
+      `<label>${label}<input type="number" min="${minimum}" max="${maximum}" step="${step}" value="${value}" ${exclusive ? `data-maximum-exclusive="${maximum}"` : ""} data-sound-tool="event" data-track-id="${track.id}" data-tool-id="${event.id}" data-clip-id="${clip.id}" data-parameter="${parameter}" data-control-key="${key}-${parameter}" aria-label="${escapeHtml(`${name} ${label.toLowerCase()}`)}"></label>`;
+    return `<div class="midi-note-inspector" aria-label="${escapeHtml(`${name} editor`)}">
+      <strong>${escapeHtml(midiNoteName(event.pitch))}</strong>
+      ${input("Beat", "time", event.time, 0, clip.playback?.lengthBeats ?? clip.loopBeats, "any", true)}
+      ${input("Length", "duration", event.duration, 0.0625, Math.min(16, clip.playback?.lengthBeats ?? clip.loopBeats), "any")}
+      ${input("Pitch", "pitch", event.pitch, 0, 127, 1)}
+      ${input("Velocity", "velocity", event.velocity, 0.01, 1, "any")}
+    </div>`;
+  }
+
+  function midiNoteName(pitch) {
+    const names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    return `${names[pitch % 12]}${Math.floor(pitch / 12) - 1}`;
+  }
+
+  function selectOptions(values, selected) {
+    return values
+      .map((value) => `<option value="${value}" ${value === selected ? "selected" : ""}>${escapeHtml(value)}</option>`)
+      .join("");
+  }
+
+  function formatSoundValue(value, unit) {
+    const number = Number(value);
+    if (unit === "%") return `${Number((number * 100).toFixed(4))}%`;
+    if (unit === "Hz") return `${Number(number.toFixed(6))} Hz`;
+    if (unit === "s") return `${Number(number.toFixed(6))} s`;
+    return String(value);
+  }
+
+  function validateSoundToolControl(control) {
+    const maximum = Number(control.dataset.maximumExclusive);
+    if (!Number.isFinite(maximum)) return;
+    const valid = Number.isFinite(control.valueAsNumber) && control.valueAsNumber < maximum;
+    control.setCustomValidity(valid ? "" : `Enter a value below ${maximum}`);
+  }
+
+  function regionalEffectsForTrack(track) {
+    const effects = [];
+    for (const edit of state.project.edits) collectRegionalEffects(edit.action, track.role, edit, effects);
+    return effects;
+  }
+
+  function collectRegionalEffects(action, role, edit, effects) {
+    if (action.type === "compound") {
+      for (const child of action.actions) collectRegionalEffects(child, role, edit, effects);
+      return;
+    }
+    if (action.type === "timed") {
+      const duration = edit.end - edit.start;
+      collectRegionalEffects(action.action, role, {
+        start: edit.start + duration * action.start,
+        end: edit.start + duration * action.end,
+      }, effects);
+      return;
+    }
+    if (action.type === "effect" && (action.target === "all" || action.target === role)) {
+      effects.push({ name: action.name, detail: `${Math.round(action.value * 100)}%`, start: edit.start, end: edit.end });
+    }
+    if (action.type === "remove-effect" && (action.target === "all" || action.target === role)) {
+      effects.push({ name: action.name, detail: "OFF", start: edit.start, end: edit.end });
+    }
+    if (action.type === "filter" && (action.target === "all" || action.target === role)) {
+      const amount = Math.round(action.value * 100);
+      effects.push({
+        name: "Tone filter",
+        detail: `${amount > 0 ? "+" : ""}${amount}%`,
+        start: edit.start,
+        end: edit.end,
+      });
+    }
+  }
+
   async function replaceProject(operation, options = {}) {
     const preservePosition = options.preservePosition !== false;
     const resumePlayback = options.resumePlayback !== false && audio.isActive;
@@ -658,6 +1254,177 @@
       showError(error, context);
       return false;
     }
+  }
+
+  function changeMix(trackId, values, focusControl) {
+    return enqueueProjectMutation(() => applyMixChange(trackId, values, focusControl));
+  }
+
+  function setChannelMutationPending(pending) {
+    state.channelMutationPending = pending;
+    elements.addChannel.disabled = pending;
+    elements.channelList.querySelectorAll("[data-delete-track]").forEach((button) => {
+      button.disabled = pending;
+    });
+  }
+
+  function channelMutationRecord(project, clientOperationId, action, values) {
+    const record = project.channelOperations?.find(
+      (operation) => operation.operationId === clientOperationId,
+    );
+    if (!record || record.action !== action) return null;
+    if (action === "add" && record.role !== values.role) return null;
+    if (action === "delete" && String(record.trackId) !== String(values.track_id)) return null;
+    return record;
+  }
+
+  function focusChannelMutation(operation) {
+    if (operation.action === "add") {
+      elements.channelList
+        .querySelector(`[data-channel-track="${operation.trackId}"]`)
+        ?.focus({ preventScroll: true });
+    } else {
+      elements.addChannel.focus({ preventScroll: true });
+    }
+  }
+
+  function changeChannel(action, values) {
+    if (state.channelMutationPending) return Promise.resolve();
+    const clientOperationId = operationId();
+    setChannelMutationPending(true);
+    return enqueueProjectMutation(async () => {
+      let reconciled = true;
+      let confirmedOperation = null;
+      try {
+        await replaceProject(async () => {
+          const project = await api("/api/channels", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({ operation_id: clientOperationId, action, ...values }),
+          });
+          confirmedOperation = channelMutationRecord(
+            project,
+            clientOperationId,
+            action,
+            values,
+          );
+          if (!confirmedOperation) throw new Error("The track response did not identify this mutation.");
+          adoptProject(project);
+          renderProject();
+        });
+        showToast(action === "add" ? "Track added" : "Track deleted");
+      } catch (error) {
+        if (isRetryableApiError(error)) {
+          try {
+            await replaceProject(async () => {
+              adoptProject(await api("/api/project", {}, RECONCILED_REQUEST_TIMEOUT_MS));
+              renderProject();
+            });
+            confirmedOperation = channelMutationRecord(
+              state.project,
+              clientOperationId,
+              action,
+              values,
+            );
+            if (confirmedOperation) {
+              showToast(action === "add" ? "Track added" : "Track deleted");
+            } else {
+              showError(error, action === "add" ? "adding a track" : "deleting a track");
+            }
+          } catch (refreshError) {
+            reconciled = false;
+            showError(
+              new Error(
+                `The track result could not be confirmed. Reload before trying again. ${errorMessage(refreshError)}`,
+              ),
+              action === "add" ? "adding a track" : "deleting a track",
+            );
+          }
+        } else {
+          showError(error, action === "add" ? "adding a track" : "deleting a track");
+        }
+      } finally {
+        if (reconciled) {
+          setChannelMutationPending(false);
+          if (confirmedOperation) focusChannelMutation(confirmedOperation);
+        }
+      }
+    });
+  }
+
+  function changeSoundTool(control, value) {
+    if (control.dataset.soundTool === "instrument") {
+      state.graphNodeSelection[control.dataset.trackId] = `instrument:${control.dataset.toolId}`;
+    } else if (control.dataset.soundTool === "effect" || control.dataset.soundTool === "routing") {
+      state.graphNodeSelection[control.dataset.trackId] = `effect:${control.dataset.toolId}`;
+    } else if (control.dataset.soundTool === "modulator") {
+      state.graphNodeSelection[control.dataset.trackId] = `modulator:${control.dataset.toolId}`;
+    }
+    const request = {
+      track_id: control.dataset.trackId,
+      tool: control.dataset.soundTool,
+      tool_id: control.dataset.toolId,
+      parameter: control.dataset.parameter,
+      value: String(value),
+    };
+    if (control.dataset.clipId) request.clip_id = control.dataset.clipId;
+    if (!control.checkValidity()) {
+      renderProject();
+      restoreSoundToolFocus(request, control.dataset.controlKey);
+      showToast("Enter a value within the supported range", true);
+      return Promise.resolve();
+    }
+    return enqueueProjectMutation(() => applySoundToolChange(request, control.dataset.controlKey));
+  }
+
+  function restoreSoundToolFocus(request, focusKey) {
+    const controls = [...elements.channelList.querySelectorAll("[data-control-key]")];
+    const exactControl = controls.find((candidate) => candidate.dataset.controlKey === focusKey);
+    const sameToolControls = controls.filter(
+      (candidate) =>
+        candidate.dataset.trackId === request.track_id &&
+        candidate.dataset.toolId === request.tool_id &&
+        !candidate.disabled,
+    );
+    const fallbackControl =
+      sameToolControls.find((candidate) => candidate.dataset.soundTool === request.tool) ?? sameToolControls[0];
+    const focusControl = exactControl && !exactControl.disabled ? exactControl : fallbackControl;
+    if (!focusControl) return;
+    focusControl.focus({ preventScroll: true });
+  }
+
+  async function applySoundToolChange(request, focusKey) {
+    await applyProjectMutation({
+      path: "/api/sound-tools",
+      values: request,
+      context: "updating a sound tool",
+      successMessage: "Sound tool updated",
+      commitUi: () => {
+        if (request.tool !== "instrument") return;
+        if (request.parameter.startsWith("native:")) {
+          delete state.instrumentParameters[`${request.track_id}:common`];
+          delete state.instrumentParameters[`${request.track_id}:advanced`];
+        } else if (request.parameter === "preset") {
+          delete state.instrumentParameters[`${request.track_id}:common`];
+          delete state.instrumentParameters[`${request.track_id}:advanced`];
+        }
+      },
+      restoreUi: () => restoreSoundToolFocus(request, focusKey),
+      renderOnFailure: true,
+    });
+  }
+
+  async function applyMixChange(trackId, values, focusControl) {
+    await applyProjectMutation({
+      path: "/api/mix",
+      values: { track_id: trackId, ...values },
+      context: "updating the mixer",
+      restoreUi: () => {
+        const selector =
+          focusControl === "volume" ? `[data-volume-track="${trackId}"]` : `[data-mute-track="${trackId}"]`;
+        elements.channelList.querySelector(selector)?.focus({ preventScroll: true });
+      },
+    });
   }
 
   function editAppliesToTrack(edit, track) {
@@ -1666,6 +2433,10 @@
   elements.debugButton.addEventListener("click", openDebug);
   [elements.aiModeButton, elements.debugButton].forEach((button) => {
     button.addEventListener("keydown", handleViewTabKey);
+  });
+  elements.channelCreator.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void changeChannel("add", { role: elements.channelRole.value });
   });
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
