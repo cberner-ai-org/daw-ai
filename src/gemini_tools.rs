@@ -2409,6 +2409,7 @@ fn studio_error_message(error: StudioError) -> String {
         }
         StudioError::UnknownTrack => "track not found; call read_sound_graph".to_owned(),
         StudioError::InvalidMix => "mixer value out of range".to_owned(),
+        StudioError::InvalidDuration => "project duration out of range".to_owned(),
         StudioError::InvalidChannel => "channel limit exceeded".to_owned(),
         StudioError::LastTrack => "cannot delete the only track; create another first".to_owned(),
         StudioError::UnknownSoundTool => {

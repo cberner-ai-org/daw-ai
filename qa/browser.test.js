@@ -704,6 +704,114 @@ async function run() {
       `returning to AI Mode must restore timeline overlays (${JSON.stringify(restoredOverlays)})`,
     );
 
+    const durationBaseline = await evaluate(cdp, appSession, `(() => ({
+      duration: Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')),
+      buttons: [
+        document.querySelector('#ai-duration-button')?.textContent.trim(),
+        document.querySelector('#advanced-duration-button')?.textContent.trim(),
+      ],
+    }))()`);
+    assert.deepEqual(durationBaseline.buttons, ["Duration", "Duration"]);
+    await evaluate(cdp, appSession, `(() => {
+      window.prompt = () => null;
+      document.querySelector('#ai-duration-button').click();
+    })()`);
+    assert.equal(
+      await evaluate(cdp, appSession, "Number(document.querySelector('.track-lane').getAttribute('aria-valuemax'))"),
+      durationBaseline.duration,
+      "cancelling the AI Mode duration prompt must preserve the project",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      window.prompt = () => '301';
+      document.querySelector('#ai-duration-button').click();
+    })()`);
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `(() => ({
+        duration: Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')),
+        toast: document.querySelector('#toast-message').textContent,
+        error: document.querySelector('#toast').classList.contains('is-error'),
+      }))()`),
+      {
+        duration: durationBaseline.duration,
+        toast: "Enter a duration between 1 second and 5 minutes",
+        error: true,
+      },
+      "invalid duration input must be rejected in the browser",
+    );
+    const resizedDuration = durationBaseline.duration === 300 ? 299 : durationBaseline.duration + 1;
+    await evaluate(cdp, appSession, `(() => {
+      window.prompt = () => '${resizedDuration}';
+      document.querySelector('#ai-duration-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')) === ${resizedDuration}`,
+      ),
+      "AI Mode duration resize",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#total-time').textContent"),
+      `/ ${Math.floor(resizedDuration / 60)}:${String(resizedDuration % 60).padStart(2, "0")}`,
+    );
+    await evaluate(cdp, appSession, `(() => {
+      document.querySelector('#advanced-button').click();
+      window.prompt = () => '${durationBaseline.duration}';
+      document.querySelector('#advanced-duration-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `fetch('/api/project').then((response) => response.json()).then(
+          (project) => project.duration === ${durationBaseline.duration}
+        )`,
+      ),
+      "Advanced duration resize",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#ai-mode-button').click()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')) === ${durationBaseline.duration}`,
+      ),
+      "restored timeline duration",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#debug-button').click()");
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#audio-metrics-toggle').checked"),
+      true,
+      "audio metrics must default to enabled",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const toggle = document.querySelector('#audio-metrics-toggle');
+      toggle.checked = false;
+      toggle.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    assert.equal(
+      await evaluate(cdp, appSession, "localStorage.getItem('daw-ai.audio-metrics.v1')"),
+      "false",
+      "audio metrics preference must be persisted",
+    );
+    await cdp.send("Page.reload", { ignoreCache: true }, appSession);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.querySelector('#play-button') &&
+          !document.querySelector('#play-button').disabled &&
+          document.querySelector('#audio-metrics-toggle').checked === false`,
+      ),
+      "restored audio metrics preference",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      const toggle = document.querySelector('#audio-metrics-toggle');
+      toggle.checked = true;
+      toggle.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+
     await cdp.send(
       "Emulation.setDeviceMetricsOverride",
       { width: 390, height: 844, deviceScaleFactor: 1, mobile: true },

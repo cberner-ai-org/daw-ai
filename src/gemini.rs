@@ -430,10 +430,14 @@ fn execute_tool(
                     let audio_name = session
                         .record_audio(sequence * 1_000_000 + state.audio_artifacts, &audio.wav)
                         .map_err(PlannerError::Io)?;
-                    let description = format!(
-                        "{} Objective measurements: {} Session artifact: {audio_name}.",
-                        audio.description, audio.measurements
-                    );
+                    let description = if audio.measurements.is_null() {
+                        format!("{} Session artifact: {audio_name}.", audio.description)
+                    } else {
+                        format!(
+                            "{} Objective measurements: {} Session artifact: {audio_name}.",
+                            audio.description, audio.measurements
+                        )
+                    };
                     let output = ToolOutput {
                         result: vec![serde_json::json!({
                             "type": "text",
