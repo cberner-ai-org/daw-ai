@@ -25,7 +25,7 @@ use crate::model::Project;
 use crate::model::{MIN_MIDI_NOTE_BEATS, TrackRole};
 use crate::prompt::{Action, EditPlan};
 #[cfg(test)]
-use crate::prompt::{AutomationPoint, MAX_COMPOUND_ACTIONS, MidiNote};
+use crate::prompt::{MAX_COMPOUND_ACTIONS, MidiNote};
 
 const STUDIO_CONTRACT: &str = include_str!("../gemini/STUDIO.md");
 pub(crate) const GEMINI_MODEL: &str = "gemini-3.6-flash";
@@ -955,13 +955,6 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
                 value: setting,
             })
         }
-        "automation" if value == 0.0 => Ok(Action::Automation {
-            track_id: nonzero_integer_field(object, "trackId")?,
-            parameter: automation_parameter(name)?,
-            curve: automation_curve(string_field(object, "setting")?)?,
-            points: automation_points_field(object)?,
-            target: target.ok_or_else(|| invalid("automation requires a role target"))?,
-        }),
         "effect" if (0.0..=1.0).contains(&value) => Ok(Action::Effect {
             name: effect_name(name, false)?,
             mix: value as f32,
@@ -1020,43 +1013,6 @@ fn action_from_json(value: &JsonValue) -> Result<Action, PlannerError> {
         end: end as f32,
         action: Box::new(action),
     })
-}
-
-#[cfg(test)]
-fn automation_points_field(object: &Object) -> Result<Vec<AutomationPoint>, PlannerError> {
-    let points = object
-        .get("points")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| invalid("automation points must be an array"))?;
-    if !(2..=16).contains(&points.len()) {
-        return Err(invalid("automation requires between 2 and 16 points"));
-    }
-    let points = points
-        .iter()
-        .map(|point| {
-            let point = point
-                .as_object()
-                .ok_or_else(|| invalid("each automation point must be an object"))?;
-            Ok(AutomationPoint {
-                time: number_field(point, "time")? as f32,
-                value: number_field(point, "value")? as f32,
-            })
-        })
-        .collect::<Result<Vec<_>, PlannerError>>()?;
-    if points.first().map(|point| point.time) != Some(0.0)
-        || points.last().map(|point| point.time) != Some(1.0)
-        || points
-            .iter()
-            .any(|point| !(0.0..=1.0).contains(&point.time))
-        || points
-            .windows(2)
-            .any(|points| points[1].time <= points[0].time)
-    {
-        return Err(invalid(
-            "automation point times must increase from 0 through 1",
-        ));
-    }
-    Ok(points)
 }
 
 #[cfg(test)]
@@ -1159,24 +1115,6 @@ fn modulator_parameter(name: &str) -> Result<String, PlannerError> {
 }
 
 #[cfg(test)]
-fn automation_parameter(name: &str) -> Result<String, PlannerError> {
-    if modulator_parameter(name).is_ok() || modulator_automation_target(name).is_some() {
-        Ok(name.to_owned())
-    } else {
-        Err(invalid("unknown automation target"))
-    }
-}
-
-#[cfg(test)]
-fn automation_curve(name: &str) -> Result<&'static str, PlannerError> {
-    match name {
-        "linear" => Ok("linear"),
-        "hold" => Ok("hold"),
-        _ => Err(invalid("unknown automation curve")),
-    }
-}
-
-#[cfg(test)]
 fn modulator_shape(name: &str) -> Result<&'static str, PlannerError> {
     match name {
         "sine" => Ok("sine"),
@@ -1201,17 +1139,6 @@ fn modulator_rate(value: f64) -> Result<f32, PlannerError> {
 fn effect_modulation_target(name: &str) -> Option<u64> {
     let target = name.strip_prefix("effect:")?;
     [".mix", ".cutoff", ".resonance"]
-        .iter()
-        .find_map(|suffix| target.strip_suffix(suffix))?
-        .parse::<u64>()
-        .ok()
-        .filter(|id| *id > 0)
-}
-
-#[cfg(test)]
-fn modulator_automation_target(name: &str) -> Option<u64> {
-    let target = name.strip_prefix("modulator:")?;
-    [".rate", ".depth"]
         .iter()
         .find_map(|suffix| target.strip_suffix(suffix))?
         .parse::<u64>()
@@ -1346,16 +1273,6 @@ fn integer_field(object: &Object, name: &str) -> Result<u64, PlannerError> {
         Err(invalid(&format!(
             "{name} must be a non-negative safe integer"
         )))
-    }
-}
-
-#[cfg(test)]
-fn nonzero_integer_field(object: &Object, name: &str) -> Result<u64, PlannerError> {
-    let value = integer_field(object, name)?;
-    if value == 0 {
-        Err(invalid(&format!("{name} must identify an existing track")))
-    } else {
-        Ok(value)
     }
 }
 
@@ -1753,8 +1670,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_scoped_parameter_automation() {
-        let plan = plan_from_json(
+    fn rejects_removed_parameter_automation() {
+        plan_from_json(
             r#"{
                 "summary":"Opened the bass filter through the transition",
                 "musicalPlan":"Build brightness only through the middle of the selection.",
@@ -1770,35 +1687,7 @@ mod tests {
                 }]
             }"#,
         )
-        .expect("valid scoped automation");
-
-        assert_eq!(
-            plan.action,
-            Action::Timed {
-                start: 0.2,
-                end: 0.8,
-                action: Box::new(Action::Automation {
-                    track_id: 2,
-                    parameter: "effect:210.cutoff".to_owned(),
-                    curve: "linear",
-                    points: vec![
-                        AutomationPoint {
-                            time: 0.0,
-                            value: 300.0,
-                        },
-                        AutomationPoint {
-                            time: 0.5,
-                            value: 4000.0,
-                        },
-                        AutomationPoint {
-                            time: 1.0,
-                            value: 12000.0,
-                        },
-                    ],
-                    target: TrackRole::Bass,
-                }),
-            }
-        );
+        .expect_err("DAW-owned automation is not a supported Gemini action");
     }
 
     #[test]

@@ -564,7 +564,9 @@ fn clip_events_in_window<'a>(
             occurrences.push(ClipOccurrence {
                 event,
                 time,
-                duration: event.duration,
+                duration: event
+                    .duration
+                    .min(((f64::from(clip.end) - time) / beat_duration).max(0.0) as f32),
                 velocity: event.velocity,
             });
         }
@@ -671,7 +673,7 @@ pub(crate) fn analyze(region: &AudioRegion) -> RegionAnalysis {
         .filter(|pair| pair[0].is_sign_positive() != pair[1].is_sign_positive())
         .count();
     let zero_crossing_rate = zero_crossings as f32 / mono.len().max(1) as f32;
-    let spectrum = average_spectrum(&mono);
+    let spectrum = average_stereo_spectrum(&region.samples);
     let total = spectrum.iter().sum::<f32>().max(f32::EPSILON);
     let mut weighted = 0.0;
     let mut low = 0.0;
@@ -726,14 +728,51 @@ fn average_spectrum(samples: &[f32]) -> Vec<f32> {
     spectrum
 }
 
+fn average_stereo_spectrum(samples: &[f32]) -> Vec<f32> {
+    let channels = [
+        samples
+            .iter()
+            .step_by(CHANNEL_COUNT)
+            .copied()
+            .collect::<Vec<_>>(),
+        samples
+            .iter()
+            .skip(1)
+            .step_by(CHANNEL_COUNT)
+            .copied()
+            .collect::<Vec<_>>(),
+    ];
+    let mut spectrum = average_spectrum(&channels[0]);
+    let right = average_spectrum(&channels[1]);
+    for (left, right) in spectrum.iter_mut().zip(right) {
+        *left = (*left + right) * 0.5;
+    }
+    spectrum
+}
+
 pub(crate) fn mel_spectrogram(region: &AudioRegion) -> MelSpectrogram {
-    let mono = mono_samples(&region.samples);
-    let frames = frame_count(mono.len());
+    let left = region
+        .samples
+        .iter()
+        .step_by(CHANNEL_COUNT)
+        .copied()
+        .collect::<Vec<_>>();
+    let right = region
+        .samples
+        .iter()
+        .skip(1)
+        .step_by(CHANNEL_COUNT)
+        .copied()
+        .collect::<Vec<_>>();
+    let frames = frame_count(left.len());
     let filters = mel_filters();
     let mut values = vec![vec![0.0; MEL_BANDS]; frames];
     let mut maximum_db = -120.0_f32;
     for (frame, bands) in values.iter_mut().enumerate() {
-        let powers = frame_power(&mono, frame * FFT_HOP);
+        let mut powers = frame_power(&left, frame * FFT_HOP);
+        for (left, right) in powers.iter_mut().zip(frame_power(&right, frame * FFT_HOP)) {
+            *left = (*left + right) * 0.5;
+        }
         for (band, filter) in bands.iter_mut().zip(&filters) {
             let energy = filter
                 .iter()
@@ -2043,6 +2082,41 @@ mod tests {
             checks > 1
         });
         assert!(matches!(result, Err(message) if message == "audio render interrupted"));
+    }
+
+    #[test]
+    fn stereo_analysis_preserves_out_of_phase_energy() {
+        let samples = (0..FFT_SIZE)
+            .flat_map(|index| {
+                let value = (2.0 * PI * 440.0 * index as f32 / SAMPLE_RATE as f32).sin();
+                [value, -value]
+            })
+            .collect::<Vec<_>>();
+        let region = AudioRegion {
+            samples,
+            event_count: 0,
+            event_onsets: Vec::new(),
+        };
+        let analysis = analyze(&region);
+        assert!(analysis.spectral_centroid_hz > 400.0);
+        assert!(analysis.spectral_centroid_hz < 500.0);
+        assert!(mel_spectrogram(&region).maximum_db > -120.0);
+    }
+
+    #[test]
+    fn clip_boundary_truncates_sustained_note_gates() {
+        let mut project = Project::demo();
+        {
+            let clip = &mut project.tracks[1].clips[0];
+            clip.end = clip.start + 0.5;
+            clip.events[0].time = 0.0;
+            clip.events[0].duration = 16.0;
+        }
+        let track = &project.tracks[1];
+        let clip = &track.clips[0];
+        let occurrences = clip_events_in_window(&project, track, clip, 0.0, 1.0);
+        assert_eq!(occurrences.len(), 1);
+        assert!(occurrences[0].duration <= project.bpm as f32 / 120.0 + 0.000_01);
     }
 
     fn sample_difference(left: &[f32], right: &[f32]) -> f32 {

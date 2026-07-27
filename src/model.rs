@@ -878,15 +878,15 @@ impl Action {
             Self::Gain { .. }
             | Self::Mute { .. }
             | Self::Automation { .. }
-            | Self::Effect { .. }
-            | Self::RemoveEffect { .. }
-            | Self::Filter { .. }
             | Self::Rhythm { .. } => true,
             Self::MidiClip { .. }
             | Self::AddTrack { .. }
             | Self::Instrument { .. }
             | Self::Modulator { .. }
             | Self::Configure { .. }
+            | Self::Effect { .. }
+            | Self::RemoveEffect { .. }
+            | Self::Filter { .. }
             | Self::Tempo { .. } => false,
         }
     }
@@ -1561,13 +1561,9 @@ impl Studio {
                 Ok(())
             }
             Action::Rhythm { amount, target } => {
-                let tracks = matching_action_tracks(&mut self.project, *target)?;
-                for track in tracks {
-                    for event in track.clips.iter_mut().flat_map(|clip| &mut clip.events) {
-                        event.velocity = (event.velocity * (1.0 + amount)).clamp(0.01, 1.0);
-                    }
-                }
-                Ok(())
+                self.transform_midi_region(*target, start, end, |event| {
+                    event.velocity = (event.velocity * (1.0 + amount)).clamp(0.01, 1.0);
+                })
             }
         }
     }
