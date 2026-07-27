@@ -314,10 +314,7 @@ fn parse_effect(
             Some(Ok(parameter.to_owned()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let extra_parameters = serialized_parameters
-        .into_iter()
-        .filter(|(parameter, _)| parameter_overrides.contains(parameter))
-        .collect();
+    let extra_parameters = serialized_parameters;
     let preset_slot = effect
         .contains_key("presetSlot")
         .then(|| {
@@ -358,9 +355,10 @@ fn parse_effect(
         }
     }
     for parameter in &parsed.tempo_sync_parameters {
-        if !semantics
-            .get(parameter)
-            .is_some_and(|semantics| semantics.tempo_sync)
+        if (parsed.preset_slot.is_none() || parsed.parameter_overrides.contains(parameter))
+            && !semantics
+                .get(parameter)
+                .is_some_and(|semantics| semantics.tempo_sync)
         {
             return Err(invalid(format!(
                 "effect parameter {parameter} cannot use tempo sync"
@@ -368,9 +366,10 @@ fn parse_effect(
         }
     }
     for parameter in &parsed.deactivated_parameters {
-        if !semantics
-            .get(parameter)
-            .is_some_and(|semantics| semantics.can_deactivate)
+        if (parsed.preset_slot.is_none() || parsed.parameter_overrides.contains(parameter))
+            && !semantics
+                .get(parameter)
+                .is_some_and(|semantics| semantics.can_deactivate)
         {
             return Err(invalid(format!(
                 "effect parameter {parameter} cannot be deactivated"
@@ -697,7 +696,12 @@ fn parse_clip_event(
         id,
         kind,
         time,
-        duration: range(event, "duration", MIN_MIDI_NOTE_BEATS, loop_beats)?,
+        duration: range(
+            event,
+            "duration",
+            MIN_MIDI_NOTE_BEATS,
+            loop_beats.min(crate::model::MAX_MIDI_NOTE_DURATION_BEATS),
+        )?,
         pitch: bounded_integer(event, "pitch", 0, 127)? as u8,
         velocity: range(event, "velocity", 0.01, 1.0)?,
     })
@@ -1053,7 +1057,12 @@ fn parse_midi_note(value: &JsonValue, loop_beats: f32) -> Result<MidiNote, Proje
     }
     Ok(MidiNote {
         time,
-        duration: range(event, "duration", MIN_MIDI_NOTE_BEATS, loop_beats)?,
+        duration: range(
+            event,
+            "duration",
+            MIN_MIDI_NOTE_BEATS,
+            loop_beats.min(crate::model::MAX_MIDI_NOTE_DURATION_BEATS),
+        )?,
         pitch: bounded_integer(event, "pitch", 0, 127)? as u8,
         velocity: range(event, "velocity", 0.01, 1.0)?,
     })
@@ -1396,6 +1405,36 @@ mod tests {
         let original = Project::demo();
         let parsed = parse_project(&original.to_json()).expect("valid demo graph");
         assert_eq!(parsed.to_json(), original.to_json());
+    }
+
+    #[test]
+    fn round_trip_preserves_published_native_effect_defaults() {
+        let mut studio = crate::model::Studio::from_project(Project::demo());
+        let effect_id = studio
+            .create_effect(2, "Reverb 2", 0.5)
+            .expect("native effect");
+        let before = studio.project().tracks[1]
+            .effects
+            .iter()
+            .find(|effect| effect.id == effect_id)
+            .expect("created effect");
+        assert!(!before.parameters.is_empty());
+        assert!(before.parameter_overrides.is_empty());
+
+        let reopened = parse_project(&studio.to_json()).expect("reopened project");
+        let after = reopened.tracks[1]
+            .effects
+            .iter()
+            .find(|effect| effect.id == effect_id)
+            .expect("reopened effect");
+        assert_eq!(
+            after.parameters.keys().collect::<Vec<_>>(),
+            before.parameters.keys().collect::<Vec<_>>()
+        );
+        assert!(after.parameters.iter().all(|(parameter, value)| {
+            (value - before.parameters[parameter]).abs() < 0.000_001
+        }));
+        assert!(after.parameter_overrides.is_empty());
     }
 
     #[test]

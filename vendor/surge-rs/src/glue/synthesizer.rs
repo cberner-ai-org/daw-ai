@@ -441,6 +441,17 @@ impl SurgeSynthesizer {
         }
     }
 
+    pub fn set_lfo_phase(&mut self, scene: i32, lfo: i32, phase: f32) -> bool {
+        unsafe {
+            surge_bridge::surge_set_lfo_phase(
+                self.ptr,
+                scene,
+                lfo,
+                phase.rem_euclid(1.0),
+            )
+        }
+    }
+
     pub fn apply_parameter_monophonic_modulation(&mut self, arg1: &Parameter, depth: f32) {
         unsafe { (*self.ptr).applyParameterMonophonicModulation(arg1.ptr, depth); }
     }

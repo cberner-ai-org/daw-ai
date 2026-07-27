@@ -14,6 +14,7 @@ pub(crate) const MAX_MIDI_EVENTS_PER_CLIP: usize = 1_024;
 pub(crate) const MIN_MIDI_NOTE_BEATS: f32 = 0.0625;
 pub(crate) const MAX_LOOP_PLAYBACK_BEATS: f32 = 16.0;
 pub(crate) const MAX_ONCE_PLAYBACK_BEATS: f32 = 256.0;
+pub(crate) const MAX_MIDI_NOTE_DURATION_BEATS: f32 = 16.0;
 pub(crate) const SURGE_ENGINE: &str = "Surge XT";
 pub(crate) const SURGE_PRESETS: &[&str] = &["Init"];
 pub(crate) const TRACK_COLOR_PALETTE: &[&str] = &[
@@ -1525,19 +1526,79 @@ impl Studio {
                 }
                 Ok(())
             }
-            Action::Effect { target, .. }
-            | Action::RemoveEffect { target, .. }
-            | Action::Filter { target, .. }
-            | Action::Rhythm { target, .. } => {
-                if target.is_some_and(|target| {
-                    !self.project.tracks.iter().any(|track| track.role == target)
-                }) {
-                    Err(StudioError::UnknownTrack)
-                } else {
-                    Ok(())
+            Action::Effect { name, mix, target } => {
+                let track_ids = matching_action_track_ids(&self.project, *target)?;
+                for track_id in track_ids {
+                    self.add_effect_to_candidate(track_id, name, *mix)?;
                 }
+                Ok(())
+            }
+            Action::RemoveEffect { name, target } => {
+                let tracks = matching_action_tracks(&mut self.project, *target)?;
+                for track in tracks {
+                    let removed = track
+                        .effects
+                        .iter()
+                        .filter(|effect| *name == "Effects" || effect.name == *name)
+                        .map(|effect| effect.id)
+                        .collect::<std::collections::HashSet<_>>();
+                    track.effects.retain(|effect| !removed.contains(&effect.id));
+                    track
+                        .routing
+                        .effect_order
+                        .retain(|effect_id| !removed.contains(effect_id));
+                }
+                Ok(())
+            }
+            Action::Filter { amount, target } => {
+                let track_ids = matching_action_track_ids(&self.project, *target)?;
+                for track_id in track_ids {
+                    self.add_effect_to_candidate(track_id, "EQ", amount.abs().clamp(0.1, 1.0))?;
+                }
+                Ok(())
+            }
+            Action::Rhythm { amount, target } => {
+                let tracks = matching_action_tracks(&mut self.project, *target)?;
+                for track in tracks {
+                    for event in track.clips.iter_mut().flat_map(|clip| &mut clip.events) {
+                        event.velocity = (event.velocity * (1.0 + amount)).clamp(0.01, 1.0);
+                    }
+                }
+                Ok(())
             }
         }
+    }
+
+    fn add_effect_to_candidate(
+        &mut self,
+        track_id: u64,
+        name: &str,
+        mix: f32,
+    ) -> Result<(), StudioError> {
+        if crate::surge::effect_type_index(name).is_none()
+            || !mix.is_finite()
+            || !(0.0..=1.0).contains(&mix)
+        {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let track_index = self
+            .project
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        if !track_effects_fit_with_added_effect(&self.project.tracks[track_index]) {
+            return Err(StudioError::EffectCapacity);
+        }
+        let id = self.take_id();
+        self.project.tracks[track_index]
+            .effects
+            .push(effect(id, name, mix));
+        self.project.tracks[track_index]
+            .routing
+            .effect_order
+            .push(id);
+        Ok(())
     }
 
     pub fn set_mix(
@@ -2178,7 +2239,8 @@ impl Studio {
                 !note.time.is_finite()
                     || !(0.0..loop_beats).contains(&note.time)
                     || !note.duration.is_finite()
-                    || !(MIN_MIDI_NOTE_BEATS..=loop_beats).contains(&note.duration)
+                    || !(MIN_MIDI_NOTE_BEATS..=loop_beats.min(MAX_MIDI_NOTE_DURATION_BEATS))
+                        .contains(&note.duration)
                     || !note.velocity.is_finite()
                     || !(0.01..=1.0).contains(&note.velocity)
             })
@@ -2549,7 +2611,11 @@ fn configure_track_tool(
             match parameter {
                 "time" => event.time = parse_range_exclusive(value, 0.0, clip.loop_beats)?,
                 "duration" => {
-                    event.duration = parse_range(value, MIN_MIDI_NOTE_BEATS, clip.loop_beats)?
+                    event.duration = parse_range(
+                        value,
+                        MIN_MIDI_NOTE_BEATS,
+                        clip.loop_beats.min(MAX_MIDI_NOTE_DURATION_BEATS),
+                    )?
                 }
                 "pitch" => event.pitch = parse_integer_range(value, 0, 127)? as u8,
                 "velocity" => event.velocity = parse_range(value, 0.01, 1.0)?,
@@ -2632,7 +2698,8 @@ fn validate_clip_fields(
             !note.time.is_finite()
                 || !(0.0..loop_beats).contains(&note.time)
                 || !note.duration.is_finite()
-                || !(MIN_MIDI_NOTE_BEATS..=loop_beats).contains(&note.duration)
+                || !(MIN_MIDI_NOTE_BEATS..=loop_beats.min(MAX_MIDI_NOTE_DURATION_BEATS))
+                    .contains(&note.duration)
                 || !note.velocity.is_finite()
                 || !(0.01..=1.0).contains(&note.velocity)
         })
@@ -2887,6 +2954,23 @@ fn matching_action_tracks(
         .iter_mut()
         .filter(|track| target.is_none_or(|role| track.role == role))
         .collect())
+}
+
+fn matching_action_track_ids(
+    project: &Project,
+    target: Option<TrackRole>,
+) -> Result<Vec<u64>, StudioError> {
+    let ids = project
+        .tracks
+        .iter()
+        .filter(|track| target.is_none_or(|role| track.role == role))
+        .map(|track| track.id)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        Err(StudioError::UnknownTrack)
+    } else {
+        Ok(ids)
+    }
 }
 
 fn demo_track(id: u64, role: TrackRole, name: &str, color: &str) -> Track {
@@ -4864,6 +4948,46 @@ mod tests {
         let effect = effect(1, "Reverb 2", 0.5);
         assert!(!effect.parameters.is_empty());
         assert!(effect.parameters.keys().all(|parameter| parameter != "mix"));
+    }
+
+    #[test]
+    fn demo_effect_tone_removal_and_rhythm_plans_update_the_graph() {
+        let mut studio = Studio::from_project(Project::demo());
+        studio
+            .apply_prompt(0.0, 2.0, "add reverb to the bass")
+            .expect("demo reverb plan");
+        assert!(
+            studio.project().tracks[1]
+                .effects
+                .iter()
+                .any(|effect| effect.name == "Reverb 2")
+        );
+
+        studio
+            .apply_prompt(0.0, 2.0, "make the bass brighter")
+            .expect("demo tone plan");
+        assert!(
+            studio.project().tracks[1]
+                .effects
+                .iter()
+                .any(|effect| effect.name == "EQ")
+        );
+
+        let velocity = studio.project().tracks[1].clips[0].events[0].velocity;
+        studio
+            .apply_prompt(0.0, 2.0, "make the bass busier")
+            .expect("demo rhythm plan");
+        assert!(studio.project().tracks[1].clips[0].events[0].velocity > velocity);
+
+        studio
+            .apply_prompt(0.0, 2.0, "remove reverb from the bass")
+            .expect("demo effect removal plan");
+        assert!(
+            studio.project().tracks[1]
+                .effects
+                .iter()
+                .all(|effect| effect.name != "Reverb 2")
+        );
     }
 
     #[test]

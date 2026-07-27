@@ -479,6 +479,7 @@ fn render_track(
         SAMPLE_RATE as f32,
     )?;
     engine.set_tempo(f64::from(project.bpm));
+    engine.set_free_modulator_phases(&track.modulators, start, f64::from(project.bpm))?;
     let mut event_index = midi.partition_point(|event| event.sample < start_sample);
     let frame_count = output.len().div_euclid(CHANNEL_COUNT);
     let mut output_frame = 0;
@@ -1228,6 +1229,42 @@ mod tests {
         assert!(
             audible_difference < 0.04,
             "overlap mean difference {audible_difference} exceeded the native modulation tolerance"
+        );
+    }
+
+    #[test]
+    fn free_modulator_phase_is_continuous_across_independent_chunks() {
+        let mut project = Project::demo();
+        let track = &mut project.tracks[1];
+        let target = crate::surge::instrument_parameters_for_instrument(&track.instrument)
+            .into_iter()
+            .find(|parameter| parameter.scene_modulatable)
+            .map(|parameter| format!("native:{}", parameter.id))
+            .expect("scene-modulatable parameter");
+        track.modulators.push(crate::model::Modulator {
+            id: 9_900,
+            name: "Chunk phase".to_owned(),
+            shape: "sine".to_owned(),
+            rate: 0.37,
+            rate_mode: "hz".to_owned(),
+            trigger: "free".to_owned(),
+            source_track_id: None,
+            attack_ms: 0.0,
+            release_ms: 10.0,
+            threshold: 0.0,
+            polarity: "increase".to_owned(),
+            formula: String::new(),
+            depth: 0.8,
+            target,
+            enabled: true,
+        });
+        let track_id = track.id;
+        let continuous = render_region(&project, &[track_id], 0.0, 4.0).expect("continuous");
+        let second = render_region(&project, &[track_id], 2.0, 4.0).expect("second chunk");
+        let offset = 2 * SAMPLE_RATE as usize * CHANNEL_COUNT;
+        assert!(
+            sample_difference(&continuous.samples[offset..], &second.samples) < 0.000_01,
+            "free-running Surge LFO changed phase at the chunk boundary"
         );
     }
 

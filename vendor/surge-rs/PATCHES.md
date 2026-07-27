@@ -8,3 +8,4 @@ the patched bridge, including Surge XT's native modulation-target validation.
 Parameter writes use the bridge's headless-state safety check.
 The wrapper also exposes restoration of native tempo-sync and deactivation
 flags for preset effect parameters.
+It also exposes the native LFO start phase for project-time-aligned streaming.

@@ -13,9 +13,9 @@ use crate::audio_analysis::{self, MAX_REGION_SECONDS};
 #[cfg(test)]
 use crate::model::TrackRole;
 use crate::model::{
-    MAX_LOOP_PLAYBACK_BEATS, MAX_MIDI_EVENTS_PER_CLIP, MAX_ONCE_PLAYBACK_BEATS,
-    MIN_MIDI_NOTE_BEATS, MidiClipSpec, ModulatorSpec, PROJECT_SCHEMA_VERSION, Project, Studio,
-    StudioError, TRACK_COLOR_PALETTE, json_string,
+    MAX_LOOP_PLAYBACK_BEATS, MAX_MIDI_EVENTS_PER_CLIP, MAX_MIDI_NOTE_DURATION_BEATS,
+    MAX_ONCE_PLAYBACK_BEATS, MIN_MIDI_NOTE_BEATS, MidiClipSpec, ModulatorSpec,
+    PROJECT_SCHEMA_VERSION, Project, Studio, StudioError, TRACK_COLOR_PALETTE, json_string,
 };
 use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
 use crate::storage::{ProjectStore, replace_text_file};
@@ -457,7 +457,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "type":"array","maxItems":MAX_MIDI_EVENTS_PER_CLIP,"items":{"type":"object","properties":{
                 "time":{"type":"number","minimum":0,"maximum":256,"description":"Beat offset from the clip start. Differences between event times determine retrigger speed and may be smaller than note duration."},
-                "duration":{"type":"number","minimum":MIN_MIDI_NOTE_BEATS,"maximum":256,"description":"MIDI gate length in beats, independent of spacing between event times. 0.0625 beats is a 1/64 note."},
+                "duration":{"type":"number","minimum":MIN_MIDI_NOTE_BEATS,"maximum":MAX_MIDI_NOTE_DURATION_BEATS,"description":"MIDI gate length in beats, independent of spacing between event times. Gates may span up to 16 beats; 0.0625 beats is a 1/64 note."},
                 "pitch":{"type":"integer","minimum":0,"maximum":127},
                 "velocity":{"type":"number","minimum":0.01,"maximum":1}
             },"required":["time","duration","pitch","velocity"],"additionalProperties":false}
@@ -1929,9 +1929,10 @@ fn clip_arguments(
                 "events[{index}].time must be at least 0 and before the {loop_beats}-beat playback length"
             ));
         }
-        if !(MIN_MIDI_NOTE_BEATS..=loop_beats).contains(&note.duration) {
+        let maximum_note_beats = loop_beats.min(crate::model::MAX_MIDI_NOTE_DURATION_BEATS);
+        if !(MIN_MIDI_NOTE_BEATS..=maximum_note_beats).contains(&note.duration) {
             return Err(format!(
-                "events[{index}].duration must be between {MIN_MIDI_NOTE_BEATS} and {loop_beats} beats"
+                "events[{index}].duration must be between {MIN_MIDI_NOTE_BEATS} and {maximum_note_beats} beats"
             ));
         }
         if !(0.01..=1.0).contains(&note.velocity) {
@@ -2742,6 +2743,10 @@ mod tests {
         assert_eq!(
             midi["parameters"]["properties"]["events"]["items"]["properties"]["duration"]["minimum"],
             MIN_MIDI_NOTE_BEATS
+        );
+        assert_eq!(
+            midi["parameters"]["properties"]["events"]["items"]["properties"]["duration"]["maximum"],
+            MAX_MIDI_NOTE_DURATION_BEATS
         );
         let new_track = declarations
             .iter()

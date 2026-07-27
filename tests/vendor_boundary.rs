@@ -55,6 +55,7 @@ fn vendored_surge_boundary_keeps_pins_and_patched_api() {
         "pub fn is_valid_modulation",
         "pub fn set_parameter_temposync",
         "pub fn set_parameter_deactivated",
+        "pub fn set_lfo_phase",
     ] {
         assert!(binding.contains(patched_api));
     }
