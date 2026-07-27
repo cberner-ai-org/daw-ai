@@ -1,7 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -18,7 +16,7 @@ use crate::model::{
     PROJECT_SCHEMA_VERSION, Project, Studio, StudioError, TRACK_COLOR_PALETTE, json_string,
 };
 use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
-use crate::storage::{ProjectStore, replace_text_file};
+use crate::storage::{ProjectStore, read_bounded_text, replace_text_file};
 
 pub(crate) const READ_TOOL_NAME: &str = "read_sound_graph";
 pub(crate) const AUDIO_TOOL_NAME: &str = "render_audio_region";
@@ -90,29 +88,6 @@ const DEFAULT_SESSION_RETENTION_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SESSION_JSON_BYTES: u64 = 64 * 1024;
 const MAX_PROGRESS_PLAN_BYTES: u64 = 64 * 1024;
 const MAX_SOUND_GRAPH_BYTES: u64 = 4 * 1024 * 1024;
-
-fn read_text_nofollow(path: &Path, maximum_bytes: u64) -> io::Result<String> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "metadata is not a regular file",
-        ));
-    }
-    let mut source = String::new();
-    file.take(maximum_bytes + 1).read_to_string(&mut source)?;
-    if source.len() as u64 > maximum_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "metadata exceeds its size limit",
-        ));
-    }
-    Ok(source)
-}
 
 #[derive(Clone, Copy)]
 struct SessionRetention {
@@ -271,7 +246,11 @@ impl EditSession {
     }
 
     pub(crate) fn metadata_source(&self) -> io::Result<String> {
-        read_text_nofollow(&self.path.join(SESSION_FILE), 64 * 1024)
+        read_bounded_text(
+            &self.path.join(SESSION_FILE),
+            MAX_SESSION_JSON_BYTES,
+            "Gemini session metadata",
+        )
     }
 
     pub(crate) fn stats(&self) -> io::Result<(usize, usize)> {
@@ -300,8 +279,12 @@ impl EditSession {
             return Err("Gemini did not use a registered graph mutation tool".to_owned());
         }
         let action = bounded_compound(actions);
-        let graph = read_text_nofollow(&self.path.join(GRAPH_FILE), MAX_SOUND_GRAPH_BYTES)
-            .map_err(|error| format!("could not read Gemini sound graph: {error}"))?;
+        let graph = read_bounded_text(
+            &self.path.join(GRAPH_FILE),
+            MAX_SOUND_GRAPH_BYTES,
+            "Gemini sound graph",
+        )
+        .map_err(|error| format!("could not read Gemini sound graph: {error}"))?;
         let project = Project::from_json(&graph)
             .map_err(|error| format!("Gemini left an invalid sound graph: {error}"))?;
         Ok((
@@ -325,12 +308,18 @@ impl EditSession {
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err("Gemini edit progress handoff is not a regular directory".to_owned());
         }
-        let plan_source =
-            read_text_nofollow(&path.join(PROGRESS_PLAN_FILE), MAX_PROGRESS_PLAN_BYTES)
-                .map_err(|error| format!("could not read Gemini edit plan progress: {error}"))?;
-        let graph_source =
-            read_text_nofollow(&path.join(PROGRESS_GRAPH_FILE), MAX_SOUND_GRAPH_BYTES)
-                .map_err(|error| format!("could not read Gemini sound graph progress: {error}"))?;
+        let plan_source = read_bounded_text(
+            &path.join(PROGRESS_PLAN_FILE),
+            MAX_PROGRESS_PLAN_BYTES,
+            "Gemini edit plan progress",
+        )
+        .map_err(|error| format!("could not read Gemini edit plan progress: {error}"))?;
+        let graph_source = read_bounded_text(
+            &path.join(PROGRESS_GRAPH_FILE),
+            MAX_SOUND_GRAPH_BYTES,
+            "Gemini sound graph progress",
+        )
+        .map_err(|error| format!("could not read Gemini sound graph progress: {error}"))?;
         let plan = if let Some(summary) = serde_json::from_str::<JsonValue>(&plan_source)
             .ok()
             .filter(|value| value.get("graphMutation") == Some(&JsonValue::Bool(true)))
@@ -1801,8 +1790,12 @@ fn mutation_display(
 }
 
 fn edit_selection(session_path: &Path) -> Result<(f32, f32), String> {
-    let source = fs::read_to_string(session_path.join(REQUEST_FILE))
-        .map_err(|error| format!("could not read edit request: {error}"))?;
+    let source = read_bounded_text(
+        &session_path.join(REQUEST_FILE),
+        MAX_SESSION_JSON_BYTES,
+        "Gemini edit request",
+    )
+    .map_err(|error| format!("could not read edit request: {error}"))?;
     let request: JsonValue = serde_json::from_str(&source)
         .map_err(|error| format!("edit request was invalid: {error}"))?;
     let start = request
@@ -2011,13 +2004,14 @@ fn undo_agent_mutation(
     current: &Project,
 ) -> Result<String, String> {
     let undo_path = session_path.join(UNDO_GRAPH_FILE);
-    let source = fs::read_to_string(&undo_path).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            "nothing to undo in this edit session".to_owned()
-        } else {
-            format!("could not read undo snapshot: {error}")
-        }
-    })?;
+    let source = read_bounded_text(&undo_path, MAX_SOUND_GRAPH_BYTES, "Gemini undo snapshot")
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                "nothing to undo in this edit session".to_owned()
+            } else {
+                format!("could not read undo snapshot: {error}")
+            }
+        })?;
     let mut restored = Project::from_json(&source)
         .map_err(|error| format!("undo snapshot is invalid: {error}"))?;
     restored.version = current.version.saturating_add(1);
@@ -2209,8 +2203,12 @@ fn region_measurements(region: &audio_analysis::AudioRegion) -> JsonValue {
 }
 
 fn current_project(session_path: &Path) -> Result<Project, String> {
-    let source = fs::read_to_string(session_path.join(GRAPH_FILE))
-        .map_err(|error| format!("could not read sound-graph.json: {error}"))?;
+    let source = read_bounded_text(
+        &session_path.join(GRAPH_FILE),
+        MAX_SOUND_GRAPH_BYTES,
+        "Gemini sound graph",
+    )
+    .map_err(|error| format!("could not read sound-graph.json: {error}"))?;
     Project::from_json(&source).map_err(|error| format!("sound-graph.json is invalid: {error}"))
 }
 
@@ -2489,7 +2487,9 @@ pub(crate) fn session_summaries_in(root: &Path) -> io::Result<Vec<JsonValue>> {
         if !path.is_file() {
             continue;
         }
-        let Ok(source) = read_text_nofollow(&path, MAX_SESSION_JSON_BYTES) else {
+        let Ok(source) =
+            read_bounded_text(&path, MAX_SESSION_JSON_BYTES, "Gemini session metadata")
+        else {
             continue;
         };
         let Ok(value) = serde_json::from_str::<JsonValue>(&source) else {
@@ -2533,11 +2533,14 @@ fn apply_session_retention_with(root: &Path, policy: SessionRetention) -> io::Re
             continue;
         }
         let metadata_path = entry.path().join(SESSION_FILE);
-        let Some(metadata) = read_text_nofollow(&metadata_path, MAX_SESSION_JSON_BYTES)
-            .ok()
-            .and_then(|source| serde_json::from_str::<JsonValue>(&source).ok())
-            .filter(|metadata| valid_session_metadata(&entry.path(), metadata))
-        else {
+        let Some(metadata) = read_bounded_text(
+            &metadata_path,
+            MAX_SESSION_JSON_BYTES,
+            "Gemini session metadata",
+        )
+        .ok()
+        .and_then(|source| serde_json::from_str::<JsonValue>(&source).ok())
+        .filter(|metadata| valid_session_metadata(&entry.path(), metadata)) else {
             continue;
         };
         let running = metadata.get("status").and_then(JsonValue::as_str) == Some("running");

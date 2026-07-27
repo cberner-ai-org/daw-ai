@@ -9,7 +9,7 @@ use crate::model::{Project, Studio};
 
 pub(crate) const PROJECT_PATH_ENV: &str = "DAW_AI_PROJECT_PATH";
 pub(crate) const MAX_PROJECT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_PROJECT_DOCUMENT_BYTES: u64 = 20 * 1024 * 1024;
+pub(crate) const MAX_PROJECT_DOCUMENT_BYTES: u64 = 20 * 1024 * 1024;
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
@@ -57,24 +57,11 @@ impl ProjectStore {
     }
 
     pub(crate) fn read_source(&self) -> io::Result<String> {
-        let file = OpenOptions::new().read(true).open(&self.path)?;
-        let metadata = file.metadata()?;
-        if metadata.len() > MAX_PROJECT_DOCUMENT_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("sound graph document exceeds the {MAX_PROJECT_DOCUMENT_BYTES}-byte limit"),
-            ));
-        }
-        let mut source = String::with_capacity(metadata.len() as usize);
-        file.take(MAX_PROJECT_DOCUMENT_BYTES + 1)
-            .read_to_string(&mut source)?;
-        if source.len() as u64 > MAX_PROJECT_DOCUMENT_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("sound graph document exceeds the {MAX_PROJECT_DOCUMENT_BYTES}-byte limit"),
-            ));
-        }
-        Ok(source)
+        read_bounded_text(
+            &self.path,
+            MAX_PROJECT_DOCUMENT_BYTES,
+            "sound graph document",
+        )
     }
 
     pub(crate) fn save(&self, project: &Project) -> io::Result<()> {
@@ -103,6 +90,40 @@ impl ProjectStore {
         }
         replace_text_file(&self.path, source)
     }
+}
+
+pub(crate) fn read_bounded_text(
+    path: &Path,
+    maximum_bytes: u64,
+    description: &str,
+) -> io::Result<String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} is not a regular file"),
+        ));
+    }
+    if metadata.len() > maximum_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} exceeds the {maximum_bytes}-byte limit"),
+        ));
+    }
+    let mut source = String::with_capacity(metadata.len() as usize);
+    file.take(maximum_bytes + 1).read_to_string(&mut source)?;
+    if source.len() as u64 > maximum_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} exceeds the {maximum_bytes}-byte limit"),
+        ));
+    }
+    Ok(source)
 }
 
 pub(crate) fn replace_text_file(path: &Path, source: &str) -> io::Result<()> {
@@ -226,6 +247,34 @@ mod tests {
                 .contains("\"preset\":\"Factory/Leads/Classic Lead 1\"")
         );
         fs::remove_file(path).expect("remove test graph");
+    }
+
+    #[test]
+    fn bounded_text_reads_regular_files_and_rejects_oversized_content() {
+        let path = temporary_project_path("bounded-read");
+        fs::write(&path, "small").expect("write bounded source");
+        assert_eq!(
+            read_bounded_text(&path, 5, "test document").expect("bounded read"),
+            "small"
+        );
+        let error = read_bounded_text(&path, 4, "test document").expect_err("oversized read");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("4-byte limit"));
+        fs::remove_file(path).expect("remove bounded source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_text_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let target = temporary_project_path("bounded-target");
+        let link = temporary_project_path("bounded-link");
+        fs::write(&target, "source").expect("write symlink target");
+        symlink(&target, &link).expect("create symlink");
+        assert!(read_bounded_text(&link, 64, "test document").is_err());
+        fs::remove_file(link).expect("remove symlink");
+        fs::remove_file(target).expect("remove symlink target");
     }
 
     #[test]

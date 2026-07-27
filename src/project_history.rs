@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -5,7 +6,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::model::{Project, Studio};
-use crate::storage::{ProjectStore, quarantine_invalid_file};
+use crate::storage::{
+    MAX_PROJECT_DOCUMENT_BYTES, ProjectStore, quarantine_invalid_file, read_bounded_text,
+};
 
 pub(crate) const MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HISTORY_SNAPSHOTS: usize = 128;
@@ -36,7 +39,7 @@ impl ProjectHistory {
 }
 
 pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result<ProjectHistory> {
-    let source = fs::read_to_string(path)?;
+    let source = read_bounded_text(path, MAX_PROJECT_DOCUMENT_BYTES, "project history")?;
     let value: serde_json::Value = serde_json::from_str(&source)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let Some(history) = value.get("history") else {
