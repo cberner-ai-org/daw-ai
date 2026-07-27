@@ -291,6 +291,7 @@ fn request_needs_user_scope(request: &Request) -> bool {
             | "/api/channels"
             | "/api/mix"
             | "/api/duration"
+            | "/api/spectrum"
             | "/api/sound-tools"
             | "/api/undo"
             | "/api/reset"
@@ -415,7 +416,6 @@ struct EditRequest {
     end: f32,
     project: crate::model::Project,
     reference_audio: Option<crate::gemini::ReferenceAudio>,
-    include_audio_metrics: bool,
 }
 
 struct EditFailure {
@@ -991,6 +991,7 @@ impl Router {
             ("POST", "/api/channels") => self.change_channel(&request.body),
             ("POST", "/api/mix") => self.change_mix(&request.body),
             ("POST", "/api/duration") => self.change_duration(&request.body),
+            ("POST", "/api/spectrum") => self.spectrum(&request.body),
             ("POST", "/api/sound-tools") => self.change_sound_tool(&request.body),
             ("POST", "/api/logs") => Self::client_log(&request.body),
             ("POST", "/api/undo") => self.undo(),
@@ -998,8 +999,8 @@ impl Router {
             ("POST", "/api/history") => self.select_history(&request.body),
             (
                 _,
-                "/api/edits" | "/api/channels" | "/api/mix" | "/api/duration" | "/api/sound-tools"
-                | "/api/logs" | "/api/undo" | "/api/reset",
+                "/api/edits" | "/api/channels" | "/api/mix" | "/api/duration" | "/api/spectrum"
+                | "/api/sound-tools" | "/api/logs" | "/api/undo" | "/api/reset",
             ) => Response::json(405, error_json("method not allowed")).with_header("Allow", "POST"),
             (_, "/api/project" | "/api/health" | "/api/gemini-sessions") => {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
@@ -1037,7 +1038,6 @@ impl Router {
             Ok(audio) => audio,
             Err(message) => return Response::json(422, error_json(message)),
         };
-        let include_audio_metrics = include_audio_metrics(&form);
         let project = {
             let studio = self.lock_studio();
             if let Err(error) = studio.validate_edit(start, end, prompt) {
@@ -1078,7 +1078,6 @@ impl Router {
             end,
             project,
             reference_audio,
-            include_audio_metrics,
         };
         let worker = self.clone();
         let spawn = thread::Builder::new()
@@ -1416,7 +1415,6 @@ impl Router {
             edit.end,
             &edit.project,
             edit.reference_audio.clone(),
-            edit.include_audio_metrics,
             cancellation,
             |request| {
                 self.edit_jobs.set_running(
@@ -1424,7 +1422,7 @@ impl Router {
                     "rendering",
                     "Rendering the current sound graph with the Rust audio engine",
                 );
-                let result = render_audio_for_edit(request, edit.include_audio_metrics);
+                let result = render_audio_request(request);
                 self.edit_jobs.set_running(
                     job_id,
                     "planning",
@@ -1560,6 +1558,46 @@ impl Router {
                 Err(response) => response,
             },
             Err(error) => Response::json(422, studio_error(error)),
+        }
+    }
+
+    fn spectrum(&self, body: &str) -> Response {
+        let form = parse_form(body);
+        let Some(start) = form
+            .get("start")
+            .and_then(|value| value.parse::<f32>().ok())
+        else {
+            return Response::json(422, error_json("spectrum start is required"));
+        };
+        let project = self.lock_studio().project().clone();
+        let start = start.clamp(0.0, project.duration);
+        let end = (start + 0.125).min(project.duration);
+        if end <= start {
+            return Response::json(200, "{\"tracks\":[]}".to_owned());
+        }
+        let track_ids = project
+            .tracks
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>();
+        match audio_analysis::render_region_with_tracks(&project, &track_ids, start, end) {
+            Ok(regions) => {
+                let tracks = regions
+                    .tracks
+                    .iter()
+                    .map(|(id, region)| {
+                        let levels = audio_analysis::spectrum_levels(region)
+                            .iter()
+                            .map(|level| format!("{level:.4}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("{{\"trackId\":{id},\"levels\":[{levels}]}}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Response::json(200, format!("{{\"tracks\":[{tracks}]}}"))
+            }
+            Err(error) => Response::json(422, error_json(&error)),
         }
     }
 
@@ -2058,22 +2096,6 @@ impl Router {
     }
 }
 
-fn include_audio_metrics(form: &HashMap<String, String>) -> bool {
-    form.get("include_audio_metrics")
-        .is_none_or(|value| value != "false")
-}
-
-fn render_audio_for_edit(
-    request: crate::gemini_tools::AudioRenderRequest,
-    include_metrics: bool,
-) -> Result<crate::gemini_tools::AudioRender, String> {
-    render_audio_request(request).map(|mut audio| {
-        if !include_metrics {
-            audio.measurements = serde_json::Value::Null;
-        }
-        audio
-    })
-}
 fn new_operation_id(id: u64) -> String {
     let mut random = [0_u8; 16];
     if File::open("/dev/urandom")
@@ -2585,6 +2607,20 @@ mod tests {
     }
 
     #[test]
+    fn serves_backend_track_spectrum_levels() {
+        let response = Router::demo().handle(&request("POST", "/api/spectrum", "start=0"));
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body).expect("spectrum JSON");
+        let tracks = body["tracks"].as_array().expect("spectrum tracks");
+        assert_eq!(tracks.len(), Project::demo().tracks.len());
+        assert!(tracks.iter().all(|track| {
+            track["levels"]
+                .as_array()
+                .is_some_and(|levels| levels.len() == 8)
+        }));
+    }
+
+    #[test]
     fn changes_project_duration_with_server_side_bounds() {
         let router = Router::demo();
         let changed = router.handle(&request("POST", "/api/duration", "duration=300"));
@@ -2605,30 +2641,6 @@ mod tests {
                 .status,
             422
         );
-    }
-
-    #[test]
-    fn metrics_opt_out_keeps_audio_on_every_gemini_render() {
-        let disabled = parse_form("include_audio_metrics=false");
-        assert!(!include_audio_metrics(&disabled));
-        assert!(include_audio_metrics(&parse_form("")));
-
-        for start in [0.0, 0.1] {
-            let rendered = render_audio_for_edit(
-                crate::gemini_tools::AudioRenderRequest {
-                    project: Project::demo(),
-                    track_ids: vec![2],
-                    start,
-                    end: start + 0.1,
-                    description: "Test render".to_owned(),
-                },
-                include_audio_metrics(&disabled),
-            )
-            .expect("Gemini audio render");
-            assert!(rendered.measurements.is_null());
-            assert!(rendered.wav.starts_with(b"RIFF"));
-            assert!(rendered.wav.len() > 44);
-        }
     }
 
     #[test]
@@ -2886,7 +2898,6 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
-            include_audio_metrics: true,
         };
         let plan = |preset: &str, summary: &str| EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3024,7 +3035,6 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
-            include_audio_metrics: true,
         };
         let first_plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3157,7 +3167,6 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
-            include_audio_metrics: true,
         };
         let plan = EditPlan {
             action: crate::prompt::Action::Configure {

@@ -781,36 +781,16 @@ async function run() {
     );
     await evaluate(cdp, appSession, "document.querySelector('#debug-button').click()");
     assert.equal(
-      await evaluate(cdp, appSession, "document.querySelector('#audio-metrics-toggle').checked"),
-      true,
-      "audio metrics must default to enabled",
+      await evaluate(cdp, appSession, "document.querySelectorAll('.track-spectrum i').length"),
+      24,
+      "each demo track must have an eight-band spectrum analyzer",
     );
-    await evaluate(cdp, appSession, `(() => {
-      const toggle = document.querySelector('#audio-metrics-toggle');
-      toggle.checked = false;
-      toggle.dispatchEvent(new Event('change', { bubbles: true }));
-    })()`);
     assert.equal(
-      await evaluate(cdp, appSession, "localStorage.getItem('daw-ai.audio-metrics.v1')"),
-      "false",
-      "audio metrics preference must be persisted",
+      await evaluate(cdp, appSession, "document.querySelector('#audio-metrics-toggle')"),
+      null,
+      "Debug must not expose an audio metrics toggle",
     );
-    await cdp.send("Page.reload", { ignoreCache: true }, appSession);
-    await waitFor(
-      async () => evaluate(
-        cdp,
-        appSession,
-        `document.querySelector('#play-button') &&
-          !document.querySelector('#play-button').disabled &&
-          document.querySelector('#audio-metrics-toggle').checked === false`,
-      ),
-      "restored audio metrics preference",
-    );
-    await evaluate(cdp, appSession, `(() => {
-      const toggle = document.querySelector('#audio-metrics-toggle');
-      toggle.checked = true;
-      toggle.dispatchEvent(new Event('change', { bubbles: true }));
-    })()`);
+    await evaluate(cdp, appSession, "document.querySelector('#ai-mode-button').click()");
 
     await cdp.send(
       "Emulation.setDeviceMetricsOverride",

@@ -569,6 +569,40 @@ main {
 
 .track-meta {
   min-width: 0;
+  flex: 1 1 auto;
+}
+
+.track-spectrum {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  width: 34px;
+  height: 26px;
+  flex: 0 0 auto;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #12131a;
+}
+
+.track-spectrum i {
+  width: 2px;
+  height: max(1px, calc(var(--spectrum-level, 0) * 18px));
+  border-radius: 1px;
+  background: var(--track-color);
+  transition: height 120ms linear;
+}
+
+[data-audio-state="playing"] .track-spectrum i {
+  animation: spectrum-pulse 620ms ease-in-out infinite alternate;
+  animation-delay: calc(var(--spectrum-level, 0) * -410ms);
+}
+
+@keyframes spectrum-pulse {
+  to {
+    height: max(1px, calc(var(--spectrum-level, 0) * 12px));
+    opacity: 0.58;
+  }
 }
 
 .track-meta strong,

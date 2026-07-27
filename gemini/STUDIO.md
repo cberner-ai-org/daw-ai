@@ -55,7 +55,9 @@ Same-track native targets execute inside Surge XT. Use the target IDs and contro
 
 ## Listening
 
-`render_audio_region` renders the latest graph through Surge XT. It accepts optional `tracks` as `"all"` or stable track IDs and an absolute range of at most 16 seconds. Omitted `tracks` means all tracks. The listening range is independent of the edit selection. The returned measurements are descriptive, not decisions.
+`render_audio_region` renders the latest graph through Surge XT and returns WAV audio without measurements. It accepts optional `tracks` as `"all"` or stable track IDs and an absolute range of at most 16 seconds. Omitted `tracks` means all tracks. The listening range is independent of the edit selection.
+
+`analyze_audio` renders the same selectable range and returns objective full-mix and per-track signal measurements without audio. Its standard level and spectral measurements describe the signal; they are not musical judgments or completion decisions.
 
 `audition_instrument` renders an installed Surge preset with a short disposable MIDI sequence and optionally one effect. It never changes the graph or history. Use it to compare uncertain presets, pitches, and articulations before creating tracks or clips.
 

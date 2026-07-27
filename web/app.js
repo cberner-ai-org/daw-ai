@@ -43,7 +43,6 @@
     clearDebug: document.querySelector("#clear-debug"),
     refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
     geminiSessionList: document.querySelector("#gemini-session-list"),
-    audioMetricsToggle: document.querySelector("#audio-metrics-toggle"),
     sessionHistoryList: document.querySelector("#session-history-list"),
     toast: document.querySelector("#toast"),
     toastMessage: document.querySelector("#toast-message"),
@@ -69,13 +68,14 @@
     clientIssues: [],
     geminiSessions: [],
     projectHistory: { current: 0, entries: [] },
+    spectrumPending: false,
+    spectrumUpdatedAt: 0,
   };
   let historyLoadQueue = Promise.resolve();
   let projectMutationQueue = Promise.resolve();
   const RECONCILED_REQUEST_TIMEOUT_MS = 2000;
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
-  const AUDIO_METRICS_STORAGE_KEY = "daw-ai.audio-metrics.v1";
   const AUDIO_RETRY_DELAYS_MS = [250, 500, 1000];
   const AUDIO_SEEK_DEBOUNCE_MS = 200;
   const TOAST_DISMISS_MS = 4200;
@@ -423,6 +423,7 @@
     state.selectionEnd = clamp(state.selectionEnd, state.selectionStart + 0.25, project.duration);
     renderRuler();
     renderTracks();
+    void updateSpectrumAnalyzers(true);
     renderSelection();
     renderPlayhead();
     renderDebug();
@@ -531,6 +532,7 @@
           <div class="track-label">
             <span class="track-color" aria-hidden="true"></span>
             <span class="track-meta"><strong>${escapeHtml(track.name)}</strong><span>${escapeHtml(track.role)}</span></span>
+            <span class="track-spectrum" data-spectrum-track="${track.id}" aria-label="${escapeHtml(track.name)} spectrum analyzer">${Array.from({ length: 8 }, () => "<i></i>").join("")}</span>
           </div>
           <div class="track-lane" data-track-id="${track.id}" role="slider" tabindex="0" aria-label="${escapeHtml(track.name)} timeline selection" aria-valuemin="0" aria-valuemax="${duration}" aria-valuenow="${state.selectionStart}" aria-valuetext="Selected ${state.selectionStart.toFixed(1)} to ${state.selectionEnd.toFixed(1)} seconds. Arrow keys move; Shift plus Arrow keys resize.">${clips}${markers}</div>
         </div>`;
@@ -596,6 +598,31 @@
     if (!state.project) return;
     const left = elements.rulerLane.offsetLeft + (audio.playhead / state.project.duration) * elements.rulerLane.offsetWidth;
     elements.playhead.style.left = `${left}px`;
+  }
+
+  async function updateSpectrumAnalyzers(force = false) {
+    const now = Date.now();
+    if ((!force && !audio.isPlaying) || state.spectrumPending || now - state.spectrumUpdatedAt < 1000) return;
+    state.spectrumPending = true;
+    state.spectrumUpdatedAt = now;
+    try {
+      const result = await api("/api/spectrum", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ start: String(audio.playhead) }),
+      });
+      for (const track of result.tracks || []) {
+        const analyzer = elements.trackRows.querySelector(`[data-spectrum-track="${track.trackId}"]`);
+        if (!analyzer) continue;
+        analyzer.querySelectorAll("i").forEach((bar, index) => {
+          bar.style.setProperty("--spectrum-level", clamp(Number(track.levels[index]) || 0, 0, 1));
+        });
+      }
+    } catch (error) {
+      reportClientIssue("warning", error, "updating spectrum analyzers");
+    } finally {
+      state.spectrumPending = false;
+    }
   }
 
   function centerSelectionOnNarrowTimeline() {
@@ -1259,7 +1286,6 @@
           prompt,
           start: String(selectionStart),
           end: String(selectionEnd),
-          include_audio_metrics: String(pending.includeAudioMetrics !== false),
         });
         if (pending.referenceAudio) {
           editBody.set("reference_audio_name", pending.referenceAudio.name);
@@ -1383,7 +1409,6 @@
         end: state.selectionEnd,
         acceptedJob: null,
         referenceAudio,
-        includeAudioMetrics: elements.audioMetricsToggle.checked,
       };
       if (!persistPendingEdit(pending) && referenceAudio) {
         throw new Error("Could not preserve the reference audio for edit recovery");
@@ -1670,13 +1695,6 @@
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
   elements.refreshGeminiSessions.addEventListener("click", () => void loadGeminiSessions());
-  elements.audioMetricsToggle.addEventListener("change", () => {
-    try {
-      window.localStorage.setItem(AUDIO_METRICS_STORAGE_KEY, String(elements.audioMetricsToggle.checked));
-    } catch (_error) {
-      // An unavailable preference store should not prevent edits.
-    }
-  });
   elements.sessionHistoryList.addEventListener("click", (event) => {
     void enqueueProjectMutation(() => selectProjectHistory(event));
   });
@@ -1715,12 +1733,6 @@
   });
 
   async function initialize() {
-    try {
-      elements.audioMetricsToggle.checked =
-        window.localStorage.getItem(AUDIO_METRICS_STORAGE_KEY) !== "false";
-    } catch (_error) {
-      // Keep metrics enabled when preference storage is unavailable.
-    }
     const pending = readPendingEdit();
     if (pending) {
       if (!elements.promptInput.value) elements.promptInput.value = pending.submittedText;
