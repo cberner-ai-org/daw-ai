@@ -818,6 +818,38 @@ impl ChannelOperation {
 }
 
 impl Action {
+    fn clip_to_absolute_end(
+        &mut self,
+        parent_start: f32,
+        parent_end: f32,
+        absolute_end: f32,
+    ) -> bool {
+        match self {
+            Self::Compound { actions } => {
+                actions.retain_mut(|action| {
+                    action.clip_to_absolute_end(parent_start, parent_end, absolute_end)
+                });
+                !actions.is_empty()
+            }
+            Self::Timed { start, end, action } => {
+                let parent_duration = parent_end - parent_start;
+                let action_start = parent_start + parent_duration * *start;
+                let action_end = parent_start + parent_duration * *end;
+                if action_start >= absolute_end
+                    || !action.clip_to_absolute_end(action_start, action_end, absolute_end)
+                {
+                    return false;
+                }
+                let clipped_parent_end = parent_end.min(absolute_end);
+                let clipped_parent_duration = clipped_parent_end - parent_start;
+                *start = (action_start - parent_start) / clipped_parent_duration;
+                *end = (action_end.min(absolute_end) - parent_start) / clipped_parent_duration;
+                true
+            }
+            _ => true,
+        }
+    }
+
     fn retain_valid_automation(
         &mut self,
         track_id: u64,
@@ -1216,10 +1248,16 @@ impl Studio {
                 clip.end = clip.end.min(duration);
             }
         }
-        self.project.edits.retain(|edit| edit.start < duration);
-        for edit in &mut self.project.edits {
+        self.project.edits.retain_mut(|edit| {
+            if edit.start >= duration {
+                return false;
+            }
+            let keep = edit
+                .action
+                .clip_to_absolute_end(edit.start, edit.end, duration);
             edit.end = edit.end.min(duration);
-        }
+            keep
+        });
         self.project.version += 1;
         Ok(())
     }
@@ -5004,6 +5042,44 @@ mod tests {
             studio.set_duration(300.01),
             Err(StudioError::InvalidDuration)
         );
+        studio.project.edits.push(Edit {
+            id: 999,
+            operation_id: None,
+            start: 0.0,
+            end: 32.0,
+            prompt: "add timed effects".to_owned(),
+            summary: "Added timed effects".to_owned(),
+            action: Action::Compound {
+                actions: vec![
+                    Action::Timed {
+                        start: 0.25,
+                        end: 0.75,
+                        action: Box::new(Action::Timed {
+                            start: 0.0,
+                            end: 0.5,
+                            action: Box::new(Action::Effect {
+                                name: "Reverb 2",
+                                mix: 0.5,
+                                target: None,
+                            }),
+                        }),
+                    },
+                    Action::Timed {
+                        start: 0.5,
+                        end: 1.0,
+                        action: Box::new(Action::Timed {
+                            start: 0.5,
+                            end: 1.0,
+                            action: Box::new(Action::Effect {
+                                name: "Delay",
+                                mix: 0.5,
+                                target: None,
+                            }),
+                        }),
+                    },
+                ],
+            },
+        });
 
         let previous_version = studio.project().version;
         studio.set_duration(10.0).expect("valid duration");
@@ -5017,6 +5093,31 @@ mod tests {
                 .flat_map(|track| &track.clips)
                 .all(|clip| clip.start < 10.0 && clip.end <= 10.0)
         );
+        let resized_edit = studio
+            .project()
+            .edits
+            .iter()
+            .find(|edit| edit.id == 999)
+            .expect("partially retained edit");
+        let Action::Compound { actions } = &resized_edit.action else {
+            panic!("retained compound action");
+        };
+        assert_eq!(actions.len(), 1, "actions beyond the endpoint are removed");
+        let Action::Timed { start, end, action } = &actions[0] else {
+            panic!("retained timed action");
+        };
+        assert!((start - 0.8).abs() < f32::EPSILON);
+        assert!((end - 1.0).abs() < f32::EPSILON);
+        let Action::Timed {
+            start: nested_start,
+            end: nested_end,
+            ..
+        } = action.as_ref()
+        else {
+            panic!("retained nested timed action");
+        };
+        assert!(nested_start.abs() < f32::EPSILON);
+        assert!((nested_end - 1.0).abs() < f32::EPSILON);
         Project::from_json(&studio.project().to_json()).expect("resized project remains valid");
 
         assert!(studio.undo(), "duration change is undoable");
