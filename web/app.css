@@ -812,6 +812,7 @@ main {
 
 .prompt-title-row h2,
 .section-heading h2,
+.drawer-header h2,
 .debug-heading h2 {
   margin: 0;
   font-size: 17px;
@@ -1188,6 +1189,62 @@ main {
   font-variant-numeric: tabular-nums;
 }
 
+.sound-editor {
+  min-height: calc(100vh - 205px);
+  margin-top: 18px;
+  padding: 26px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 20px 70px rgba(0, 0, 0, 0.16);
+}
+
+.drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.drawer-intro {
+  max-width: 680px;
+  margin: 12px 0 24px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.channel-creator {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 0 18px;
+}
+
+.channel-creator label {
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.channel-creator select {
+  min-height: 38px;
+  padding: 0 30px 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  color: var(--text);
+  background: #191b23;
+}
+
+.channel-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+  min-width: 0;
+}
+
 .debug-panel {
   min-height: calc(100vh - 205px);
   padding: clamp(22px, 4vw, 38px);
@@ -1321,6 +1378,663 @@ main {
   line-height: 1.6;
 }
 
+.channel-card {
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #20232c;
+}
+
+.track-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(250px, 0.8fr);
+  align-items: start;
+  gap: 12px;
+}
+
+.track-editor-column,
+.node-inspector-column {
+  min-width: 0;
+}
+
+.sound-graph-panel {
+  padding: 12px;
+  border: 1px solid rgba(189, 255, 93, 0.12);
+  border-radius: 8px;
+  background: #181a21;
+}
+
+.node-inspector-column {
+  position: sticky;
+  top: 12px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.13);
+}
+
+.inspector-label {
+  padding: 2px 3px 0;
+  color: var(--faint);
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.node-inspector {
+  margin-top: 7px;
+  background: #20232c;
+}
+
+.channel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 15px;
+}
+
+.channel-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.delete-channel-button {
+  padding: 5px 8px;
+  border: 1px solid rgba(255, 142, 158, 0.3);
+  border-radius: 5px;
+  color: var(--danger);
+  background: rgba(255, 142, 158, 0.04);
+  font-size: 8px;
+  font-weight: 800;
+}
+
+.delete-channel-button:hover {
+  background: rgba(255, 142, 158, 0.1);
+}
+
+.channel-name {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.channel-name i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--track-color);
+  box-shadow: 0 0 9px var(--track-color);
+}
+
+.mute-button {
+  padding: 5px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 8px;
+  font-weight: 800;
+}
+
+.mute-button.is-muted {
+  border-color: rgba(255, 142, 158, 0.35);
+  color: var(--danger);
+  background: rgba(255, 142, 158, 0.09);
+}
+
+.volume-control {
+  display: grid;
+  grid-template-columns: 48px 1fr 32px;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 15px;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.volume-control output {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+input[type="range"] {
+  height: 3px;
+  appearance: none;
+  border-radius: 4px;
+  background: #3b3e48;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  appearance: none;
+  border: 2px solid #20232c;
+  border-radius: 50%;
+  background: var(--track-color);
+  box-shadow: 0 0 0 1px var(--track-color);
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: 2px solid #20232c;
+  border-radius: 50%;
+  background: var(--track-color);
+}
+
+.channel-details {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.detail-block {
+  padding: 10px;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.13);
+}
+
+.detail-block span,
+.detail-block strong {
+  display: block;
+}
+
+.detail-block span {
+  margin-bottom: 4px;
+  color: var(--faint);
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.detail-block strong {
+  font-size: 9px;
+  font-weight: 550;
+  line-height: 1.4;
+}
+
+.effects-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  grid-column: 1 / -1;
+}
+
+.effect-pill {
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.effect-pill b {
+  margin-left: 3px;
+  color: var(--faint);
+  font-weight: 600;
+}
+
+.effect-pill.is-regional {
+  border-color: rgba(189, 255, 93, 0.22);
+  color: #dfffad;
+  background: rgba(189, 255, 93, 0.055);
+}
+
+.sound-tool {
+  min-width: 0;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.13);
+}
+
+.tool-heading,
+.effect-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.tool-heading {
+  margin-bottom: 11px;
+}
+
+.tool-heading span,
+.tool-heading strong {
+  display: block;
+}
+
+.tool-heading span {
+  margin-bottom: 3px;
+  color: var(--faint);
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.tool-heading strong,
+.effect-card-heading strong {
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.tool-heading code,
+.effect-card-heading code {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 7px;
+}
+
+.tool-controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+}
+
+.oscillator-stack {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.oscillator-card {
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.oscillator-card > strong {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 9px;
+}
+
+.oscillator-card .tool-controls {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.tool-control {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: var(--faint);
+  font-size: 7px;
+  font-weight: 750;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.tool-control select {
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  padding: 5px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--text);
+  background: #292c36;
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.range-with-output {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  min-height: 30px;
+}
+
+.range-with-output input[type="range"] {
+  width: 100%;
+  min-width: 0;
+}
+
+.range-with-output output {
+  color: var(--muted);
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  text-align: right;
+  text-transform: none;
+}
+
+.routing-chain {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  overflow-x: auto;
+  padding: 8px;
+  border-radius: 6px;
+  color: var(--muted);
+  background: #181a21;
+  font-size: 8px;
+  white-space: nowrap;
+}
+
+.routing-chain > span {
+  padding: 3px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.graph-node,
+.graph-terminal {
+  flex: 0 0 auto;
+  min-width: 76px;
+}
+
+.graph-node {
+  display: grid;
+  gap: 2px;
+  padding: 7px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--text);
+  background: #242731;
+  text-align: left;
+}
+
+.graph-node:hover,
+.graph-node:focus-visible {
+  border-color: rgba(189, 255, 93, 0.45);
+}
+
+.graph-node.is-selected {
+  border-color: var(--track-color);
+  background: color-mix(in srgb, var(--track-color) 13%, #242731);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--track-color) 28%, transparent);
+}
+
+.graph-node span,
+.graph-node small {
+  display: block;
+}
+
+.graph-node span {
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.graph-node small {
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 6px;
+  letter-spacing: 0.06em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.graph-terminal {
+  padding: 7px 8px !important;
+  color: var(--faint);
+  background: #111319;
+  text-align: center;
+}
+
+.graph-control-nodes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+
+.graph-node-modulator {
+  min-width: 145px;
+  border-style: dashed;
+}
+
+.routing-chain i {
+  display: grid;
+  justify-items: center;
+  gap: 1px;
+  color: var(--track-color);
+  font-style: normal;
+}
+
+.routing-chain i b {
+  font-size: 6px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.effect-stack {
+  display: grid;
+  gap: 7px;
+  margin: 8px 0;
+}
+
+.effect-card,
+.modulator-card {
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.effect-card.is-disabled,
+.modulator-card.is-disabled {
+  opacity: 0.58;
+}
+
+.effect-card .tool-control {
+  margin-top: 8px;
+}
+
+.effect-card-heading .effect-pill {
+  padding: 0;
+  border: 0;
+}
+
+.tool-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.tool-actions button {
+  min-width: 28px;
+  min-height: 26px;
+  padding: 4px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 8px;
+}
+
+.tool-actions button:disabled {
+  opacity: 0.3;
+}
+
+.modulator-card + .modulator-card {
+  margin-top: 7px;
+}
+
+.modulator-card .tool-controls {
+  margin-top: 8px;
+}
+
+.modulator-route {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+  color: var(--faint);
+  font-size: 7px;
+}
+
+.modulator-route i {
+  color: var(--track-color);
+  font-style: normal;
+}
+
+.clip-editor {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.clip-editor + .clip-editor {
+  margin-top: 6px;
+}
+
+.clip-editor summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px;
+  cursor: pointer;
+  font-size: 9px;
+  list-style-position: inside;
+}
+
+.clip-editor summary b {
+  color: var(--faint);
+  font-size: 7px;
+  font-weight: 600;
+}
+
+.piano-roll {
+  display: grid;
+  grid-template-columns: 42px minmax(280px, 1fr);
+  height: 210px;
+  min-width: 0;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: #111319;
+}
+
+.piano-keyboard {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  border-right: 1px solid var(--line-strong);
+}
+
+.piano-key {
+  display: block;
+  flex: 1 1 0;
+  min-height: 6px;
+  padding-left: 3px;
+  border-bottom: 1px solid #c8c9c5;
+  color: #303238;
+  background: #e8e8e4;
+  font-size: 5px;
+  line-height: 1;
+}
+
+.piano-key.is-black {
+  width: 62%;
+  border-color: #16171c;
+  color: transparent;
+  background: #30323a;
+}
+
+.piano-grid {
+  position: relative;
+  min-width: 420px;
+  min-height: 100%;
+  background-color: #171920;
+  background-image:
+    linear-gradient(to bottom, transparent calc(100% - 1px), rgba(255, 255, 255, 0.055) 0),
+    linear-gradient(to right, transparent calc(100% - 1px), rgba(189, 255, 93, 0.1) 0);
+  background-size: 100% var(--pitch-row-height), var(--beat-width) 100%;
+}
+
+.midi-note {
+  position: absolute;
+  top: var(--note-top);
+  left: var(--note-left);
+  width: var(--note-width);
+  height: max(5px, var(--note-height));
+  min-height: 0;
+  overflow: hidden;
+  padding: 0 2px;
+  border: 1px solid color-mix(in srgb, var(--track-color) 76%, white);
+  border-radius: 2px;
+  color: #10120e;
+  background: var(--track-color);
+  opacity: calc(0.55 + var(--note-velocity) * 0.4);
+  font-size: 6px;
+  line-height: 1;
+  text-align: left;
+}
+
+.midi-note:hover,
+.midi-note:focus-visible,
+.midi-note.is-selected {
+  z-index: 2;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.midi-note-inspector {
+  display: grid;
+  grid-template-columns: 48px repeat(4, minmax(0, 1fr));
+  align-items: end;
+  gap: 6px;
+  padding: 8px;
+  border-top: 1px solid var(--line);
+  background: #181a21;
+}
+
+.midi-note-inspector > strong {
+  align-self: center;
+  color: var(--track-color);
+  font-size: 9px;
+}
+
+.midi-note-inspector label {
+  display: grid;
+  gap: 3px;
+  color: var(--faint);
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.midi-note-inspector input {
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  padding: 4px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--text);
+  background: #292c36;
+  font: inherit;
+}
+
+.empty-piano-roll {
+  padding: 24px;
+  border-top: 1px solid var(--line);
+  color: var(--faint);
+  font-size: 9px;
+  text-align: center;
+}
 
 .toast {
   position: fixed;
@@ -1491,9 +2205,18 @@ main {
     padding: 18px;
   }
 
+  .sound-editor,
   .debug-panel {
     min-height: calc(100vh - 190px);
     padding: 18px;
+  }
+
+  .track-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .node-inspector-column {
+    position: static;
   }
 
   .debug-heading {
@@ -1525,6 +2248,42 @@ main {
 }
 
 @media (max-width: 420px) {
+  .sound-editor {
+    overflow-x: hidden;
+    padding: 18px 12px 28px;
+  }
+
+  .drawer-header {
+    display: block;
+  }
+
+  .channel-creator {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .channel-creator label {
+    align-self: flex-start;
+  }
+
+  .channel-card {
+    min-width: 0;
+    padding: 12px;
+  }
+
+  .sound-tool {
+    min-width: 0;
+    padding: 10px;
+  }
+
+  .tool-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .oscillator-card .tool-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .project-heading {
     display: block;
   }

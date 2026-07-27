@@ -678,6 +678,28 @@ async function run() {
       { activeTab: "ai-mode-button", focused: "timeline-panel", aiHidden: false },
       "the skip link must reveal and focus the timeline from another tab",
     );
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `document.querySelector('#sound-editor') &&
+            document.querySelectorAll('#sound-editor [data-graph-node]').length >= 3`,
+        ),
+      "sound-graph editor",
+    );
+    assert.deepEqual(
+      await evaluate(cdp, appSession, `({
+        tabs: document.querySelectorAll('[role="tab"]').length,
+        editors: document.querySelectorAll('#sound-editor').length,
+        graphs: document.querySelectorAll('#sound-editor .sound-graph').length,
+        pianoRolls: document.querySelectorAll('#sound-editor .piano-roll').length,
+        instruments: document.querySelectorAll('#sound-editor .instrument-tool').length,
+        trackCreator: Boolean(document.querySelector('#sound-editor #channel-creator')),
+      })`),
+      { tabs: 2, editors: 1, graphs: 3, pianoRolls: 3, instruments: 3, trackCreator: true },
+      "AI Mode must retain the chartered sound-graph editor without an Advanced tab",
+    );
     const durationBaseline = await evaluate(cdp, appSession, `(() => ({
       duration: Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')),
       button: document.querySelector('#ai-duration-button')?.textContent.trim(),
@@ -1445,11 +1467,13 @@ async function run() {
       appSession,
       "fetch('/api/project').then((response) => response.json())",
     );
+    const conflictDuration =
+      projectBeforeConflict.duration === 300 ? 299 : projectBeforeConflict.duration + 1;
     await evaluate(cdp, appSession, `(() => {
       const originalFetch = window.fetch;
       window.__conflictProjectRefreshes = 0;
       window.__conflictPollCount = 0;
-      window.__mixDuringPromptRequests = 0;
+      window.__durationDuringPromptRequests = 0;
       window.__releaseConflictStatus = false;
       window.fetch = async function fetch(resource, options) {
         if (resource === '/api/edits') {
@@ -1475,7 +1499,7 @@ async function run() {
             elapsedSeconds: 1, timeoutSeconds: 1200,
           }), { status: 200, headers: { 'Content-Type': 'application/json' } });
         }
-        if (resource === '/api/mix') window.__mixDuringPromptRequests += 1;
+        if (resource === '/api/duration') window.__durationDuringPromptRequests += 1;
         if (resource === '/api/project') window.__conflictProjectRefreshes += 1;
         return originalFetch(resource, options);
       };
@@ -1490,18 +1514,19 @@ async function run() {
       async () => evaluate(cdp, appSession, "window.__conflictPollCount >= 1"),
       "accepted edit polling before a manual mutation",
     );
-    await evaluate(cdp, appSession, `fetch('/api/mix', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ track_id: '1', volume: '0.51' }),
-    })`);
+    await evaluate(cdp, appSession, `(() => {
+      window.prompt = () => '${conflictDuration}';
+      document.querySelector('#ai-duration-button').click();
+    })()`);
     await waitFor(
       async () => evaluate(
         cdp,
         appSession,
-        `window.__mixDuringPromptRequests === 1 && !document.querySelector('#compose-button').disabled`,
+        `window.__durationDuringPromptRequests === 1 &&
+          Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')) === ${conflictDuration} &&
+          !document.querySelector('#compose-button').disabled`,
       ),
-      "manual mixer mutation during accepted edit polling",
+      "queued Duration mutation during accepted edit polling",
     );
     await evaluate(cdp, appSession, "window.__releaseConflictStatus = true");
     await waitFor(
@@ -1520,9 +1545,9 @@ async function run() {
     );
     assert.ok(await evaluate(cdp, appSession, "window.__conflictProjectRefreshes >= 2"));
     assert.equal(conflictProject.version, projectBeforeConflict.version + 1);
-    assert.equal(conflictProject.tracks[0].volume, 0.51);
+    assert.equal(conflictProject.duration, conflictDuration);
     assert.equal(
-      await evaluate(cdp, appSession, "window.__mixDuringPromptRequests"),
+      await evaluate(cdp, appSession, "window.__durationDuringPromptRequests"),
       1,
       "accepted edit polling must not own the project mutation queue",
     );
@@ -1540,7 +1565,7 @@ async function run() {
         cdp,
         appSession,
         `fetch('/api/project').then((response) => response.json()).then(
-          (project) => project.tracks[0].volume === ${projectBeforeConflict.tracks[0].volume}
+          (project) => project.duration === ${projectBeforeConflict.duration}
         )`,
       ),
       "conflict test project restoration",
@@ -2252,7 +2277,7 @@ async function run() {
     assert.equal(consoleErrors.length, 0, "application emitted browser console errors");
 
     console.log(
-      "Browser workflows passed: mobile layout/panning, keyboard selection, backend audio rendering/transport, studio tabs/debug report, prompt single-flight/undo, cross-origin guard",
+      "Browser workflows passed: mobile layout/panning, keyboard selection, backend audio rendering/transport, studio tabs/debug report, sound-graph editor, prompt single-flight/undo, cross-origin guard",
     );
   } finally {
     if (attacker) await new Promise((resolve) => attacker.close(resolve));

@@ -145,6 +145,27 @@
           <p class="session-history-hint">Gemini and manual changes, most recent first. Jump to any earlier project state without losing what came after it.</p>
           <div id="session-history-list" class="history-list" aria-live="polite"></div>
         </section>
+        <section class="sound-editor" id="sound-editor" aria-labelledby="sound-editor-title">
+          <div class="drawer-header">
+            <div>
+              <p class="eyebrow">SOUND GRAPH</p>
+              <h2 id="sound-editor-title">Graph editor</h2>
+            </div>
+          </div>
+          <p class="drawer-intro">Edit MIDI in a piano roll, inspect typed routing, and select a sound-graph node to change its parameters. Gemini sees the same graph.</p>
+          <form class="channel-creator" id="channel-creator">
+            <label for="channel-role">New track</label>
+            <select id="channel-role" name="role">
+              <option value="drums">Drums</option>
+              <option value="bass">Bass</option>
+              <option value="chords">Chords</option>
+              <option value="lead">Lead</option>
+              <option value="texture">Texture</option>
+            </select>
+            <button class="secondary-button" id="add-channel" type="submit">Add track</button>
+          </form>
+          <div class="channel-list" id="channel-list"></div>
+        </section>
       </section>
 
       <section class="view-panel debug-panel" id="debug-panel" role="tabpanel" aria-labelledby="debug-button" hidden inert>
