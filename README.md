@@ -49,10 +49,10 @@ cargo run -- --port 8888
 2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `turn this section into a dubstep drop`.
 3. Press **Make change**, then use the transport to hear the result. The button becomes **Interrupt** while Gemini is working.
 4. Use session history to inspect earlier states and move forward again, or download the complete arrangement with **Export WAV**.
-5. Use **Duration** in AI Mode or Advanced Mode to set the song length from 1 second to 5 minutes. Shortening a song trims arrangement content past the new endpoint, and the change can be undone.
-6. Switch to **Advanced** to edit MIDI notes in the piano roll and select instrument, effect, and modulator nodes in the sound graph to edit their parameters. Tracks can also be created and deleted there. The **Debug** tab lists retained AI sessions, provides a copyable environment and browser-error report, and can omit objective audio metrics from Gemini listening responses. Gemini still receives the rendered audio when metrics are disabled.
+5. Use **Duration** in AI Mode to set the song length from 1 second to 5 minutes. Shortening a song trims arrangement content past the new endpoint, and the change can be undone.
+6. The **Debug** tab lists retained AI sessions, provides a copyable environment and browser-error report, and can omit objective audio metrics from Gemini listening responses. Gemini still receives the rendered audio when metrics are disabled.
 
-No login is required. DAW-AI assigns each browser a private random cookie and stores its project under `users/<cookie>/sound-graph.json` beside `DAW_AI_PROJECT_PATH` (or beside the working-directory default). Each user has independent edit jobs, history, playback, and project state. DAW-AI creates the demo graph for a new user and safely saves every accepted prompt, mixer change, Advanced edit, undo, reset, and history selection.
+No login is required. DAW-AI assigns each browser a private random cookie and stores its project under `users/<cookie>/sound-graph.json` beside `DAW_AI_PROJECT_PATH` (or beside the working-directory default). Each user has independent edit jobs, history, playback, and project state. DAW-AI creates the demo graph for a new user and safely saves every accepted prompt, undo, reset, and history selection.
 
 For each prompt, Gemini receives the edit range and checked-in studio contract under `gemini/`, along with registered stable-ID graph tools for reads, mutations, control discovery, undo, and Surge XT rendering. Gemini receives listening renders as audio input. Listening is independent of edit scope and model-directed.
 
@@ -60,7 +60,7 @@ Surge factory patches expose their embedded effect slots in the same sound graph
 
 Surge patches expose their scene mode, split point, and scene pitch/octave settings directly. DAW-AI does not add a recommended MIDI-note range.
 
-Gemini may render before or after edits whenever listening would help, but no separate model reviews or rejects its completion decision. It may also complete based on graph inspection alone. There is no predetermined iteration or tool-call limit; the overall 20-minute request timeout is the loop boundary. The server publishes each successful atomic mutation as an undoable edit while Gemini is still working. Direct Advanced edits and channel creation or deletion use the same persisted graph.
+Gemini may render before or after edits whenever listening would help, but no separate model reviews or rejects its completion decision. It may also complete based on graph inspection alone. There is no predetermined iteration or tool-call limit; the overall 20-minute request timeout is the loop boundary. The server publishes each successful atomic mutation as an undoable edit while Gemini is still working.
 
 Prompted edits run as asynchronous jobs so reverse proxies never need to hold one request open while Gemini works. The browser polls short status requests, fetches each published intermediate project and the completed project, and shows the current phase, applied steps, and elapsed time. Gemini may spend up to 20 minutes on an edit; if the project changes before that edit finishes, the result is rejected instead of overwriting newer work.
 
