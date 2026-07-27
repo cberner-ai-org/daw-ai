@@ -4,6 +4,7 @@ mod audio_stream;
 mod concurrency;
 pub mod gemini;
 pub mod gemini_tools;
+mod http;
 pub mod model;
 mod project_file;
 mod project_history;
