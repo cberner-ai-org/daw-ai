@@ -437,6 +437,9 @@ fn render_track(
     output: &mut [f32],
     event_onsets: &mut Vec<f32>,
 ) -> Result<(), String> {
+    if let Some(error) = crate::surge_presets::headless_render_error(&track.instrument.preset) {
+        return Err(error);
+    }
     let start = precise_sample_time(start_sample);
     let beat_duration = 60.0 / f64::from(project.bpm);
     let mut midi = Vec::new();
@@ -2117,6 +2120,17 @@ mod tests {
         let occurrences = clip_events_in_window(&project, track, clip, 0.0, 1.0);
         assert_eq!(occurrences.len(), 1);
         assert!(occurrences[0].duration <= project.bpm as f32 / 120.0 + 0.000_01);
+    }
+
+    #[test]
+    fn unsafe_headless_preset_returns_an_error_before_native_rendering() {
+        let mut project = Project::initial();
+        project.tracks[0].instrument.preset = "Factory/FX/Space Adventure 1".to_owned();
+        let error = match render_region_with_tracks(&project, &[1], 0.0, 1.0) {
+            Ok(_) => panic!("unsafe preset reached Surge"),
+            Err(error) => error,
+        };
+        assert!(error.contains("crashes the headless audio renderer"));
     }
 
     fn sample_difference(left: &[f32], right: &[f32]) -> f32 {

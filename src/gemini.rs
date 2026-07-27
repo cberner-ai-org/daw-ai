@@ -15,10 +15,11 @@ use serde_json::Value as JsonValue;
 #[cfg(test)]
 use crate::gemini_tools::render_audio_request;
 use crate::gemini_tools::{
-    AUDIO_TOOL_NAME, AudioRender, AudioRenderRequest, EditSession, INSTRUMENT_PARAMETER_TOOL_NAME,
-    PRESET_TOOL_NAME, READ_TOOL_NAME, SOUND_TOOL_PARAMETER_TOOL_NAME, apply_agent_mutation,
-    base64_audio, is_mutation_tool, list_instrument_parameters, list_sound_tool_parameters,
-    list_surge_presets, prepare_audio_render, read_sound_graph,
+    AUDIO_TOOL_NAME, AUDITION_TOOL_NAME, AudioRender, AudioRenderRequest, EditSession,
+    INSTRUMENT_PARAMETER_TOOL_NAME, PRESET_TOOL_NAME, READ_TOOL_NAME,
+    SOUND_TOOL_PARAMETER_TOOL_NAME, apply_agent_mutation, base64_audio, is_mutation_tool,
+    list_instrument_parameters, list_sound_tool_parameters, list_surge_presets,
+    prepare_audio_render, prepare_instrument_audition, read_sound_graph,
     tool_declarations_with_audio_metrics,
 };
 use crate::model::Project;
@@ -429,8 +430,13 @@ fn execute_tool(
         name if is_mutation_tool(name) || name == "set_parameter" => Ok(ToolOutput::text(
             apply_and_commit_mutation(session, &call.arguments, name, state, on_update)?,
         )),
-        AUDIO_TOOL_NAME => {
-            match prepare_audio_render(session.path(), &call.arguments).and_then(render_audio) {
+        AUDIO_TOOL_NAME | AUDITION_TOOL_NAME => {
+            let prepared = if call.name == AUDIO_TOOL_NAME {
+                prepare_audio_render(session.path(), &call.arguments)
+            } else {
+                prepare_instrument_audition(session.path(), &call.arguments)
+            };
+            match prepared.and_then(render_audio) {
                 Ok(audio) => {
                     state.audio_listens += 1;
                     state.audio_artifacts += 1;
@@ -456,8 +462,8 @@ fn execute_tool(
                                 {
                                     "type": "text",
                                     "text": format!(
-                                        "Audio produced by {AUDIO_TOOL_NAME} for function call {}. Listen to this WAV before deciding what to do next.",
-                                        call.id
+                                        "Audio produced by {} for function call {}. Listen to this WAV before deciding what to do next.",
+                                        call.name, call.id
                                     )
                                 },
                                 {

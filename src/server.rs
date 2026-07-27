@@ -974,7 +974,7 @@ impl Router {
             ("GET", "/app.js") => Response::static_asset("text/javascript; charset=utf-8", APP_JS),
             ("GET", "/api/health") => Response::json(200, "{\"status\":\"ok\"}".to_owned()),
             ("GET", "/api/surge-presets") => {
-                let presets = crate::surge_presets::catalog()
+                let presets = crate::surge_presets::render_safe_catalog()
                     .into_iter()
                     .map(|preset| json_string(&preset.id))
                     .collect::<Vec<_>>()

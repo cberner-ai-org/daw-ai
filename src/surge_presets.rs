@@ -4,6 +4,30 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::{env, fs};
 
 pub(crate) const FACTORY_PREFIX: &str = "Factory/";
+const HEADLESS_UNSAFE_PRESETS: &[&str] = &[
+    "Factory/FX/Space Adventure 1",
+    "Factory/Pads/Computers In Space",
+    "Factory/Pads/Primes",
+    "Factory/Polysynths/Eyan",
+    "Factory/Polysynths/Fonk",
+    "Factory/Polysynths/Japanese Space-ulation Wheel",
+    "Factory/Polysynths/Jim",
+    "Factory/Polysynths/Past Tense",
+    "Factory/Sequences/Burial Ground",
+];
+
+#[cfg(test)]
+pub(crate) fn headless_unsafe_presets() -> &'static [&'static str] {
+    HEADLESS_UNSAFE_PRESETS
+}
+
+pub(crate) fn headless_render_error(id: &str) -> Option<String> {
+    HEADLESS_UNSAFE_PRESETS.contains(&id).then(|| {
+        format!(
+            "Surge XT preset {id} is disabled because it crashes the headless audio renderer; choose another preset"
+        )
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Preset {
@@ -33,6 +57,13 @@ pub(crate) fn catalog() -> Vec<Preset> {
         return Vec::new();
     };
     catalog_for_root(&root).as_ref().clone()
+}
+
+pub(crate) fn render_safe_catalog() -> Vec<Preset> {
+    catalog()
+        .into_iter()
+        .filter(|preset| headless_render_error(&preset.id).is_none())
+        .collect()
 }
 
 fn catalog_for_root(root: &Path) -> Arc<Vec<Preset>> {
@@ -225,6 +256,12 @@ mod tests {
             presets
                 .iter()
                 .all(|preset| preset.id != "Factory/FX/Aggero")
+        );
+        let safe = render_safe_catalog();
+        assert_eq!(safe.len(), presets.len() - HEADLESS_UNSAFE_PRESETS.len());
+        assert!(
+            safe.iter()
+                .all(|preset| !HEADLESS_UNSAFE_PRESETS.contains(&preset.id.as_str()))
         );
     }
 

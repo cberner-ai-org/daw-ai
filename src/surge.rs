@@ -1024,6 +1024,138 @@ mod tests {
         assert!(energy > 0.001, "factory patch rendered silence");
     }
 
+    #[test]
+    #[ignore]
+    fn probe_factory_preset_in_isolated_process() {
+        let preset = std::env::var("DAW_AI_PRESET_PROBE_ID").expect("preset probe ID");
+        let mode = std::env::var("DAW_AI_PRESET_PROBE_MODE").expect("preset probe mode");
+        let mut instrument = crate::model::Project::initial().tracks[0]
+            .instrument
+            .clone();
+        instrument.preset = preset.clone();
+        if mode == "double" {
+            let mut first =
+                Engine::new_with_graph_effects(&instrument, &[], &[], &[], 1, 16_000.0, false)
+                    .expect("first preset engine");
+            for _ in 0..64 {
+                first.process();
+            }
+        }
+        let (effects, effect_order) = if mode == "direct" {
+            (Vec::new(), Vec::new())
+        } else if matches!(mode.as_str(), "repeat" | "graph") {
+            let mut effects = preset_effects(&preset).expect("preset effect discovery");
+            if mode == "repeat" {
+                effects.clear();
+            }
+            for (index, effect) in effects.iter_mut().enumerate() {
+                effect.id = index as u64 + 1_000;
+            }
+            let order = effects.iter().map(|effect| effect.id).collect();
+            (effects, order)
+        } else if mode == "double" {
+            (Vec::new(), Vec::new())
+        } else {
+            panic!("unknown preset probe mode: {mode}");
+        };
+        eprintln!("probe {preset} [{mode}]: constructing");
+        let mut engine = Engine::new_with_graph_effects(
+            &instrument,
+            &effects,
+            &effect_order,
+            &[],
+            1,
+            16_000.0,
+            mode == "graph",
+        )
+        .expect("preset engine");
+        eprintln!("probe {preset} [{mode}]: processing");
+        engine.play_note(60, 0.8, 1);
+        let energy = (0..64)
+            .map(|_| engine.process())
+            .flat_map(|block| block[0])
+            .map(f32::abs)
+            .sum::<f32>();
+        assert!(energy.is_finite(), "preset rendered non-finite audio");
+        eprintln!("probe {preset} [{mode}]: complete");
+    }
+
+    #[test]
+    #[ignore]
+    fn qualifies_every_factory_preset_in_isolated_processes() {
+        use std::collections::BTreeSet;
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let presets = Arc::new(crate::surge_presets::catalog());
+        assert_eq!(
+            presets.len(),
+            638,
+            "factory catalog changed; rerun qualification"
+        );
+        let next = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let executable = std::env::current_exe().expect("test executable");
+        let worker_count = std::thread::available_parallelism()
+            .map_or(4, usize::from)
+            .min(8);
+        let workers = (0..worker_count)
+            .map(|_| {
+                let presets = Arc::clone(&presets);
+                let next = Arc::clone(&next);
+                let failures = Arc::clone(&failures);
+                let executable = executable.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(preset) = presets.get(index) else {
+                            break;
+                        };
+                        for mode in ["direct", "double", "graph"] {
+                            let status = Command::new(&executable)
+                                .arg("surge::tests::probe_factory_preset_in_isolated_process")
+                                .args(["--ignored", "--exact"])
+                                .env("DAW_AI_PRESET_PROBE_ID", &preset.id)
+                                .env("DAW_AI_PRESET_PROBE_MODE", mode)
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status()
+                                .expect("preset probe process");
+                            if !status.success() {
+                                failures
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(format!("{} [{mode}]: {status}", preset.id));
+                            }
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("preset qualification worker");
+        }
+        let failures = failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failed_presets = failures
+            .iter()
+            .filter_map(|failure| failure.split_once(" [").map(|(preset, _)| preset))
+            .collect::<BTreeSet<_>>();
+        let expected = crate::surge_presets::headless_unsafe_presets()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            failed_presets,
+            expected,
+            "factory preset qualification failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[cfg(any())]
     #[test]
     fn factory_patch_parameters_change_only_when_explicitly_overridden() {
