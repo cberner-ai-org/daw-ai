@@ -15,12 +15,11 @@ use serde_json::Value as JsonValue;
 #[cfg(test)]
 use crate::gemini_tools::render_audio_request;
 use crate::gemini_tools::{
-    AUDIO_TOOL_NAME, AUDITION_TOOL_NAME, AudioRender, AudioRenderRequest, EditSession,
-    INSTRUMENT_PARAMETER_TOOL_NAME, PRESET_TOOL_NAME, READ_TOOL_NAME,
+    ANALYZE_AUDIO_TOOL_NAME, AUDIO_TOOL_NAME, AUDITION_TOOL_NAME, AudioRender, AudioRenderRequest,
+    EditSession, INSTRUMENT_PARAMETER_TOOL_NAME, PRESET_TOOL_NAME, READ_TOOL_NAME,
     SOUND_TOOL_PARAMETER_TOOL_NAME, apply_agent_mutation, base64_audio, is_mutation_tool,
     list_instrument_parameters, list_sound_tool_parameters, list_surge_presets,
-    prepare_audio_render, prepare_instrument_audition, read_sound_graph,
-    tool_declarations_with_audio_metrics,
+    prepare_audio_render, prepare_instrument_audition, read_sound_graph, tool_declarations,
 };
 use crate::model::Project;
 #[cfg(test)]
@@ -114,7 +113,6 @@ impl GeminiPlanner {
         end: f32,
         project: &Project,
         reference_audio: Option<ReferenceAudio>,
-        include_audio_metrics: bool,
         cancellation: Arc<AtomicBool>,
         mut render_audio: impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
         mut on_update: impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -127,7 +125,6 @@ impl GeminiPlanner {
             start,
             end,
             reference_audio.as_ref(),
-            include_audio_metrics,
             cancellation,
             &mut render_audio,
             &mut on_update,
@@ -155,7 +152,6 @@ fn run_session_with_reference(
     start: f32,
     end: f32,
     reference_audio: Option<&ReferenceAudio>,
-    include_audio_metrics: bool,
     cancellation: Arc<AtomicBool>,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -169,7 +165,6 @@ fn run_session_with_reference(
         start,
         end,
         reference_audio,
-        include_audio_metrics,
         render_audio,
         on_update,
         &|| cancellation.load(Ordering::SeqCst),
@@ -206,7 +201,6 @@ fn run_session_with_transport(
         start,
         end,
         None,
-        true,
         render_audio,
         on_update,
         is_cancelled,
@@ -221,14 +215,13 @@ fn run_session_with_transport_reference(
     start: f32,
     end: f32,
     reference_audio: Option<&ReferenceAudio>,
-    include_audio_metrics: bool,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     is_cancelled: &impl Fn() -> bool,
     transport: &mut impl FnMut(usize, &JsonValue, Duration) -> Result<String, PlannerError>,
 ) -> Result<GeminiEdit, PlannerError> {
     let started = Instant::now();
-    let tools = tool_declarations_with_audio_metrics(include_audio_metrics);
+    let tools = tool_declarations();
     let mut input = reference_audio.map_or_else(
         || JsonValue::String(planner_task(prompt, start, end)),
         |audio| {
@@ -261,7 +254,7 @@ fn run_session_with_transport_reference(
             "model": GEMINI_MODEL,
             "input": input,
             "tools": &tools,
-            "system_instruction": system_instruction_with_audio_metrics(include_audio_metrics),
+            "system_instruction": system_instruction(),
             "generation_config": {"thinking_level": "high"},
             "store": true
         });
@@ -430,6 +423,13 @@ fn execute_tool(
         name if is_mutation_tool(name) || name == "set_parameter" => Ok(ToolOutput::text(
             apply_and_commit_mutation(session, &call.arguments, name, state, on_update)?,
         )),
+        ANALYZE_AUDIO_TOOL_NAME => {
+            let result = prepare_audio_render(session.path(), &call.arguments)
+                .and_then(render_audio)
+                .map(|audio| audio.measurements.to_string())
+                .unwrap_or_else(|error| format!("Tool error: {error}"));
+            Ok(ToolOutput::text(result))
+        }
         AUDIO_TOOL_NAME | AUDITION_TOOL_NAME => {
             let prepared = if call.name == AUDIO_TOOL_NAME {
                 prepare_audio_render(session.path(), &call.arguments)
@@ -443,14 +443,8 @@ fn execute_tool(
                     let audio_name = session
                         .record_audio(sequence * 1_000_000 + state.audio_artifacts, &audio.wav)
                         .map_err(PlannerError::Io)?;
-                    let description = if audio.measurements.is_null() {
-                        format!("{} Session artifact: {audio_name}.", audio.description)
-                    } else {
-                        format!(
-                            "{} Objective measurements: {} Session artifact: {audio_name}.",
-                            audio.description, audio.measurements
-                        )
-                    };
+                    let description =
+                        format!("{} Session artifact: {audio_name}.", audio.description);
                     let output = ToolOutput {
                         result: vec![serde_json::json!({
                             "type": "text",
@@ -799,12 +793,7 @@ fn planner_task(prompt: &str, start: f32, end: f32) -> String {
     )
 }
 
-fn system_instruction_with_audio_metrics(include_audio_metrics: bool) -> String {
-    let listening_instruction = if include_audio_metrics {
-        "When you listen, use the WAV and objective measurements and reason from the actual audio - not event-count proxies - about groove, beat subdivision, energy contour, tension, impact, timbre, and contrast. "
-    } else {
-        "When you listen, use the WAV itself and reason from the actual audio - not event-count proxies - about groove, beat subdivision, energy contour, tension, impact, timbre, and contrast. Objective measurements are disabled for this edit. "
-    };
+fn system_instruction() -> String {
     format!(
         concat!(
             "You are the autonomous sound-graph producer inside DAW-AI. Use the registered tools; ",
@@ -816,7 +805,7 @@ fn system_instruction_with_audio_metrics(include_audio_metrics: bool) -> String 
             "compare the audible result with the user's request, and iterate on composition and sound ",
             "design until they match. Listen before editing, audition important preset or effect choices ",
             "on isolated tracks, and evaluate the final full mix. ",
-            "{}",
+            "When you listen, reason from the WAV itself. Use analyze_audio separately when standard objective signal measurements would help; do not treat those measurements as musical judgments. ",
             "If a style depends on intensification, express it ",
             "through composition and rhythmic subdivision when appropriate. Default drums, bass grooves, ",
             "chord accompaniment, arpeggios, and repeated riffs to musical beat loops; reserve one-shot ",
@@ -825,7 +814,7 @@ fn system_instruction_with_audio_metrics(include_audio_metrics: bool) -> String 
             "separate completion reviewer. There is no ",
             "predetermined tool-call or iteration limit; the request timeout is the only loop limit.\n\n{}"
         ),
-        listening_instruction, STUDIO_CONTRACT
+        STUDIO_CONTRACT
     )
 }
 
@@ -1378,14 +1367,35 @@ mod tests {
         .expect("baseline audio");
         assert_eq!(baseline.result.len(), 1);
         assert_eq!(baseline.result[0]["type"], "text");
+        let listening_text = baseline.result[0]["text"].as_str().unwrap();
+        assert!(!listening_text.contains("Objective measurements"));
+        assert!(!listening_text.contains("peakDbfs"));
         let audio_input = &baseline.supplemental_input[0]["content"][1];
         assert_eq!(audio_input["type"], "audio");
         assert_eq!(audio_input["mime_type"], "audio/wav");
         assert!(audio_input["data"].as_str().unwrap().starts_with("UklGR"));
 
-        execute_tool(
+        let analysis = execute_tool(
             &session,
             3,
+            &call(
+                ANALYZE_AUDIO_TOOL_NAME,
+                serde_json::json!({"tracks": [2], "start": 4, "end": 8}),
+            ),
+            &mut state,
+            &mut render_audio,
+            &mut |edit| Ok(edit.project),
+        )
+        .expect("objective analysis");
+        assert!(analysis.supplemental_input.is_empty());
+        let measurements: JsonValue =
+            serde_json::from_str(analysis.result[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(measurements["mix"].as_object().unwrap().len(), 10);
+        assert_eq!(state.audio_listens, 1);
+
+        execute_tool(
+            &session,
+            4,
             &call("set_parameter", preset_edit("Factory/Leads/Classic Lead 1")),
             &mut state,
             &mut render_audio,
@@ -1399,7 +1409,7 @@ mod tests {
 
         execute_tool(
             &session,
-            4,
+            5,
             &call(
                 "set_parameter",
                 preset_edit("Factory/Polysynths/Anthemish 1"),
@@ -1412,7 +1422,7 @@ mod tests {
 
         execute_tool(
             &session,
-            5,
+            6,
             &audio,
             &mut state,
             &mut render_audio,
@@ -1565,7 +1575,6 @@ mod tests {
             0.0,
             4.0,
             Some(&reference),
-            true,
             &mut render_audio_request,
             &mut |edit| Ok(edit.project),
             &|| false,
@@ -1670,7 +1679,7 @@ mod tests {
     #[test]
     fn gemini_prompt_encourages_iterative_listening_without_a_tempo_assumption() {
         let task = planner_task("make the bass hit harder", 4.0, 8.0);
-        let instruction = system_instruction_with_audio_metrics(true);
+        let instruction = system_instruction();
         assert!(task.contains("listen after each change"));
         assert!(task.contains("iterate on composition and sound design"));
         assert!(task.contains("requested genre"));
@@ -1681,19 +1690,14 @@ mod tests {
         assert!(instruction.contains("chooses its own absolute project start and end"));
         assert!(instruction.contains("listen after each change"));
         assert!(instruction.contains("iterate on composition and sound design"));
-        assert!(instruction.contains("objective measurements"));
-        assert!(instruction.contains("actual audio - not event-count proxies"));
+        assert!(instruction.contains("analyze_audio"));
+        assert!(instruction.contains("reason from the WAV itself"));
         assert!(instruction.contains("rhythmic subdivision"));
         assert!(instruction.contains("Default drums, bass grooves"));
         assert!(instruction.contains("reserve one-shot MIDI phrases mainly for melody"));
         assert!(instruction.contains("tempo must change"));
         assert!(instruction.contains("no separate completion reviewer"));
         assert!(instruction.contains("no predetermined tool-call or iteration limit"));
-
-        let metrics_disabled = system_instruction_with_audio_metrics(false);
-        assert!(metrics_disabled.contains("use the WAV itself"));
-        assert!(metrics_disabled.contains("Objective measurements are disabled"));
-        assert!(!metrics_disabled.contains("use the WAV and objective measurements"));
     }
 
     #[test]

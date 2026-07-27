@@ -20,6 +20,7 @@ use crate::storage::{ProjectStore, read_bounded_text, replace_text_file};
 
 pub(crate) const READ_TOOL_NAME: &str = "read_sound_graph";
 pub(crate) const AUDIO_TOOL_NAME: &str = "render_audio_region";
+pub(crate) const ANALYZE_AUDIO_TOOL_NAME: &str = "analyze_audio";
 pub(crate) const AUDITION_TOOL_NAME: &str = "audition_instrument";
 pub(crate) const PRESET_TOOL_NAME: &str = "list_surge_presets";
 pub(crate) const INSTRUMENT_PARAMETER_TOOL_NAME: &str = "list_instrument_parameters";
@@ -391,14 +392,9 @@ impl Drop for EditSession {
     }
 }
 
-pub(crate) fn tool_declarations_with_audio_metrics(include_audio_metrics: bool) -> Vec<JsonValue> {
+pub(crate) fn tool_declarations() -> Vec<JsonValue> {
     let audio_schema = serde_json::from_str::<JsonValue>(AUDIO_REGION_SCHEMA)
         .expect("embedded audio schema is valid JSON");
-    let audio_description = if include_audio_metrics {
-        "Optionally render all tracks (the default) or a list of model-chosen track IDs and absolute project start/end times from the latest sound graph as WAV audio with objective mix and per-track measurements. Listening is optional but recommended after every major change; you decide whether and when to listen. The listening range is independent of the selected edit scope."
-    } else {
-        "Optionally render all tracks (the default) or a list of model-chosen track IDs and absolute project start/end times from the latest sound graph as WAV audio. Listen to and reason from the audio itself; objective measurements are disabled for this edit. Listening is optional but recommended after every major change; you decide whether and when to listen. The listening range is independent of the selected edit scope."
-    };
     let mut tools = vec![
         serde_json::json!({
             "type": "function",
@@ -420,7 +416,13 @@ pub(crate) fn tool_declarations_with_audio_metrics(include_audio_metrics: bool) 
         serde_json::json!({
             "type": "function",
             "name": AUDIO_TOOL_NAME,
-            "description": audio_description,
+            "description": "Render all tracks (the default) or selected track IDs over an absolute project range and return WAV audio for listening. This tool returns audio without measurements. The listening range is independent of the selected edit scope.",
+            "parameters": audio_schema.clone()
+        }),
+        serde_json::json!({
+            "type": "function",
+            "name": ANALYZE_AUDIO_TOOL_NAME,
+            "description": "Objectively analyze the rendered full mix and every selected track over an absolute project range. Returns standard signal-level and spectral measurements without audio and without musical judgments.",
             "parameters": audio_schema
         }),
         function(
@@ -2410,6 +2412,7 @@ fn audio_measurements(
                 .map(|track| {
                     serde_json::json!({
                         "trackId": track.id,
+                        "trackName": track.name,
                         "muted": track.muted,
                         "measurements": region_measurements(region)
                     })
@@ -2452,33 +2455,8 @@ fn region_measurements(region: &audio_analysis::AudioRegion) -> JsonValue {
     } else {
         region.samples.iter().sum::<f32>() / region.samples.len() as f32
     };
-    let time_series = region
-        .samples
-        .chunks(audio_analysis::SAMPLE_RATE as usize * audio_analysis::CHANNEL_COUNT)
-        .enumerate()
-        .map(|(index, samples)| {
-            let peak = samples.iter().copied().map(f32::abs).fold(0.0, f32::max);
-            let rms = if samples.is_empty() {
-                0.0
-            } else {
-                (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32)
-                    .sqrt()
-            };
-            serde_json::json!({
-                "startOffsetSeconds": index,
-                "durationSeconds": samples.len() as f32
-                    / (audio_analysis::SAMPLE_RATE as f32 * audio_analysis::CHANNEL_COUNT as f32),
-                "peakDbfs": amplitude_dbfs(peak),
-                "rmsDbfs": amplitude_dbfs(rms)
-            })
-        })
-        .collect::<Vec<_>>();
     serde_json::json!({
-        "sampleCount": region.samples.len() / audio_analysis::CHANNEL_COUNT,
-        "eventCount": region.event_count,
-        "peakAmplitude": analysis.peak,
         "peakDbfs": amplitude_dbfs(analysis.peak),
-        "rmsAmplitude": analysis.rms,
         "rmsDbfs": amplitude_dbfs(analysis.rms),
         "crestFactorDb": if analysis.rms > 0.0 {
             Some(20.0 * (analysis.peak / analysis.rms).log10())
@@ -2489,12 +2467,9 @@ fn region_measurements(region: &audio_analysis::AudioRegion) -> JsonValue {
         "dcOffset": dc_offset,
         "zeroCrossingRate": analysis.zero_crossing_rate,
         "spectralCentroidHz": analysis.spectral_centroid_hz,
-        "energyRatios": {
-            "low": analysis.low_energy_ratio,
-            "mid": analysis.mid_energy_ratio,
-            "high": analysis.high_energy_ratio
-        },
-        "oneSecondWindows": time_series
+        "lowBandEnergyRatio": analysis.low_energy_ratio,
+        "midBandEnergyRatio": analysis.mid_energy_ratio,
+        "highBandEnergyRatio": analysis.high_energy_ratio
     })
 }
 
@@ -3002,38 +2977,37 @@ mod tests {
 
     #[test]
     fn declares_direct_graph_editing_and_audio_tools() {
-        let declarations = tool_declarations_with_audio_metrics(true);
+        let declarations = tool_declarations();
         let names = declarations
             .iter()
             .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str))
             .collect::<Vec<_>>();
         assert_eq!(
-            names[0..6],
+            names[0..7],
             [
                 READ_TOOL_NAME,
                 AUDIO_TOOL_NAME,
+                ANALYZE_AUDIO_TOOL_NAME,
                 AUDITION_TOOL_NAME,
                 PRESET_TOOL_NAME,
                 INSTRUMENT_PARAMETER_TOOL_NAME,
                 SOUND_TOOL_PARAMETER_TOOL_NAME,
             ]
         );
-        assert_eq!(&names[6..], MUTATION_TOOL_NAMES);
+        assert_eq!(&names[7..], MUTATION_TOOL_NAMES);
         assert!(
             declarations[1]["description"]
                 .as_str()
                 .unwrap()
-                .contains("you decide whether and when to listen")
+                .contains("without measurements")
         );
-        let without_metrics = tool_declarations_with_audio_metrics(false);
-        let audio_description = without_metrics[1]["description"]
+        let analysis_description = declarations[2]["description"]
             .as_str()
-            .expect("audio tool description");
-        assert!(audio_description.contains("as WAV audio"));
-        assert!(audio_description.contains("objective measurements are disabled"));
-        assert!(!audio_description.contains("with objective mix and per-track measurements"));
+            .expect("analysis tool description");
+        assert!(analysis_description.contains("without audio"));
+        assert!(analysis_description.contains("without musical judgments"));
         assert_eq!(
-            declarations[2]["parameters"]["properties"]["durationBeats"]["maximum"],
+            declarations[3]["parameters"]["properties"]["durationBeats"]["maximum"],
             16
         );
         let midi = declarations
@@ -4329,7 +4303,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_render_description_names_surge_xt() {
+    fn audio_analysis_has_exactly_ten_standard_metrics_per_mix_and_track() {
         let session =
             EditSession::create(&Project::demo(), "listen", 0.0, 2.0).expect("edit session");
         let arguments = serde_json::json!({"tracks":[2],"start":0,"end":0.1});
@@ -4352,15 +4326,31 @@ mod tests {
             1
         );
         assert_eq!(surge.measurements["tracks"][0]["trackId"], 2);
-        assert!(surge.measurements["mix"]["peakDbfs"].as_f64().is_some());
-        assert!(surge.measurements["mix"]["rmsDbfs"].as_f64().is_some());
-        assert_eq!(
-            surge.measurements["mix"]["oneSecondWindows"]
-                .as_array()
-                .expect("time measurements")
-                .len(),
-            1
-        );
+        let expected = [
+            "clippedSampleCount",
+            "crestFactorDb",
+            "dcOffset",
+            "highBandEnergyRatio",
+            "lowBandEnergyRatio",
+            "midBandEnergyRatio",
+            "peakDbfs",
+            "rmsDbfs",
+            "spectralCentroidHz",
+            "zeroCrossingRate",
+        ];
+        for measurements in [
+            &surge.measurements["mix"],
+            &surge.measurements["tracks"][0]["measurements"],
+        ] {
+            let object = measurements.as_object().expect("measurement object");
+            assert_eq!(object.len(), 10);
+            assert!(expected.iter().all(|name| object.contains_key(*name)));
+            assert!(
+                object
+                    .values()
+                    .all(|value| value.is_number() || value.is_null())
+            );
+        }
     }
 
     #[test]

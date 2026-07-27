@@ -704,6 +704,33 @@ pub(crate) fn analyze(region: &AudioRegion) -> RegionAnalysis {
     }
 }
 
+pub(crate) fn spectrum_levels(region: &AudioRegion) -> [f32; 8] {
+    let mono = mono_samples(&region.samples);
+    if mono.is_empty() {
+        return [0.0; 8];
+    }
+    let powers = frame_power(&mono, mono.len().saturating_sub(FFT_SIZE));
+    let minimum_hz = 40.0_f32;
+    let maximum_hz = SAMPLE_RATE as f32 / 2.0;
+    let mut levels = [0.0; 8];
+    for (band, level) in levels.iter_mut().enumerate() {
+        let low = minimum_hz * (maximum_hz / minimum_hz).powf(band as f32 / 8.0);
+        let high = minimum_hz * (maximum_hz / minimum_hz).powf((band + 1) as f32 / 8.0);
+        let energy = powers
+            .iter()
+            .enumerate()
+            .filter(|(bin, _)| {
+                let hz = *bin as f32 * SAMPLE_RATE as f32 / FFT_SIZE as f32;
+                hz >= low && hz < high
+            })
+            .map(|(_, power)| *power)
+            .sum::<f32>();
+        let db = 10.0 * energy.max(1e-12).log10();
+        *level = ((db + 72.0) / 72.0).clamp(0.0, 1.0);
+    }
+    levels
+}
+
 fn mono_samples(samples: &[f32]) -> Vec<f32> {
     samples
         .chunks_exact(CHANNEL_COUNT)
@@ -2120,6 +2147,29 @@ mod tests {
         let occurrences = clip_events_in_window(&project, track, clip, 0.0, 1.0);
         assert_eq!(occurrences.len(), 1);
         assert!(occurrences[0].duration <= project.bpm as f32 / 120.0 + 0.000_01);
+    }
+
+    #[test]
+    fn spectrum_levels_are_bounded_and_distinguish_silence_from_tone() {
+        let silence = AudioRegion {
+            samples: vec![0.0; FFT_SIZE * CHANNEL_COUNT],
+            event_count: 0,
+            event_onsets: Vec::new(),
+        };
+        let tone = AudioRegion {
+            samples: (0..FFT_SIZE)
+                .flat_map(|index| {
+                    let sample = (2.0 * PI * 440.0 * index as f32 / SAMPLE_RATE as f32).sin() * 0.5;
+                    [sample, sample]
+                })
+                .collect(),
+            event_count: 0,
+            event_onsets: Vec::new(),
+        };
+        assert_eq!(spectrum_levels(&silence), [0.0; 8]);
+        let levels = spectrum_levels(&tone);
+        assert!(levels.iter().all(|level| (0.0..=1.0).contains(level)));
+        assert!(levels.iter().copied().fold(0.0, f32::max) > 0.5);
     }
 
     #[test]
