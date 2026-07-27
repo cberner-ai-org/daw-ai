@@ -26,6 +26,7 @@ pub(crate) const AUDITION_TOOL_NAME: &str = "audition_instrument";
 pub(crate) const PRESET_TOOL_NAME: &str = "list_surge_presets";
 pub(crate) const INSTRUMENT_PARAMETER_TOOL_NAME: &str = "list_instrument_parameters";
 pub(crate) const SOUND_TOOL_PARAMETER_TOOL_NAME: &str = "list_sound_tool_parameters";
+pub(crate) const LOAD_TOOL_GROUP_NAME: &str = "load_tool_group";
 const SET_INSTRUMENT_PARAMETER_TOOL_NAME: &str = "set_instrument_parameter";
 const SET_INSTRUMENT_PARAMETERS_TOOL_NAME: &str = "set_instrument_parameters";
 const UPDATE_EFFECT_PARAMETERS_TOOL_NAME: &str = "update_effect_parameters";
@@ -168,7 +169,7 @@ impl EditSession {
         start: f32,
         end: f32,
     ) -> io::Result<Self> {
-        Self::create_in(&session_root(), project, prompt, start, end, false)
+        Self::create_in(&session_root(), project, prompt, start, end, false, false)
     }
 
     pub(crate) fn create_in(
@@ -178,6 +179,7 @@ impl EditSession {
         start: f32,
         end: f32,
         batch_parameter_tools: bool,
+        trimmed_prompt: bool,
     ) -> io::Result<Self> {
         apply_session_retention_with(root, SessionRetention::configured())?;
         let path = reserve_session_directory(root)?;
@@ -205,6 +207,8 @@ impl EditSession {
                     "appliedSteps": 0,
                     "audioListens": 0,
                     "batchParameterTools": batch_parameter_tools,
+                    "trimmedPrompt": trimmed_prompt,
+                    "dynamicToolLoading": trimmed_prompt,
                     "detail": "Gemini session started"
                 })
                 .to_string(),
@@ -493,6 +497,68 @@ pub(crate) fn tool_declarations(batch_parameter_tools: bool) -> Vec<JsonValue> {
         ),
     ];
     tools.extend(mutation_tool_declarations(batch_parameter_tools));
+    tools
+}
+
+pub(crate) fn dynamic_tool_declarations(
+    batch_parameter_tools: bool,
+    group: Option<&str>,
+) -> Vec<JsonValue> {
+    let mut tools = tool_declarations(batch_parameter_tools);
+    let base = [
+        READ_TOOL_NAME,
+        AUDIO_TOOL_NAME,
+        ANALYZE_AUDIO_TOOL_NAME,
+        AUDITION_TOOL_NAME,
+        PRESET_TOOL_NAME,
+        INSTRUMENT_PARAMETER_TOOL_NAME,
+        SOUND_TOOL_PARAMETER_TOOL_NAME,
+    ];
+    tools.retain(|tool| {
+        let name = tool
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        base.contains(&name)
+            || match group {
+                Some("arrangement") => matches!(
+                    name,
+                    "new_track"
+                        | "delete_track"
+                        | "set_track_identity"
+                        | "add_midi_clip"
+                        | "update_midi_clip"
+                        | "delete_midi_clip"
+                        | "set_track_volume"
+                        | "set_track_mute"
+                        | "set_tempo"
+                        | "undo"
+                ),
+                Some("sound") => matches!(
+                    name,
+                    "set_surge_preset"
+                        | "add_effect"
+                        | "update_effect"
+                        | UPDATE_EFFECT_PARAMETERS_TOOL_NAME
+                        | "delete_effect"
+                        | "add_modulator"
+                        | "update_modulator"
+                        | "delete_modulator"
+                        | SET_INSTRUMENT_PARAMETER_TOOL_NAME
+                        | SET_INSTRUMENT_PARAMETERS_TOOL_NAME
+                        | "undo"
+                ),
+                _ => false,
+            }
+    });
+    tools.push(function(
+        LOAD_TOOL_GROUP_NAME,
+        "Load the arrangement or sound editing functions needed for the next operation. Call again to switch groups.",
+        object_schema(
+            serde_json::json!({"group":{"type":"string","enum":["arrangement","sound"]}}),
+            &["group"],
+        ),
+    ));
     tools
 }
 
@@ -1985,6 +2051,32 @@ pub(crate) fn apply_agent_mutation(
     if let Some(context) = midi_context {
         response["midiContext"] = context;
     }
+    if matches!(
+        name,
+        SET_INSTRUMENT_PARAMETERS_TOOL_NAME | UPDATE_EFFECT_PARAMETERS_TOOL_NAME
+    ) {
+        let single_mutation = if name == SET_INSTRUMENT_PARAMETERS_TOOL_NAME {
+            SET_INSTRUMENT_PARAMETER_TOOL_NAME
+        } else {
+            "update_effect"
+        };
+        let mut results = Vec::new();
+        for (parameter, _) in parameter_changes(object)? {
+            let mut single = object.clone();
+            single.insert(
+                "parameter".to_owned(),
+                JsonValue::String(parameter.to_owned()),
+            );
+            single.remove("changes");
+            if let Some(display) = mutation_display(studio.project(), single_mutation, &single) {
+                results.push(serde_json::json!({
+                    "parameter": parameter,
+                    "display": display
+                }));
+            }
+        }
+        response["parameterResults"] = JsonValue::Array(results);
+    }
     if let Some(display) = mutation_display(studio.project(), name, object) {
         response["display"] = JsonValue::String(display);
     }
@@ -2010,6 +2102,13 @@ fn mutation_display(
     }
     if mutation == "update_effect" {
         let effect_id = arguments.get("effectId")?.as_u64()?;
+        let effect = track.effects.iter().find(|effect| effect.id == effect_id)?;
+        if parameter == "mix" {
+            return Some(format!("{:.2} %", f64::from(effect.mix) * 100.0));
+        }
+        if parameter == "enabled" {
+            return Some(if effect.enabled { "On" } else { "Off" }.to_owned());
+        }
         return crate::surge::effect_parameter_semantics(
             &track.instrument,
             &track.effects,
@@ -2251,6 +2350,9 @@ fn normalize_effect_parameter_value(
         .iter()
         .find(|track| track.id == track_id)
         .ok_or_else(|| format!("track {track_id} does not exist"))?;
+    if matches!(parameter, "mix" | "enabled") {
+        return Ok(value.to_owned());
+    }
     let semantics = crate::surge::effect_parameter_semantics(
         &track.instrument,
         &track.effects,
@@ -3296,6 +3398,10 @@ mod tests {
                 .unwrap()
                 .contains("2 parameters")
         );
+        assert_eq!(response["parameterResults"][0]["parameter"], "mix");
+        assert_eq!(response["parameterResults"][0]["display"], "20.00 %");
+        assert_eq!(response["parameterResults"][1]["parameter"], "Amount");
+        assert!(response["parameterResults"][1]["display"].is_string());
         let updated = session.take_update().unwrap().expect("one atomic update");
         let effect = &updated.1.tracks[0].effects[0];
         assert!((effect.mix - 0.2).abs() < 0.001);
@@ -3356,6 +3462,13 @@ mod tests {
         )
         .expect("batch response");
         assert!(response["message"].as_str().unwrap().contains("2 Surge XT"));
+        assert_eq!(
+            response["parameterResults"]
+                .as_array()
+                .expect("instrument displays")
+                .len(),
+            2
+        );
         let updated = session.take_update().unwrap().expect("one atomic update");
         assert_eq!(
             updated.1.tracks[0]
@@ -3366,6 +3479,37 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn dynamic_declarations_keep_tool_groups_small_and_switchable() {
+        let initial = dynamic_tool_declarations(true, None);
+        assert_eq!(initial.len(), 8);
+        assert!(
+            initial
+                .iter()
+                .any(|tool| tool["name"] == LOAD_TOOL_GROUP_NAME)
+        );
+        assert!(!initial.iter().any(|tool| tool["name"] == "new_track"));
+
+        let arrangement = dynamic_tool_declarations(true, Some("arrangement"));
+        assert!(arrangement.len() <= 20);
+        assert!(
+            arrangement
+                .iter()
+                .any(|tool| tool["name"] == "add_midi_clip")
+        );
+        assert!(!arrangement.iter().any(|tool| tool["name"] == "add_effect"));
+
+        let sound = dynamic_tool_declarations(true, Some("sound"));
+        assert!(sound.len() <= 20);
+        assert!(sound.iter().any(|tool| tool["name"] == "add_effect"));
+        assert!(
+            sound
+                .iter()
+                .any(|tool| tool["name"] == UPDATE_EFFECT_PARAMETERS_TOOL_NAME)
+        );
+        assert!(!sound.iter().any(|tool| tool["name"] == "add_midi_clip"));
     }
 
     #[test]
