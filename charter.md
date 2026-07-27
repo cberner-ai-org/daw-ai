@@ -23,6 +23,8 @@ multiple users working on their own projects concurrently is supported.
 with their mouse and enter a prompt for the AI describing the change to be made. This might be something
 as simple as "increase volume" or as complex as "insert a sick drop here". The AI then makes those changes.
 
+There is also a small spectrum analyzer on the left of the timeline for each track, which animates during playback.
+
 After submitting a change request, the submit button becomes an interrupt button.
 
 Double-clicking (or long-pressing on mobile) on the track selects the entire track.
@@ -123,7 +125,7 @@ It can also be specified as an environment variable.
 
 Since Gemini is best at writing code and config files, the internal synth and other tools that DAW-AI uses should
 be represented a way that is friendly for Gemini:
-* The sound graph should be stored in a file on disk that Gemini can edit directly
+* The sound graph should be stored in a file on disk
 * Additionally, tools should be provided that are registered with Gemini and that make the
   modifications to the sound graph and return useful error messages to Gemini.
 * Gemini may perform multiple edits to fulfil a request, which are shown to the user incrementally
