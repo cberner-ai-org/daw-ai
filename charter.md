@@ -10,6 +10,9 @@ It should be simple to use and the interface should rely heavily on AI powered i
 
 There is an Export button that renders the whole track to a .wav file and initiates a download of it.
 
+There are two separate tabs, each filling most of the screen, and there is a prominent tab near the top to
+switch between AI Mode and Debug.
+
 #### Multi-user support
 
 There is no authentication. Users are identified with a cookie. Each user gets their own project. And
@@ -28,30 +31,16 @@ There is a session history list of all the actions the agent took. Clicking on o
 state, so that the user can play and inspect it. The session history does not rollback, allowing the user to navigate
 forward again.
 
-#### Advanced Mode
-There is also an advanced view which the user can open that shows the details of the instruments, effects,...etc
-that the agent has implemented for the track. This should be similar to a traditional DAW, but prioritize simple
-interfaces over super powerful tools. It allows the user to directly edit any of the tracks, and also create
-or delete entire tracks of the sound graph.
-
-MIDI clips are shown with a standard MIDI visualization and editor.
-
-Instruments, modulators, and effects are shown in an associated sound graph. Click a node in the graph shows
-a side pane that displays the relevant parameters and settings.
-
-These two views are separate tabs, each filling most of the screen, and there is a prominent tab near the top to
-switch between AI Mode, Advanced, and Debug.
-
 #### Debug
 
-There is also a third tab "Debug" which is a debugging pane showing error information, and other information
+There is also a tab "Debug" which is a debugging pane showing error information, and other information
 that is useful to a coding assistant. The information is easy for the user to copy and paste into an
 external coding assistant, if they need help debugging issues in DAW AI itself. It can be assumed that
 the user and coding assistant have access to the machine DAW AI is deployed on, to read additional logs...etc.
 
 ### Sound tools
 
-The following sound tools should be implemented and available in the advanced view of the UI and also to the AI model.
+The following sound tools should be implemented and available to the AI model.
 
 These are all implemented in the DAW AI backend. The client-side JS contains a basic editor to modify the sound graph and view it,
 but all execution of it is in the backend server process.
