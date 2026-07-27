@@ -42,6 +42,7 @@
     copyDebug: document.querySelector("#copy-debug"),
     clearDebug: document.querySelector("#clear-debug"),
     batchParameterTools: document.querySelector("#batch-parameter-tools"),
+    trimmedPrompt: document.querySelector("#trimmed-prompt"),
     refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
     geminiSessionList: document.querySelector("#gemini-session-list"),
     sessionHistoryList: document.querySelector("#session-history-list"),
@@ -76,6 +77,7 @@
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
   const BATCH_PARAMETER_TOOLS_STORAGE_KEY = "daw-ai.batch-parameter-tools.v1";
+  const TRIMMED_PROMPT_STORAGE_KEY = "daw-ai.trimmed-prompt.v1";
   const AUDIO_RETRY_DELAYS_MS = [250, 500, 1000];
   const AUDIO_SEEK_DEBOUNCE_MS = 200;
   const TOAST_DISMISS_MS = 4200;
@@ -1094,8 +1096,11 @@
           typeof pending.referenceAudio.data === "string");
       const validBatchSetting =
         pending.batchParameterTools === undefined || typeof pending.batchParameterTools === "boolean";
-      if (validOperationId && validRequest && validJob && validReference && validBatchSetting) {
+      const validPromptSetting =
+        pending.trimmedPrompt === undefined || typeof pending.trimmedPrompt === "boolean";
+      if (validOperationId && validRequest && validJob && validReference && validBatchSetting && validPromptSetting) {
         pending.batchParameterTools = pending.batchParameterTools === true;
+        pending.trimmedPrompt = pending.trimmedPrompt === true;
         return pending;
       }
     } catch (_error) {
@@ -1458,6 +1463,7 @@
           editBody.set("reference_audio_data", pending.referenceAudio.data);
         }
         editBody.set("batch_parameter_tools", String(pending.batchParameterTools === true));
+        editBody.set("trimmed_prompt", String(pending.trimmedPrompt === true));
         accepted = await acceptEdit(
           clientOperationId,
           editBody,
@@ -1576,6 +1582,7 @@
         acceptedJob: null,
         referenceAudio,
         batchParameterTools: elements.batchParameterTools.checked,
+        trimmedPrompt: elements.trimmedPrompt.checked,
       };
       if (!persistPendingEdit(pending) && referenceAudio) {
         throw new Error("Could not preserve the reference audio for edit recovery");
@@ -1699,6 +1706,7 @@
       `AI edit: ${state.promptPending ? "pending" : "idle"}`,
       `AI sessions: ${state.geminiSessions.length} retained locally`,
       `Batch parameter tools: ${elements.batchParameterTools.checked ? "enabled" : "disabled"}`,
+      `Trimmed Gemini prompt: ${elements.trimmedPrompt.checked ? "enabled" : "disabled"}`,
       `Selection: ${state.selectionStart.toFixed(1)}s - ${state.selectionEnd.toFixed(1)}s`,
     ];
     if (project) {
@@ -1717,7 +1725,7 @@
       for (const session of state.geminiSessions.slice(0, 10)) {
         lines.push(
           `${new Date(Number(session.createdAt) || 0).toISOString()} [${session.model || "Unknown provider"}; ${session.status || "unknown"}] ` +
-            `${session.appliedSteps || 0} edit actions, ${session.audioListens || 0} listens, batch parameters ${session.batchParameterTools ? "on" : "off"}: ${session.prompt || ""}`,
+            `${session.appliedSteps || 0} edit actions, ${session.audioListens || 0} listens, batch parameters ${session.batchParameterTools ? "on" : "off"}, trimmed prompt ${session.trimmedPrompt ? "on" : "off"}: ${session.prompt || ""}`,
         );
       }
     }
@@ -1744,7 +1752,7 @@
       .map(
         (session) => `<article class="gemini-session-item">
           <div><strong>${escapeHtml(new Date(Number(session.createdAt) || 0).toLocaleString())}</strong>
-          <span>${escapeHtml(session.model || "Unknown provider")} &middot; ${escapeHtml(session.status || "unknown")} &middot; ${Number(session.appliedSteps) || 0} actions &middot; ${Number(session.audioListens) || 0} listens &middot; batch ${session.batchParameterTools ? "on" : "off"}</span></div>
+          <span>${escapeHtml(session.model || "Unknown provider")} &middot; ${escapeHtml(session.status || "unknown")} &middot; ${Number(session.appliedSteps) || 0} actions &middot; ${Number(session.audioListens) || 0} listens &middot; batch ${session.batchParameterTools ? "on" : "off"} &middot; trimmed ${session.trimmedPrompt ? "on" : "off"}</span></div>
           <p>${escapeHtml(session.prompt || "Untitled edit")}</p>
         </article>`,
       )
@@ -1874,6 +1882,14 @@
     }
     renderDebug();
   });
+  elements.trimmedPrompt.addEventListener("change", () => {
+    try {
+      window.localStorage.setItem(TRIMMED_PROMPT_STORAGE_KEY, String(elements.trimmedPrompt.checked));
+    } catch (_error) {
+      // An unavailable preference store must not prevent the experiment.
+    }
+    renderDebug();
+  });
   elements.sessionHistoryList.addEventListener("click", (event) => {
     void enqueueProjectMutation(() => selectProjectHistory(event));
   });
@@ -1917,6 +1933,12 @@
         window.localStorage.getItem(BATCH_PARAMETER_TOOLS_STORAGE_KEY) === "true";
     } catch (_error) {
       elements.batchParameterTools.checked = false;
+    }
+    try {
+      elements.trimmedPrompt.checked =
+        window.localStorage.getItem(TRIMMED_PROMPT_STORAGE_KEY) === "true";
+    } catch (_error) {
+      elements.trimmedPrompt.checked = false;
     }
     const pending = readPendingEdit();
     if (pending) {

@@ -428,6 +428,7 @@ struct EditRequest {
     project: crate::model::Project,
     reference_audio: Option<crate::gemini::ReferenceAudio>,
     batch_parameter_tools: bool,
+    trimmed_prompt: bool,
 }
 
 struct EditFailure {
@@ -1158,6 +1159,10 @@ impl Router {
             Ok(value) => value,
             Err(message) => return Response::json(422, error_json(message)),
         };
+        let trimmed_prompt = match parse_optional_boolean(&form, "trimmed_prompt") {
+            Ok(value) => value,
+            Err(message) => return Response::json(422, error_json(message)),
+        };
         let project = {
             let studio = self.lock_studio();
             if let Err(error) = studio.validate_edit(start, end, prompt) {
@@ -1199,6 +1204,7 @@ impl Router {
             project,
             reference_audio,
             batch_parameter_tools,
+            trimmed_prompt,
         };
         let worker = self.clone();
         let spawn = thread::Builder::new()
@@ -1537,6 +1543,7 @@ impl Router {
             &edit.project,
             edit.reference_audio.clone(),
             edit.batch_parameter_tools,
+            edit.trimmed_prompt,
             cancellation,
             |request| {
                 self.edit_jobs.set_running(
@@ -2989,6 +2996,7 @@ mod tests {
             project: project.clone(),
             reference_audio: None,
             batch_parameter_tools: false,
+            trimmed_prompt: false,
         };
         let plan = |preset: &str, summary: &str| EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3127,6 +3135,7 @@ mod tests {
             project: project.clone(),
             reference_audio: None,
             batch_parameter_tools: false,
+            trimmed_prompt: false,
         };
         let first_plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3260,6 +3269,7 @@ mod tests {
             project: project.clone(),
             reference_audio: None,
             batch_parameter_tools: false,
+            trimmed_prompt: false,
         };
         let plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3683,6 +3693,9 @@ mod tests {
             )
             .unwrap_err(),
             "boolean setting must be true or false"
+        );
+        assert!(
+            parse_optional_boolean(&parse_form("trimmed_prompt=true"), "trimmed_prompt").unwrap()
         );
     }
 

@@ -16,10 +16,11 @@ use serde_json::Value as JsonValue;
 use crate::gemini_tools::render_audio_request;
 use crate::gemini_tools::{
     ANALYZE_AUDIO_TOOL_NAME, AUDIO_TOOL_NAME, AUDITION_TOOL_NAME, AudioRender, AudioRenderRequest,
-    EditSession, INSTRUMENT_PARAMETER_TOOL_NAME, PRESET_TOOL_NAME, READ_TOOL_NAME,
-    SOUND_TOOL_PARAMETER_TOOL_NAME, apply_agent_mutation, base64_audio, is_mutation_tool,
-    list_instrument_parameters, list_sound_tool_parameters, list_surge_presets,
-    prepare_audio_render, prepare_instrument_audition, read_sound_graph, tool_declarations,
+    EditSession, INSTRUMENT_PARAMETER_TOOL_NAME, LOAD_TOOL_GROUP_NAME, PRESET_TOOL_NAME,
+    READ_TOOL_NAME, SOUND_TOOL_PARAMETER_TOOL_NAME, apply_agent_mutation, base64_audio,
+    dynamic_tool_declarations, is_mutation_tool, list_instrument_parameters,
+    list_sound_tool_parameters, list_surge_presets, prepare_audio_render,
+    prepare_instrument_audition, read_sound_graph, tool_declarations,
 };
 use crate::model::Project;
 #[cfg(test)]
@@ -114,6 +115,7 @@ impl GeminiPlanner {
         project: &Project,
         reference_audio: Option<ReferenceAudio>,
         batch_parameter_tools: bool,
+        trimmed_prompt: bool,
         cancellation: Arc<AtomicBool>,
         mut render_audio: impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
         mut on_update: impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -125,6 +127,7 @@ impl GeminiPlanner {
             start,
             end,
             batch_parameter_tools,
+            trimmed_prompt,
         )
         .map_err(PlannerError::Io)?;
         let result = run_session_with_reference(
@@ -134,6 +137,7 @@ impl GeminiPlanner {
             end,
             reference_audio.as_ref(),
             batch_parameter_tools,
+            trimmed_prompt,
             cancellation,
             &mut render_audio,
             &mut on_update,
@@ -162,6 +166,7 @@ fn run_session_with_reference(
     end: f32,
     reference_audio: Option<&ReferenceAudio>,
     batch_parameter_tools: bool,
+    trimmed_prompt: bool,
     cancellation: Arc<AtomicBool>,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -176,6 +181,7 @@ fn run_session_with_reference(
         end,
         reference_audio,
         batch_parameter_tools,
+        trimmed_prompt,
         render_audio,
         on_update,
         &|| cancellation.load(Ordering::SeqCst),
@@ -213,6 +219,7 @@ fn run_session_with_transport(
         end,
         None,
         false,
+        false,
         render_audio,
         on_update,
         is_cancelled,
@@ -228,22 +235,23 @@ fn run_session_with_transport_reference(
     end: f32,
     reference_audio: Option<&ReferenceAudio>,
     batch_parameter_tools: bool,
+    trimmed_prompt: bool,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     is_cancelled: &impl Fn() -> bool,
     transport: &mut impl FnMut(usize, &JsonValue, Duration) -> Result<String, PlannerError>,
 ) -> Result<GeminiEdit, PlannerError> {
     let started = Instant::now();
-    let tools = tool_declarations(batch_parameter_tools);
+    let mut loaded_tool_group: Option<String> = None;
     let mut input = reference_audio.map_or_else(
-        || JsonValue::String(planner_task(prompt, start, end)),
+        || JsonValue::String(planner_task(prompt, start, end, trimmed_prompt)),
         |audio| {
             serde_json::json!([{
                 "type": "user_input",
                 "content": [
                     {"type": "text", "text": format!(
                         "{}\n\nThe user attached reference audio named {:?}. Listen to it and use it as the audible reference for the requested match or comparison.",
-                        planner_task(prompt, start, end),
+                        planner_task(prompt, start, end, trimmed_prompt),
                         audio.name
                     )},
                     {"type": "audio", "mime_type": audio.mime_type, "data": base64_audio(&audio.bytes)}
@@ -263,11 +271,16 @@ fn run_session_with_transport_reference(
             .checked_sub(started.elapsed())
             .ok_or(PlannerError::TimedOut)?;
         sequence += 1;
+        let tools = if trimmed_prompt {
+            dynamic_tool_declarations(batch_parameter_tools, loaded_tool_group.as_deref())
+        } else {
+            tool_declarations(batch_parameter_tools)
+        };
         let mut request = serde_json::json!({
             "model": GEMINI_MODEL,
             "input": input,
             "tools": &tools,
-            "system_instruction": system_instruction(),
+            "system_instruction": system_instruction(trimmed_prompt),
             "generation_config": {"thinking_level": "high"},
             "store": true
         });
@@ -309,7 +322,22 @@ fn run_session_with_transport_reference(
             if is_cancelled() {
                 return Err(PlannerError::Interrupted);
             }
-            let output = if index == 0 {
+            let output = if index == 0 && trimmed_prompt && call.name == LOAD_TOOL_GROUP_NAME {
+                let group = call
+                    .arguments
+                    .get("group")
+                    .and_then(JsonValue::as_str)
+                    .filter(|group| matches!(*group, "arrangement" | "sound"));
+                match group {
+                    Some(group) => {
+                        loaded_tool_group = Some(group.to_owned());
+                        ToolOutput::text(format!("Loaded {group} editing tools"))
+                    }
+                    None => ToolOutput::text(
+                        "Tool error: group must be arrangement or sound".to_owned(),
+                    ),
+                }
+            } else if index == 0 {
                 execute_tool(
                     session,
                     sequence,
@@ -800,13 +828,21 @@ fn missing_credentials(path: Option<&Path>) -> PlannerError {
     ))
 }
 
-fn planner_task(prompt: &str, start: f32, end: f32) -> String {
+fn planner_task(prompt: &str, start: f32, end: f32, trimmed_prompt: bool) -> String {
+    if trimmed_prompt {
+        return format!(
+            "Selected edit region: {start:.3} to {end:.3} seconds.\nUser request: {prompt}"
+        );
+    }
     format!(
         "Selected edit region: {start:.3} to {end:.3} seconds. This bounds graph edits, not listening.\nUser request: {prompt}\n\nBegin by reading the current sound graph. Before editing, form a concise musical plan for the selected region's arrangement based on the user's request, requested genre, and existing composition. Plan the section roles, rhythm, harmony, orchestration, energy contour, transitions, and sound design needed to make the genre and request recognizable. For creative work, listen after each change, compare the sound with the user's request, and iterate on composition and sound design until they match. Establish an audible baseline, audition important sound choices on isolated tracks, and evaluate the final full mix."
     )
 }
 
-fn system_instruction() -> String {
+fn system_instruction(trimmed_prompt: bool) -> String {
+    if trimmed_prompt {
+        return "You are interacting with a DAW-like environment powered by Surge XT. Perform the user's request using the available tools.".to_owned();
+    }
     format!(
         concat!(
             "You are the autonomous sound-graph producer inside DAW-AI. Use the registered tools; ",
@@ -1589,6 +1625,7 @@ mod tests {
             4.0,
             Some(&reference),
             false,
+            false,
             &mut render_audio_request,
             &mut |edit| Ok(edit.project),
             &|| false,
@@ -1692,8 +1729,8 @@ mod tests {
 
     #[test]
     fn gemini_prompt_encourages_iterative_listening_without_a_tempo_assumption() {
-        let task = planner_task("make the bass hit harder", 4.0, 8.0);
-        let instruction = system_instruction();
+        let task = planner_task("make the bass hit harder", 4.0, 8.0, false);
+        let instruction = system_instruction(false);
         assert!(task.contains("listen after each change"));
         assert!(task.contains("iterate on composition and sound design"));
         assert!(task.contains("requested genre"));
@@ -1712,6 +1749,14 @@ mod tests {
         assert!(instruction.contains("tempo must change"));
         assert!(instruction.contains("no separate completion reviewer"));
         assert!(instruction.contains("no predetermined tool-call or iteration limit"));
+        assert_eq!(
+            system_instruction(true),
+            "You are interacting with a DAW-like environment powered by Surge XT. Perform the user's request using the available tools."
+        );
+        assert!(!system_instruction(true).contains("rhythmic subdivision"));
+        let trimmed_task = planner_task("make the bass hit harder", 4.0, 8.0, true);
+        assert!(trimmed_task.contains("User request: make the bass hit harder"));
+        assert!(!trimmed_task.contains("musical plan"));
     }
 
     #[test]
