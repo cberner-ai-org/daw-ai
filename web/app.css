@@ -874,25 +874,6 @@ main {
   color: #696b74;
 }
 
-.reference-audio-control {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 8px;
-  color: var(--text-muted);
-  font-size: 11px;
-}
-
-.reference-audio-control input {
-  max-width: 220px;
-}
-
-.reference-audio-control small {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .compose-button {
   display: inline-flex;
   align-items: center;

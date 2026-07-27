@@ -616,6 +616,8 @@ async function run() {
         reportHeight: document.querySelector('#debug-report').getBoundingClientRect().height,
         settingsDisplay: getComputedStyle(document.querySelector('.debug-settings')).display,
         batchParameterTools: document.querySelector('#batch-parameter-tools').checked,
+        slimPrompt: document.querySelector('#slim-prompt').checked,
+        dynamicTools: document.querySelector('#dynamic-tools').checked,
       };
     })()`);
     assert.deepEqual(
@@ -628,6 +630,8 @@ async function run() {
     );
     assert.equal(debugView.debugVisible && debugView.aiHidden, true, "Debug must replace the AI Mode panel");
     assert.equal(debugView.batchParameterTools, false, "batch parameter tools must default off");
+    assert.equal(debugView.slimPrompt, false, "slim prompt must default off");
+    assert.equal(debugView.dynamicTools, false, "dynamic tools must default off independently");
     assert.ok(
       debugView.panelPadding >= 20 &&
         debugView.reportHeight >= 400 &&
@@ -957,18 +961,17 @@ async function run() {
       const originalFetch = window.fetch;
       window.__refusedEditRequests = 0;
       window.__refusedEditBody = null;
-      window.__persistedReferenceAtRequest = null;
       window.__persistedBatchAtRequest = null;
+      window.__persistedSlimAtRequest = null;
+      window.__persistedDynamicAtRequest = null;
       window.fetch = function fetch(resource, options) {
         if (resource === '/api/edits') {
           window.__refusedEditRequests += 1;
           window.__refusedEditBody = options.body.toString();
-          window.__persistedReferenceAtRequest = JSON.parse(
-            localStorage.getItem('daw-ai.pending-edit.v1'),
-          ).referenceAudio;
-          window.__persistedBatchAtRequest = JSON.parse(
-            localStorage.getItem('daw-ai.pending-edit.v1'),
-          ).batchParameterTools;
+          const pending = JSON.parse(localStorage.getItem('daw-ai.pending-edit.v1'));
+          window.__persistedBatchAtRequest = pending.batchParameterTools;
+          window.__persistedSlimAtRequest = pending.slimPrompt;
+          window.__persistedDynamicAtRequest = pending.dynamicTools;
           return Promise.resolve(new Response(JSON.stringify({ error: 'Edit request refused' }), {
             status: 422,
             headers: { 'Content-Type': 'application/json' },
@@ -979,11 +982,8 @@ async function run() {
       window.__restoreFetchAfterRefusedEdit = () => {
         window.fetch = originalFetch;
       };
-      const transfer = new DataTransfer();
-      transfer.items.add(new File([new Uint8Array([255, 255, 255])], 'one-shot.wav'));
-      const reference = document.querySelector('#reference-audio');
-      reference.files = transfer.files;
-      reference.dispatchEvent(new Event('change', { bubbles: true }));
+      document.querySelector('#slim-prompt').click();
+      document.querySelector('#dynamic-tools').click();
       const input = document.querySelector('#prompt-input');
       input.value = 'refused edit';
       document.querySelector('#prompt-form').requestSubmit();
@@ -1010,9 +1010,6 @@ async function run() {
       appSession,
       "Object.fromEntries(new URLSearchParams(window.__refusedEditBody))",
     );
-    assert.equal(refusedEditBody.reference_audio_name, "one-shot.wav");
-    assert.equal(refusedEditBody.reference_audio_type, "audio/wav");
-    assert.equal(refusedEditBody.reference_audio_data, "____");
     assert.equal(
       refusedEditBody.batch_parameter_tools,
       "true",
@@ -1024,25 +1021,29 @@ async function run() {
       "the variant must be retained with an unaccepted recoverable edit",
     );
     assert.equal(
-      await evaluate(cdp, appSession, `(() => {
-        const encodedData = window.__refusedEditBody.match(/reference_audio_data=([^&]*)/)[1];
-        return /%2F|%2B/i.test(encodedData);
-      })()`),
-      false,
-      "reference base64 must use URL-safe characters that do not expand during form encoding",
+      refusedEditBody.slim_prompt,
+      "true",
+      "the selected slim-prompt variant must travel with the edit request",
     );
-    assert.deepEqual(
-      await evaluate(cdp, appSession, "window.__persistedReferenceAtRequest"),
-      { name: "one-shot.wav", type: "audio/wav", data: "____" },
-      "an unaccepted edit must retain its reference audio for reload recovery",
+    assert.equal(
+      refusedEditBody.dynamic_tools,
+      "true",
+      "the selected dynamic-tools variant must travel independently",
     );
-    assert.deepEqual(
-      await evaluate(cdp, appSession, `({
-        count: document.querySelector('#reference-audio').files.length,
-        label: document.querySelector('#reference-audio-name').textContent,
-      })`),
-      { count: 0, label: "Attach a sound for Gemini to listen to and match" },
-      "submitting transfers attachment ownership out of the next prompt draft",
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__persistedSlimAtRequest"),
+      true,
+      "the slim-prompt variant must be retained with an unaccepted edit",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__persistedDynamicAtRequest"),
+      true,
+      "the dynamic-tools variant must be retained with an unaccepted edit",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "document.querySelector('#reference-audio')"),
+      null,
+      "the unused reference-audio upload must be absent",
     );
     await evaluate(cdp, appSession, `(() => {
       window.__restoreFetchAfterRefusedEdit();
