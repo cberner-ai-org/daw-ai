@@ -1512,20 +1512,13 @@ impl Studio {
                 Ok(())
             }
             Action::Gain { amount, target } => {
-                let tracks = matching_action_tracks(&mut self.project, *target)?;
-                for track in tracks {
-                    track.volume =
-                        ((track.volume * amount * 100.0).round() / 100.0).clamp(0.0, 1.5);
-                }
-                Ok(())
+                self.transform_midi_region(*target, start, end, |event| {
+                    event.velocity = (event.velocity * amount).clamp(0.01, 1.0);
+                })
             }
-            Action::Mute { target } => {
-                let tracks = matching_action_tracks(&mut self.project, *target)?;
-                for track in tracks {
-                    track.muted = true;
-                }
-                Ok(())
-            }
+            Action::Mute { target } => self.transform_midi_region(*target, start, end, |event| {
+                event.velocity = 0.01;
+            }),
             Action::Effect { name, mix, target } => {
                 let track_ids = matching_action_track_ids(&self.project, *target)?;
                 for track_id in track_ids {
@@ -1554,6 +1547,16 @@ impl Studio {
                 let track_ids = matching_action_track_ids(&self.project, *target)?;
                 for track_id in track_ids {
                     self.add_effect_to_candidate(track_id, "EQ", amount.abs().clamp(0.1, 1.0))?;
+                    let effect = self
+                        .project
+                        .tracks
+                        .iter_mut()
+                        .find(|track| track.id == track_id)
+                        .and_then(|track| track.effects.last_mut())
+                        .ok_or(StudioError::UnknownSoundTool)?;
+                    let gain = (0.5 + amount * 0.5).clamp(0.0, 1.0);
+                    effect.parameters.insert("Gain 3".to_owned(), gain);
+                    mark_effect_override(effect, "Gain 3");
                 }
                 Ok(())
             }
@@ -1598,6 +1601,55 @@ impl Studio {
             .routing
             .effect_order
             .push(id);
+        Ok(())
+    }
+
+    fn transform_midi_region(
+        &mut self,
+        target: Option<TrackRole>,
+        start: f32,
+        end: f32,
+        mut transform: impl FnMut(&mut ClipEvent),
+    ) -> Result<(), StudioError> {
+        let track_ids = matching_action_track_ids(&self.project, target)?;
+        for track_id in track_ids {
+            let track_index = self
+                .project
+                .tracks
+                .iter()
+                .position(|track| track.id == track_id)
+                .ok_or(StudioError::UnknownTrack)?;
+            let clips = std::mem::take(&mut self.project.tracks[track_index].clips);
+            let mut transformed = Vec::with_capacity(clips.len() * 3);
+            for clip in clips {
+                if clip.end <= start || clip.start >= end {
+                    transformed.push(clip);
+                    continue;
+                }
+                let middle_start = clip.start.max(start);
+                let middle_end = clip.end.min(end);
+                if clip.start < middle_start {
+                    let mut left = clip.clone();
+                    left.id = self.take_id();
+                    left.end = middle_start;
+                    transformed.push(left);
+                }
+                let mut middle = clip.clone();
+                middle.start = middle_start;
+                middle.end = middle_end;
+                for event in &mut middle.events {
+                    transform(event);
+                }
+                transformed.push(middle);
+                if middle_end < clip.end {
+                    let mut right = clip;
+                    right.id = self.take_id();
+                    right.start = middle_end;
+                    transformed.push(right);
+                }
+            }
+            self.project.tracks[track_index].clips = transformed;
+        }
         Ok(())
     }
 
@@ -4929,18 +4981,31 @@ mod tests {
 
     #[test]
     fn demo_gain_and_mute_plans_update_the_track_graph() {
-        let mut studio = Studio::new();
-        let initial_volume = studio.project().tracks[0].volume;
+        let mut studio = Studio::from_project(Project::demo());
+        let initial_volume = studio.project().tracks[1].volume;
         studio
-            .apply_prompt(0.0, 2.0, "increase volume")
+            .apply_prompt(4.0, 8.0, "increase volume on the bass")
             .expect("demo gain plan");
-        let expected = (initial_volume * 1.28 * 100.0).round() / 100.0;
-        assert_eq!(studio.project().tracks[0].volume, expected);
+        let bass = &studio.project().tracks[1];
+        assert_eq!(bass.volume, initial_volume);
+        assert!(
+            bass.clips
+                .iter()
+                .any(|clip| clip.start == 4.0 && clip.end == 8.0)
+        );
 
         studio
-            .apply_prompt(0.0, 2.0, "mute")
+            .apply_prompt(4.0, 8.0, "mute the bass")
             .expect("demo mute plan");
-        assert!(studio.project().tracks[0].muted);
+        let bass = &studio.project().tracks[1];
+        assert!(!bass.muted);
+        assert!(
+            bass.clips
+                .iter()
+                .filter(|clip| clip.start >= 4.0 && clip.end <= 8.0)
+                .flat_map(|clip| &clip.events)
+                .all(|event| event.velocity == 0.01)
+        );
     }
 
     #[test]

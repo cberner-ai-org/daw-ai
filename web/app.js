@@ -1112,7 +1112,7 @@
     return `<div class="midi-note-inspector" aria-label="${escapeHtml(`${name} editor`)}">
       <strong>${escapeHtml(midiNoteName(event.pitch))}</strong>
       ${input("Beat", "time", event.time, 0, clip.playback?.lengthBeats ?? clip.loopBeats, "any", true)}
-      ${input("Length", "duration", event.duration, 0.0625, clip.playback?.lengthBeats ?? clip.loopBeats, "any")}
+      ${input("Length", "duration", event.duration, 0.0625, Math.min(16, clip.playback?.lengthBeats ?? clip.loopBeats), "any")}
       ${input("Pitch", "pitch", event.pitch, 0, 127, 1)}
       ${input("Velocity", "velocity", event.velocity, 0.01, 1, "any")}
     </div>`;

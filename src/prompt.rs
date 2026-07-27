@@ -485,8 +485,7 @@ fn electronic_drop_plan(context: Option<PromptContext<'_>>) -> EditPlan {
     }
     EditPlan {
         action: Action::Compound { actions },
-        summary: "Recomposed the selection with half-time drums and syncopated modulated bass"
-            .to_owned(),
+        summary: "Recomposed the selection with half-time drums and syncopated bass".to_owned(),
     }
 }
 

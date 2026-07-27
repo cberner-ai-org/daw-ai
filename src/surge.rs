@@ -361,23 +361,11 @@ impl Engine {
         self.effect_parameters.clear();
         let mut assigned = HashMap::new();
         let mut occupied = [false; SERIAL_EFFECT_SLOT_COUNT];
-        for effect in effects.iter().filter(|effect| effect.enabled) {
-            if let Some(slot) = effect
-                .preset_slot
-                .filter(|slot| *slot < SERIAL_EFFECT_SLOT_COUNT)
-            {
-                assigned.insert(effect.id, slot);
-                occupied[slot] = true;
-            }
-        }
         for effect_id in effect_order {
             if !effects
                 .iter()
                 .any(|effect| effect.id == *effect_id && effect.enabled)
             {
-                continue;
-            }
-            if assigned.contains_key(effect_id) {
                 continue;
             }
             let slot = occupied
@@ -390,6 +378,20 @@ impl Engine {
                 })?;
             occupied[slot] = true;
             assigned.insert(*effect_id, slot);
+        }
+        for send in 1..=4 {
+            for parameter in [
+                format!("A Send FX {send} Level"),
+                format!("B Send FX {send} Level"),
+                format!("Send FX {send} Return"),
+            ] {
+                if self
+                    .parameter_value(&parameter)
+                    .is_some_and(|value| value > 0.0)
+                {
+                    self.set_parameter(&parameter, 0.0)?;
+                }
+            }
         }
         for (slot_index, slot) in SERIAL_EFFECT_SLOTS.iter().enumerate() {
             if !occupied[slot_index]
@@ -1110,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_effect_orchestration_preserves_native_send_slots() {
+    fn graph_effect_orchestration_disables_unrepresented_native_send_slots() {
         let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
         let mut engine =
             Engine::new_with_graph_effects(&instrument, &[], &[], &[], 1, 16_000.0, false)
@@ -1129,14 +1131,13 @@ mod tests {
             engine.parameter_display("FX B1 FX Type").as_deref(),
             Some("Off")
         );
-        assert_ne!(
-            engine.parameter_display("FX S1 FX Type").as_deref(),
-            Some("Off")
-        );
+        assert_eq!(engine.parameter_value("A Send FX 1 Level"), Some(0.0));
+        assert_eq!(engine.parameter_value("B Send FX 1 Level"), Some(0.0));
+        assert_eq!(engine.parameter_value("Send FX 1 Return"), Some(0.0));
     }
 
     #[test]
-    fn preset_effect_slots_stay_native_while_added_effects_use_open_slots() {
+    fn routing_order_controls_preset_and_added_effect_slots() {
         let instrument = crate::model::Project::demo().tracks[1].instrument.clone();
         let preset = Effect {
             id: 90,
@@ -1172,11 +1173,11 @@ mod tests {
         .expect("preset then added");
         assert_eq!(
             first.parameter_display("FX A1 FX Type").as_deref(),
-            Some("Distortion")
+            Some("Reverb 2")
         );
         assert_eq!(
             first.parameter_display("FX A2 FX Type").as_deref(),
-            Some("Reverb 2")
+            Some("Distortion")
         );
         drop(first);
 
