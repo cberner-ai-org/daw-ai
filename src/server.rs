@@ -2199,6 +2199,7 @@ impl Request {
             && (matches!(
                 self.path.as_str(),
                 "/api/edits"
+                    | "/api/duration"
                     | "/api/mix"
                     | "/api/sound-tools"
                     | "/api/channels"
@@ -4152,6 +4153,13 @@ mod tests {
         assert_eq!(router.handle(&hostile).status, 403);
         let project = router.handle(&request("GET", "/api/project", ""));
         assert!(!project.body.contains("increase volume"));
+
+        hostile.path = "/api/duration".to_owned();
+        hostile.body = "duration=10".to_owned();
+        assert_eq!(router.handle(&hostile).status, 403);
+        let project = router.handle(&request("GET", "/api/project", ""));
+        let project: serde_json::Value = serde_json::from_str(&project.body).expect("project JSON");
+        assert_eq!(project["duration"], 32.0);
 
         hostile.path = "/api/sound-tools".to_owned();
         hostile.body =
