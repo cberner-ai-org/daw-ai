@@ -4,7 +4,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::{env, fs};
 
 pub(crate) const FACTORY_PREFIX: &str = "Factory/";
-const HEADLESS_UNSAFE_PRESETS: &[&str] = &[];
+const HEADLESS_UNSAFE_PRESETS: &[&str] = &[
+    "Factory/Keys/House Organ",
+    "Factory/Pads/Bright",
+    "Factory/Templates/Audio In Left Osc 1 + Right Osc 2",
+    "Factory/Templates/Audio In Left Scene A + Right Scene B",
+    "Factory/Templates/Audio In Mono Osc 1",
+    "Factory/Templates/Audio In Stereo Osc 1",
+    "Factory/Templates/Init Paraphonic",
+    "Factory/Tutorials/Formula Modulator/11 Example - Reich - Piano Phase",
+    "Factory/Vocoder/Noise",
+    "Factory/Vocoder/Pop",
+    "Factory/Vocoder/Solo",
+];
 
 #[cfg(test)]
 pub(crate) fn headless_unsafe_presets() -> &'static [&'static str] {
@@ -14,7 +26,7 @@ pub(crate) fn headless_unsafe_presets() -> &'static [&'static str] {
 pub(crate) fn headless_render_error(id: &str) -> Option<String> {
     HEADLESS_UNSAFE_PRESETS.contains(&id).then(|| {
         format!(
-            "Surge XT preset {id} is disabled because it crashes the headless audio renderer; choose another preset"
+            "Surge XT preset {id} is disabled because it cannot produce valid headless audio; choose another preset"
         )
     })
 }
