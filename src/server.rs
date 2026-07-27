@@ -40,6 +40,8 @@ const AUDIO_RANGE_SAMPLES: usize =
     (audio_analysis::MAX_REGION_SECONDS * audio_analysis::SAMPLE_RATE as f32) as usize;
 const PLAYBACK_CHUNK_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 2;
 const AUDIO_STREAM_LOOKAHEAD_SAMPLES: usize = PLAYBACK_CHUNK_SAMPLES * 2;
+const TRACK_STEM_WINDOW_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 12;
+const TRACK_STEMS_MAGIC: &[u8; 8] = b"DAWSTEM1";
 const GEMINI_POLL_INTERVAL_MS: u64 = 1_000;
 const DEMO_POLL_INTERVAL_MS: u64 = 25;
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -133,6 +135,15 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
             if request.path.starts_with("/api/audio-stream/") {
                 let cancellation_stream = stream.try_clone()?;
                 return scoped.write_playback_stream_with_cancel(
+                    &request,
+                    stream,
+                    || stream_disconnected(&cancellation_stream),
+                    new_user_cookie.as_deref(),
+                );
+            }
+            if request.path.starts_with("/api/track-stems/") {
+                let cancellation_stream = stream.try_clone()?;
+                return scoped.write_track_stems_with_cancel(
                     &request,
                     stream,
                     || stream_disconnected(&cancellation_stream),
@@ -291,7 +302,6 @@ fn request_needs_user_scope(request: &Request) -> bool {
             | "/api/channels"
             | "/api/mix"
             | "/api/duration"
-            | "/api/spectrum"
             | "/api/sound-tools"
             | "/api/undo"
             | "/api/reset"
@@ -301,6 +311,7 @@ fn request_needs_user_scope(request: &Request) -> bool {
         || request.path.starts_with("/api/instrument-parameters/")
         || request.path.starts_with("/api/edit-operations/")
         || (request.path.starts_with("/api/audio-stream/") && request.user_id().is_some())
+        || (request.path.starts_with("/api/track-stems/") && request.user_id().is_some())
 }
 
 fn expire_and_bound_user_cache(users: &mut HashMap<String, CachedUser>) {
@@ -457,18 +468,30 @@ impl AudioRenderer {
         )
     }
 
-    fn stream_region_with(
+    fn stream_stems_sample_range(
         &self,
         project: &crate::model::Project,
         start_sample: usize,
         end_sample: usize,
         is_cancelled: &impl Fn() -> bool,
-        render: impl FnOnce(
-            &crate::model::Project,
-            usize,
-            usize,
-        ) -> Result<audio_analysis::AudioRegion, String>,
-    ) -> Result<audio_analysis::AudioRegion, AudioRenderError> {
+    ) -> Result<Vec<(u64, audio_analysis::AudioRegion)>, AudioRenderError> {
+        self.stream_region_with(
+            project,
+            start_sample,
+            end_sample,
+            is_cancelled,
+            audio_analysis::render_project_stems_sample_range,
+        )
+    }
+
+    fn stream_region_with<T>(
+        &self,
+        project: &crate::model::Project,
+        start_sample: usize,
+        end_sample: usize,
+        is_cancelled: &impl Fn() -> bool,
+        render: impl FnOnce(&crate::model::Project, usize, usize) -> Result<T, String>,
+    ) -> Result<T, AudioRenderError> {
         loop {
             if is_cancelled() {
                 return Err(AudioRenderError::Cancelled);
@@ -710,6 +733,99 @@ fn planner_failure(error: PlannerError) -> EditFailure {
 }
 
 impl Router {
+    fn write_track_stems_with_cancel(
+        &self,
+        request: &Request,
+        output: &mut impl Write,
+        is_cancelled: impl Fn() -> bool,
+        set_cookie: Option<&str>,
+    ) -> io::Result<()> {
+        let Some(public_host) = request.public_host() else {
+            return Response::json(400, error_json("invalid host")).write(output);
+        };
+        if request.method != "GET" {
+            return Response::json(405, error_json("method not allowed"))
+                .with_header("Allow", "GET")
+                .write(output);
+        }
+        let Some((token, version, start_milliseconds)) = track_stems_stream(&request.path) else {
+            return Response::json(404, error_json("track stems not found")).write(output);
+        };
+        if token != self.audio_token.as_str() || !request.is_trusted_request(public_host) {
+            return Response::json(403, error_json("cross-origin audio request rejected"))
+                .write(output);
+        }
+
+        let project = self.lock_studio().project().clone();
+        if version != project.version {
+            return Response::json(
+                409,
+                error_json("project changed before stems were rendered"),
+            )
+            .write(output);
+        }
+        let start_sample = audio_analysis::playback_start_sample_milliseconds(start_milliseconds);
+        let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
+        if start_sample >= project_end_sample {
+            return Response::json(422, error_json("track stem start is outside the project"))
+                .write(output);
+        }
+        let end_sample = (start_sample + TRACK_STEM_WINDOW_SAMPLES).min(project_end_sample);
+        let sample_count = end_sample - start_sample;
+        let track_count = project.tracks.len();
+        let chunk_count = sample_count.div_ceil(PLAYBACK_CHUNK_SAMPLES);
+        let header_length = 28usize.saturating_add(track_count.saturating_mul(8));
+        let total_length = header_length
+            .saturating_add(chunk_count.saturating_mul(4))
+            .saturating_add(sample_count.saturating_mul(4).saturating_mul(track_count));
+        write_response_head(
+            output,
+            200,
+            "application/vnd.daw-ai.track-stems",
+            total_length,
+            &[("Cache-Control", "no-store")],
+            set_cookie,
+        )?;
+        output.write_all(TRACK_STEMS_MAGIC)?;
+        output.write_all(&audio_analysis::SAMPLE_RATE.to_le_bytes())?;
+        output.write_all(&(track_count as u32).to_le_bytes())?;
+        output.write_all(&(sample_count as u64).to_le_bytes())?;
+        output.write_all(&(PLAYBACK_CHUNK_SAMPLES as u32).to_le_bytes())?;
+        for track in &project.tracks {
+            output.write_all(&track.id.to_le_bytes())?;
+        }
+
+        let mut cursor = start_sample;
+        while cursor < end_sample {
+            if is_cancelled() {
+                return Ok(());
+            }
+            let end = (cursor + PLAYBACK_CHUNK_SAMPLES).min(end_sample);
+            let stems = match self.audio_renderer.stream_stems_sample_range(
+                &project,
+                cursor,
+                end,
+                &is_cancelled,
+            ) {
+                Ok(stems) => stems,
+                Err(AudioRenderError::Render(error)) => {
+                    eprintln!("error: could not render track stems: {error}");
+                    return Err(io::Error::other("could not render track stems"));
+                }
+                Err(AudioRenderError::Cancelled) => return Ok(()),
+            };
+            output.write_all(&((end - cursor) as u32).to_le_bytes())?;
+            for (expected, (track_id, region)) in project.tracks.iter().zip(stems) {
+                if expected.id != track_id {
+                    return Err(io::Error::other("track stem order changed during render"));
+                }
+                output.write_all(&audio_analysis::pcm_bytes(&region.samples))?;
+            }
+            cursor = end;
+        }
+        Ok(())
+    }
+
     fn write_export(
         &self,
         request: &Request,
@@ -991,7 +1107,6 @@ impl Router {
             ("POST", "/api/channels") => self.change_channel(&request.body),
             ("POST", "/api/mix") => self.change_mix(&request.body),
             ("POST", "/api/duration") => self.change_duration(&request.body),
-            ("POST", "/api/spectrum") => self.spectrum(&request.body),
             ("POST", "/api/sound-tools") => self.change_sound_tool(&request.body),
             ("POST", "/api/logs") => Self::client_log(&request.body),
             ("POST", "/api/undo") => self.undo(),
@@ -999,8 +1114,8 @@ impl Router {
             ("POST", "/api/history") => self.select_history(&request.body),
             (
                 _,
-                "/api/edits" | "/api/channels" | "/api/mix" | "/api/duration" | "/api/spectrum"
-                | "/api/sound-tools" | "/api/logs" | "/api/undo" | "/api/reset",
+                "/api/edits" | "/api/channels" | "/api/mix" | "/api/duration" | "/api/sound-tools"
+                | "/api/logs" | "/api/undo" | "/api/reset",
             ) => Response::json(405, error_json("method not allowed")).with_header("Allow", "POST"),
             (_, "/api/project" | "/api/health" | "/api/gemini-sessions") => {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
@@ -1558,46 +1673,6 @@ impl Router {
                 Err(response) => response,
             },
             Err(error) => Response::json(422, studio_error(error)),
-        }
-    }
-
-    fn spectrum(&self, body: &str) -> Response {
-        let form = parse_form(body);
-        let Some(start) = form
-            .get("start")
-            .and_then(|value| value.parse::<f32>().ok())
-        else {
-            return Response::json(422, error_json("spectrum start is required"));
-        };
-        let project = self.lock_studio().project().clone();
-        let start = start.clamp(0.0, project.duration);
-        let end = (start + 0.125).min(project.duration);
-        if end <= start {
-            return Response::json(200, "{\"tracks\":[]}".to_owned());
-        }
-        let track_ids = project
-            .tracks
-            .iter()
-            .map(|track| track.id)
-            .collect::<Vec<_>>();
-        match audio_analysis::render_region_with_tracks(&project, &track_ids, start, end) {
-            Ok(regions) => {
-                let tracks = regions
-                    .tracks
-                    .iter()
-                    .map(|(id, region)| {
-                        let levels = audio_analysis::spectrum_levels(region)
-                            .iter()
-                            .map(|level| format!("{level:.4}"))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("{{\"trackId\":{id},\"levels\":[{levels}]}}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                Response::json(200, format!("{{\"tracks\":[{tracks}]}}"))
-            }
-            Err(error) => Response::json(422, error_json(&error)),
         }
     }
 
@@ -2267,6 +2342,17 @@ fn playback_audio_stream(path: &str) -> Option<(&str, u64, u64)> {
     Some((token, version, start_milliseconds))
 }
 
+fn track_stems_stream(path: &str) -> Option<(&str, u64, u64)> {
+    let mut parts = path.strip_prefix("/api/track-stems/")?.split('/');
+    let token = parts.next()?;
+    let version = parts.next()?.parse::<u64>().ok()?;
+    let start_milliseconds = parts.next()?.parse::<u64>().ok()?;
+    if token.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some((token, version, start_milliseconds))
+}
+
 fn edit_operation_id(path: &str) -> Option<&str> {
     let operation_id = path.strip_prefix("/api/edit-operations/")?;
     valid_operation_id(operation_id).then_some(operation_id)
@@ -2603,20 +2689,6 @@ mod tests {
             presets
                 .iter()
                 .any(|preset| preset == "Factory/Leads/Classic Lead 1")
-        }));
-    }
-
-    #[test]
-    fn serves_backend_track_spectrum_levels() {
-        let response = Router::demo().handle(&request("POST", "/api/spectrum", "start=0"));
-        assert_eq!(response.status, 200);
-        let body: serde_json::Value = serde_json::from_str(&response.body).expect("spectrum JSON");
-        let tracks = body["tracks"].as_array().expect("spectrum tracks");
-        assert_eq!(tracks.len(), Project::demo().tracks.len());
-        assert!(tracks.iter().all(|track| {
-            track["levels"]
-                .as_array()
-                .is_some_and(|levels| levels.len() == 8)
         }));
     }
 
@@ -3680,6 +3752,71 @@ mod tests {
     }
 
     #[test]
+    fn streams_synchronized_pcm_stems_for_every_track() {
+        let router = Router::demo();
+        let mut project = router.lock_studio().project().clone();
+        project.duration = 0.25;
+        *router.lock_studio() = Studio::from_project(project.clone());
+        let mut response = Vec::new();
+        router
+            .write_track_stems_with_cancel(
+                &request(
+                    "GET",
+                    &format!("/api/track-stems/test-audio-token/{}/0", project.version),
+                    "",
+                ),
+                &mut response,
+                || false,
+                None,
+            )
+            .expect("track stem response");
+
+        let body_start = find_bytes(&response, b"\r\n\r\n").expect("HTTP response head") + 4;
+        let head = std::str::from_utf8(&response[..body_start]).expect("stem response head");
+        let body = &response[body_start..];
+        assert!(head.starts_with(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.daw-ai.track-stems\r\n"
+        ));
+        assert_eq!(&body[..8], TRACK_STEMS_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(body[8..12].try_into().unwrap()),
+            audio_analysis::SAMPLE_RATE
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize,
+            project.tracks.len()
+        );
+        let sample_count = u64::from_le_bytes(body[16..24].try_into().unwrap()) as usize;
+        assert_eq!(
+            sample_count,
+            audio_analysis::playback_sample_count(0.0, 0.25)
+        );
+        let mut offset = 28;
+        for track in &project.tracks {
+            assert_eq!(
+                u64::from_le_bytes(body[offset..offset + 8].try_into().unwrap()),
+                track.id
+            );
+            offset += 8;
+        }
+        let frames = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        assert_eq!(frames, sample_count);
+        for track in &project.tracks {
+            let pcm = &body[offset..offset + frames * 4];
+            assert!(
+                pcm.chunks_exact(2)
+                    .any(|sample| i16::from_le_bytes(sample.try_into().unwrap()) != 0),
+                "track {} stem was silent",
+                track.id
+            );
+            offset += frames * 4;
+        }
+        assert_eq!(offset, body.len());
+        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
+    }
+
+    #[test]
     fn export_streams_wav_bytes_and_sets_a_new_user_cookie() {
         let router = Router::demo();
         let mut project = router.lock_studio().project().clone();
@@ -3771,7 +3908,9 @@ mod tests {
                     }
                     second_cancelled.load(Ordering::SeqCst)
                 },
-                |_, _, _| panic!("a cancelled queued stream must not render"),
+                |_, _, _| -> Result<audio_analysis::AudioRegion, String> {
+                    panic!("a cancelled queued stream must not render")
+                },
             )
         });
 

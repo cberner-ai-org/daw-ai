@@ -593,18 +593,6 @@ main {
   transition: height 120ms linear;
 }
 
-[data-audio-state="playing"] .track-spectrum i {
-  animation: spectrum-pulse 620ms ease-in-out infinite alternate;
-  animation-delay: calc(var(--spectrum-level, 0) * -410ms);
-}
-
-@keyframes spectrum-pulse {
-  to {
-    height: max(1px, calc(var(--spectrum-level, 0) * 12px));
-    opacity: 0.58;
-  }
-}
-
 .track-meta strong,
 .track-meta span {
   display: block;
