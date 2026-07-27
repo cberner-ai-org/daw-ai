@@ -44,7 +44,6 @@
 
     <nav class="view-tabs" role="tablist" aria-label="Studio views">
       <button class="view-tab is-active" id="ai-mode-button" type="button" role="tab" aria-selected="true" aria-controls="ai-mode-panel">AI Mode</button>
-      <button class="view-tab advanced-button" id="advanced-button" type="button" role="tab" aria-selected="false" aria-controls="advanced-drawer" tabindex="-1">Advanced</button>
       <button class="view-tab" id="debug-button" type="button" role="tab" aria-selected="false" aria-controls="debug-panel" tabindex="-1">Debug</button>
     </nav>
 
@@ -146,32 +145,6 @@
           <p class="session-history-hint">Gemini and manual changes, most recent first. Jump to any earlier project state without losing what came after it.</p>
           <div id="session-history-list" class="history-list" aria-live="polite"></div>
         </section>
-      </section>
-
-      <section class="view-panel advanced-drawer" id="advanced-drawer" role="tabpanel" aria-labelledby="advanced-button" hidden inert>
-        <div class="drawer-header">
-          <div>
-            <p class="eyebrow">ADVANCED VIEW</p>
-            <h2 id="advanced-title">Sound details</h2>
-          </div>
-          <div class="heading-actions">
-            <button class="text-button" id="advanced-duration-button" type="button">Duration</button>
-            <button class="text-button close-button" id="close-advanced" type="button">Back to AI Mode</button>
-          </div>
-        </div>
-        <p class="drawer-intro">Edit MIDI in a piano roll, inspect typed routing, and select a sound-graph node to change its parameters. Gemini sees the same graph.</p>
-        <form class="channel-creator" id="channel-creator">
-          <label for="channel-role">New track</label>
-          <select id="channel-role" name="role">
-            <option value="drums">Drums</option>
-            <option value="bass">Bass</option>
-            <option value="chords">Chords</option>
-            <option value="lead">Lead</option>
-            <option value="texture">Texture</option>
-          </select>
-          <button class="secondary-button" id="add-channel" type="submit">Add track</button>
-        </form>
-        <div class="channel-list" id="channel-list"></div>
       </section>
 
       <section class="view-panel debug-panel" id="debug-panel" role="tabpanel" aria-labelledby="debug-button" hidden inert>
