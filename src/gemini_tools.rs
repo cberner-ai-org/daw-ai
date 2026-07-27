@@ -20,6 +20,7 @@ use crate::storage::{ProjectStore, read_bounded_text, replace_text_file};
 
 pub(crate) const READ_TOOL_NAME: &str = "read_sound_graph";
 pub(crate) const AUDIO_TOOL_NAME: &str = "render_audio_region";
+pub(crate) const AUDITION_TOOL_NAME: &str = "audition_instrument";
 pub(crate) const PRESET_TOOL_NAME: &str = "list_surge_presets";
 pub(crate) const INSTRUMENT_PARAMETER_TOOL_NAME: &str = "list_instrument_parameters";
 pub(crate) const SOUND_TOOL_PARAMETER_TOOL_NAME: &str = "list_sound_tool_parameters";
@@ -82,6 +83,38 @@ const AUDIO_REGION_SCHEMA: &str = r#"{
     }
   }
 }"#;
+const EFFECT_NAMES: &[&str] = &[
+    "Delay",
+    "Reverb 1",
+    "Phaser",
+    "Rotary Speaker",
+    "Distortion",
+    "EQ",
+    "Frequency Shifter",
+    "Conditioner",
+    "Chorus",
+    "Vocoder",
+    "Reverb 2",
+    "Flanger",
+    "Ring Modulator",
+    "Airwindows",
+    "Neuron",
+    "Graphic EQ",
+    "Resonator",
+    "CHOW",
+    "Exciter",
+    "Ensemble",
+    "Combulator",
+    "Nimbus",
+    "Tape",
+    "Treemonster",
+    "Waveshaper",
+    "Mid-Side Tool",
+    "Spring Reverb",
+    "Bonsai",
+    "Floaty Delay",
+    "Convolution",
+];
 static SESSION_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_SESSION_RETENTION_DAYS: u64 = 30;
 const DEFAULT_SESSION_RETENTION_COUNT: usize = 100;
@@ -391,6 +424,35 @@ pub(crate) fn tool_declarations_with_audio_metrics(include_audio_metrics: bool) 
             "parameters": audio_schema
         }),
         function(
+            AUDITION_TOOL_NAME,
+            "Render a disposable Surge XT instrument audition without changing the sound graph or edit history. Supply an installed preset, a short beat-relative MIDI sequence, and optionally one effect. The current project tempo is used.",
+            object_schema(
+                serde_json::json!({
+                    "presetId":{"type":"string","minLength":1,"maxLength":200,"description":"Exact installed preset ID returned by list_surge_presets."},
+                    "durationBeats":{"type":"number","minimum":0.25,"maximum":16,"description":"Audition length in beats; the resulting audio may not exceed 16 seconds."},
+                    "events":{
+                        "type":"array","minItems":1,"maxItems":MAX_MIDI_EVENTS_PER_CLIP,
+                        "items":{"type":"object","properties":{
+                            "time":{"type":"number","minimum":0,"maximum":16},
+                            "duration":{"type":"number","minimum":MIN_MIDI_NOTE_BEATS,"maximum":MAX_MIDI_NOTE_DURATION_BEATS},
+                            "pitch":{"type":"integer","minimum":0,"maximum":127},
+                            "velocity":{"type":"number","minimum":0.01,"maximum":1}
+                        },"required":["time","duration","pitch","velocity"],"additionalProperties":false}
+                    },
+                    "effect":{
+                        "type":"object",
+                        "properties":{
+                            "name":{"type":"string","enum":EFFECT_NAMES},
+                            "mix":{"type":"number","minimum":0,"maximum":1}
+                        },
+                        "required":["name","mix"],
+                        "additionalProperties":false
+                    }
+                }),
+                &["presetId", "durationBeats", "events"],
+            ),
+        ),
+        function(
             PRESET_TOOL_NAME,
             "Browse one level of the installed Surge XT factory preset hierarchy. Start at Factory and continue with exact returned folder paths until preset IDs are returned for set_surge_preset.",
             object_schema(
@@ -557,7 +619,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             "add_effect",
             "Append a named effect after the preset's visible embedded effects and set its mix. Surge XT has eight serial slots shared by preset effects and added effects. Returns the stable effect ID; use list_sound_tool_parameters to list all of its controls.",
             object_schema(
-                serde_json::json!({"trackId":id(),"name":{"type":"string","enum":["Delay","Reverb 1","Phaser","Rotary Speaker","Distortion","EQ","Frequency Shifter","Conditioner","Chorus","Vocoder","Reverb 2","Flanger","Ring Modulator","Airwindows","Neuron","Graphic EQ","Resonator","CHOW","Exciter","Ensemble","Combulator","Nimbus","Tape","Treemonster","Waveshaper","Mid-Side Tool","Spring Reverb","Bonsai","Floaty Delay","Convolution"]},"mix":{"type":"number","minimum":0,"maximum":1}}),
+                serde_json::json!({"trackId":id(),"name":{"type":"string","enum":EFFECT_NAMES},"mix":{"type":"number","minimum":0,"maximum":1}}),
                 &["trackId", "name", "mix"],
             ),
         ),
@@ -918,7 +980,7 @@ pub(crate) fn list_surge_presets(arguments: &JsonValue) -> Result<String, String
         })
         .transpose()?
         .unwrap_or_else(|| "Factory".to_owned());
-    let catalog = crate::surge_presets::catalog();
+    let catalog = crate::surge_presets::render_safe_catalog();
     let level = crate::surge_presets::browse(&catalog, &path)
         .ok_or_else(|| format!("preset folder does not exist: {path}; browse from Factory"))?;
     let folders = level
@@ -1554,6 +1616,9 @@ pub(crate) fn apply_agent_mutation(
                     "Surge XT factory preset is not installed: {preset_id}; use {PRESET_TOOL_NAME} to discover available preset IDs"
                 ));
             }
+            if let Some(error) = crate::surge_presets::headless_render_error(preset_id) {
+                return Err(error);
+            }
             let instrument_id = studio
                 .project()
                 .tracks
@@ -1698,7 +1763,16 @@ pub(crate) fn apply_agent_mutation(
             let value = required_string(object, "value")?;
             studio
                 .configure_sound_tool(track_id, tool, tool_id, None, parameter, value)
-                .map_err(|error| parameter_error_message(error, tool, tool_id, parameter))?;
+                .map_err(|error| {
+                    parameter_error_message(
+                        error,
+                        studio.project(),
+                        track_id,
+                        tool,
+                        tool_id,
+                        parameter,
+                    )
+                })?;
             format!("Set Surge XT instrument parameter {parameter} on track {track_id}")
         }
         "set_parameter" => {
@@ -1713,7 +1787,16 @@ pub(crate) fn apply_agent_mutation(
             let value = required_string(object, "value")?;
             studio
                 .configure_sound_tool(track_id, tool, tool_id, clip_id, parameter, value)
-                .map_err(|error| parameter_error_message(error, tool, tool_id, parameter))?;
+                .map_err(|error| {
+                    parameter_error_message(
+                        error,
+                        studio.project(),
+                        track_id,
+                        tool,
+                        tool_id,
+                        parameter,
+                    )
+                })?;
             format!("Set {tool} {tool_id} {parameter} on track {track_id}")
         }
         "set_track_volume" => {
@@ -1780,8 +1863,25 @@ pub(crate) fn apply_agent_mutation(
         "message": summary,
         "version": studio.project().version,
         "id": result_id,
-        "channels": sound_tool_inventory(studio.project())
+        "channels": sound_tool_inventory(studio.project()),
+        "timing": {
+            "bpm": studio.project().bpm,
+            "secondsPerBeat": 60.0 / f64::from(studio.project().bpm)
+        }
     });
+    if matches!(name, "add_midi_clip" | "update_midi_clip") {
+        let start_beats = required_number(object, "startBeat")?;
+        let duration_beats = required_number(object, "durationBeats")?;
+        let seconds_per_beat = 60.0 / f64::from(studio.project().bpm);
+        response["clipTiming"] = serde_json::json!({
+            "startBeats": start_beats,
+            "endBeats": start_beats + duration_beats,
+            "durationBeats": duration_beats,
+            "startSeconds": start_beats * seconds_per_beat,
+            "endSeconds": (start_beats + duration_beats) * seconds_per_beat,
+            "durationSeconds": duration_beats * seconds_per_beat
+        });
+    }
     if let Some(context) = midi_context {
         response["midiContext"] = context;
     }
@@ -1999,16 +2099,79 @@ fn update_parameter(
     let tool_id = required_id(object, id_name)?;
     let parameter = required_string(object, "parameter")?;
     let value = required_string(object, "value")?;
+    let normalized_value = if tool == "effect" {
+        normalize_effect_parameter_value(studio.project(), track_id, tool_id, parameter, value)?
+    } else {
+        value.to_owned()
+    };
     studio
-        .configure_sound_tool(track_id, tool, tool_id, None, parameter, value)
-        .map_err(|error| parameter_error_message(error, tool, tool_id, parameter))?;
+        .configure_sound_tool(track_id, tool, tool_id, None, parameter, &normalized_value)
+        .map_err(|error| {
+            parameter_error_message(error, studio.project(), track_id, tool, tool_id, parameter)
+        })?;
     Ok(format!(
         "Updated {tool} {tool_id} {parameter} on track {track_id}"
     ))
 }
 
+fn normalize_effect_parameter_value(
+    project: &Project,
+    track_id: u64,
+    effect_id: u64,
+    parameter: &str,
+    value: &str,
+) -> Result<String, String> {
+    let track = project
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .ok_or_else(|| format!("track {track_id} does not exist"))?;
+    let semantics = crate::surge::effect_parameter_semantics(
+        &track.instrument,
+        &track.effects,
+        &track.routing.effect_order,
+        track_id,
+        effect_id,
+    );
+    let Some(semantics) = semantics.get(parameter) else {
+        let available = semantics.keys().cloned().collect::<Vec<_>>().join(", ");
+        return Err(format!(
+            "effect parameter {parameter} is invalid; valid parameters: {available}"
+        ));
+    };
+    if semantics.choices.is_empty() {
+        return Ok(value.to_owned());
+    }
+    if let Some((choice, _)) = semantics
+        .choices
+        .iter()
+        .find(|(_, display)| display.eq_ignore_ascii_case(value.trim()))
+    {
+        return Ok(choice.to_string());
+    }
+    if let Ok(number) = value.parse::<f32>()
+        && semantics
+            .choices
+            .iter()
+            .any(|(choice, _)| (*choice - number).abs() < 0.000_001)
+    {
+        return Ok(number.to_string());
+    }
+    let choices = semantics
+        .choices
+        .iter()
+        .map(|(choice, display)| format!("{display} ({choice})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "effect parameter {parameter} must be one of: {choices}"
+    ))
+}
+
 fn parameter_error_message(
     error: StudioError,
+    project: &Project,
+    track_id: u64,
     tool: &str,
     tool_id: u64,
     parameter: &str,
@@ -2022,6 +2185,10 @@ fn parameter_error_message(
     match error {
         StudioError::UnknownSoundTool => format!("{tool} {tool_id} not found"),
         StudioError::InvalidSoundTool => {
+            if tool == "effect" {
+                return normalize_effect_parameter_value(project, track_id, tool_id, parameter, "")
+                    .expect_err("an empty effect selection must be rejected");
+            }
             format!("invalid {tool} parameter or value: {parameter}")
         }
         other => studio_error_message(other),
@@ -2109,6 +2276,96 @@ pub(crate) fn prepare_audio_render(
     })
 }
 
+pub(crate) fn prepare_instrument_audition(
+    session_path: &Path,
+    arguments: &JsonValue,
+) -> Result<AudioRenderRequest, String> {
+    let current = current_project(session_path)?;
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "audition arguments must be an object".to_owned())?;
+    let preset_id = required_string(object, "presetId")?;
+    if crate::surge_presets::find(preset_id).is_none() {
+        return Err(format!(
+            "Surge XT factory preset is not installed: {preset_id}; use {PRESET_TOOL_NAME} to discover valid preset IDs"
+        ));
+    }
+    if let Some(error) = crate::surge_presets::headless_render_error(preset_id) {
+        return Err(error);
+    }
+    let duration_beats = required_number(object, "durationBeats")? as f32;
+    let seconds_per_beat = 60.0 / f32::from(current.bpm);
+    let duration_seconds = duration_beats * seconds_per_beat;
+    if !(0.25..=16.0).contains(&duration_beats) || duration_seconds > MAX_REGION_SECONDS {
+        let maximum_beats = (MAX_REGION_SECONDS / seconds_per_beat).min(16.0);
+        return Err(format!(
+            "durationBeats must be between 0.25 and {maximum_beats:.3} at {} BPM (0.125 to {MAX_REGION_SECONDS} seconds)",
+            current.bpm
+        ));
+    }
+
+    let mut project = Project::initial();
+    project.bpm = current.bpm;
+    project.duration = duration_seconds.max(0.25);
+    let mut studio = Studio::from_project(project);
+    let track_id = studio.project().tracks[0].id;
+    let instrument_id = studio.project().tracks[0].instrument.id;
+    studio
+        .configure_sound_tool(
+            track_id,
+            "instrument",
+            instrument_id,
+            None,
+            "preset",
+            preset_id,
+        )
+        .map_err(studio_error_message)?;
+    if let Some(effect) = object.get("effect") {
+        let effect = effect
+            .as_object()
+            .ok_or_else(|| "effect must be an object with name and mix".to_owned())?;
+        let name = required_string(effect, "name")?;
+        if !EFFECT_NAMES.contains(&name) {
+            return Err(format!(
+                "effect.name must be one of: {}",
+                EFFECT_NAMES.join(", ")
+            ));
+        }
+        let mix = required_number(effect, "mix")? as f32;
+        if !(0.0..=1.0).contains(&mix) {
+            return Err("effect.mix must be between 0 and 1".to_owned());
+        }
+        studio
+            .create_effect(track_id, name, mix)
+            .map_err(studio_error_message)?;
+    }
+    let mut clip = object.clone();
+    clip.insert("trackId".to_owned(), track_id.into());
+    clip.insert("label".to_owned(), "Audition".into());
+    clip.insert("startBeat".to_owned(), 0.into());
+    clip.insert("playback".to_owned(), serde_json::json!({"mode":"once"}));
+    let (_, spec) = clip_arguments(&clip, current.bpm)?;
+    studio
+        .create_midi_clip(track_id, &spec)
+        .map_err(studio_error_message)?;
+    let effect_description = object
+        .get("effect")
+        .and_then(JsonValue::as_object)
+        .and_then(|effect| effect.get("name"))
+        .and_then(JsonValue::as_str)
+        .map_or_else(String::new, |name| format!(" through {name}"));
+    Ok(AudioRenderRequest {
+        project: studio.project().clone(),
+        track_ids: vec![track_id],
+        start: 0.0,
+        end: duration_seconds,
+        description: format!(
+            "Auditioned {preset_id}{effect_description} for {duration_beats:.3} beats ({duration_seconds:.3} seconds) at {} BPM",
+            current.bpm
+        ),
+    })
+}
+
 pub(crate) fn render_audio_request(request: AudioRenderRequest) -> Result<AudioRender, String> {
     render_audio_request_cancellable(request, || false)
 }
@@ -2161,11 +2418,16 @@ fn audio_measurements(
         .collect::<Vec<_>>();
     serde_json::json!({
         "renderer": backend,
+        "bpm": request.project.bpm,
+        "secondsPerBeat": seconds(60.0 / f32::from(request.project.bpm)),
         "sampleRateHz": audio_analysis::SAMPLE_RATE,
         "channelCount": audio_analysis::CHANNEL_COUNT,
         "startSeconds": seconds(request.start),
         "endSeconds": seconds(request.end),
         "durationSeconds": seconds(request.end - request.start),
+        "startBeats": seconds(request.start * f32::from(request.project.bpm) / 60.0),
+        "endBeats": seconds(request.end * f32::from(request.project.bpm) / 60.0),
+        "durationBeats": seconds((request.end - request.start) * f32::from(request.project.bpm) / 60.0),
         "frequencyBandsHz": {
             "low": [0, 250],
             "mid": [250, 2500],
@@ -2746,16 +3008,17 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str))
             .collect::<Vec<_>>();
         assert_eq!(
-            names[0..5],
+            names[0..6],
             [
                 READ_TOOL_NAME,
                 AUDIO_TOOL_NAME,
+                AUDITION_TOOL_NAME,
                 PRESET_TOOL_NAME,
                 INSTRUMENT_PARAMETER_TOOL_NAME,
                 SOUND_TOOL_PARAMETER_TOOL_NAME,
             ]
         );
-        assert_eq!(&names[5..], MUTATION_TOOL_NAMES);
+        assert_eq!(&names[6..], MUTATION_TOOL_NAMES);
         assert!(
             declarations[1]["description"]
                 .as_str()
@@ -2769,6 +3032,10 @@ mod tests {
         assert!(audio_description.contains("as WAV audio"));
         assert!(audio_description.contains("objective measurements are disabled"));
         assert!(!audio_description.contains("with objective mix and per-track measurements"));
+        assert_eq!(
+            declarations[2]["parameters"]["properties"]["durationBeats"]["maximum"],
+            16
+        );
         let midi = declarations
             .iter()
             .find(|tool| tool["name"] == "add_midi_clip")
@@ -2836,6 +3103,100 @@ mod tests {
             update_modulator["parameters"]["properties"]["value"]["maxLength"],
             8_192
         );
+    }
+
+    #[test]
+    fn disposable_audition_builds_audio_request_without_mutating_session() {
+        let original = Project::initial();
+        let session = EditSession::create(&original, "audition a lead", 0.0, 4.0).expect("session");
+        let request = prepare_instrument_audition(
+            session.path(),
+            &serde_json::json!({
+                "presetId":"Factory/Leads/Classic Lead 1",
+                "durationBeats":2,
+                "events":[
+                    {"time":0,"duration":0.25,"pitch":60,"velocity":0.8},
+                    {"time":1,"duration":0.25,"pitch":64,"velocity":0.8}
+                ],
+                "effect":{"name":"Delay","mix":0.25}
+            }),
+        )
+        .expect("audition request");
+        assert_eq!(request.project.bpm, original.bpm);
+        assert_eq!(request.project.tracks.len(), 1);
+        assert_eq!(
+            request.project.tracks[0].instrument.preset,
+            "Factory/Leads/Classic Lead 1"
+        );
+        assert_eq!(request.project.tracks[0].clips.len(), 1);
+        assert_eq!(request.project.tracks[0].effects.len(), 1);
+        assert_eq!(request.end, 1.0);
+        assert!(session.take_update().unwrap().is_none());
+        assert_eq!(
+            current_project(session.path()).unwrap().to_json(),
+            original.to_json()
+        );
+
+        let error = prepare_instrument_audition(
+            session.path(),
+            &serde_json::json!({
+                "presetId":"Factory/FX/Space Adventure 1",
+                "durationBeats":1,
+                "events":[{"time":0,"duration":0.25,"pitch":60,"velocity":0.8}]
+            }),
+        )
+        .expect_err("unsafe audition preset");
+        assert!(error.contains("crashes the headless audio renderer"));
+    }
+
+    #[test]
+    fn effect_selection_accepts_display_labels_and_reports_valid_choices() {
+        let project = project_with_effect("Distortion");
+        let track = &project.tracks[0];
+        let effect = &track.effects[0];
+        let semantics = crate::surge::effect_parameter_semantics(
+            &track.instrument,
+            &track.effects,
+            &track.routing.effect_order,
+            track.id,
+            effect.id,
+        );
+        let (parameter, choice) = semantics
+            .iter()
+            .find_map(|(parameter, semantics)| {
+                semantics
+                    .choices
+                    .first()
+                    .map(|choice| (parameter.clone(), choice.clone()))
+            })
+            .expect("selection effect parameter");
+        let session =
+            EditSession::create(&project, "set effect choice", 0.0, 1.0).expect("session");
+        apply_agent_mutation(
+            session.path(),
+            "update_effect",
+            &serde_json::json!({
+                "trackId":track.id,
+                "effectId":effect.id,
+                "parameter":parameter,
+                "value":choice.1
+            }),
+        )
+        .expect("display label accepted");
+        session.take_update().unwrap().expect("effect update");
+        let error = apply_agent_mutation(
+            session.path(),
+            "update_effect",
+            &serde_json::json!({
+                "trackId":track.id,
+                "effectId":effect.id,
+                "parameter":parameter,
+                "value":"not a choice"
+            }),
+        )
+        .expect_err("invalid display label");
+        assert!(error.contains("must be one of:"));
+        assert!(error.contains(&choice.1));
     }
 
     #[test]

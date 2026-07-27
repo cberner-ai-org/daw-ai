@@ -22,6 +22,7 @@ The graph's IDs, current values, routing, and states are authoritative.
 `list_instrument_parameters` browses the instrument by Surge module. Call it with `trackId`, then pass an exact returned module ID until a leaf returns native parameters. Copy `parameter` into `set_instrument_parameter`. Copy `modulationTarget`, when present, into `add_modulator.target`. Values, display strings, choices, and semantic flags come from Surge XT.
 
 `list_sound_tool_parameters` returns the editable controls for one effect or modulator. Copy its returned `parameter` unchanged into the named mutation tool. Effect controls and metadata come from Surge XT.
+For selection controls, `update_effect` accepts either an exact returned display label or its exact numeric value. Validation errors repeat the valid choices.
 
 ## Mutations
 
@@ -37,6 +38,7 @@ The graph's IDs, current values, routing, and states are authoritative.
 - `undo` restores the state before the latest successful mutation in this session.
 
 Clip placement is in beats. Convert seconds to beats with `seconds * bpm / 60`. Keep mutations inside the selected region.
+Mutation and render responses include the current BPM and both beat and second equivalents; use those returned values instead of estimating section boundaries.
 
 ## Modulation
 
@@ -54,5 +56,7 @@ Same-track native targets execute inside Surge XT. Use the target IDs and contro
 ## Listening
 
 `render_audio_region` renders the latest graph through Surge XT. It accepts optional `tracks` as `"all"` or stable track IDs and an absolute range of at most 16 seconds. Omitted `tracks` means all tracks. The listening range is independent of the edit selection. The returned measurements are descriptive, not decisions.
+
+`audition_instrument` renders an installed Surge preset with a short disposable MIDI sequence and optionally one effect. It never changes the graph or history. Use it to compare uncertain presets, pitches, and articulations before creating tracks or clips.
 
 Use listening when it helps evaluate the user's request. Continue making tool calls until the requested edit is complete.

@@ -347,7 +347,12 @@ fn parse_effect(
     );
     for (parameter, value) in &parsed.parameters {
         if semantics.get(parameter).is_some_and(|semantics| {
-            !semantics.choices.is_empty() && (semantics.value - value).abs() >= 0.000_01
+            !semantics.choices.is_empty()
+                && (semantics.value - value).abs() >= 0.000_01
+                && !semantics
+                    .choices
+                    .iter()
+                    .any(|(choice, _)| (choice - value).abs() < 0.000_01)
         }) {
             return Err(invalid(format!(
                 "effect parameter {parameter} must match a Surge XT choice"
