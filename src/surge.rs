@@ -933,6 +933,10 @@ pub(crate) fn is_native_effect(name: &str) -> bool {
     effect_type_index(name).is_some()
 }
 
+pub(crate) fn is_headless_safe_effect(name: &str) -> bool {
+    is_native_effect(name) && !matches!(name, "Audio Input" | "Spring Reverb" | "Tape" | "Vocoder")
+}
+
 fn parameter_map(synth: &SurgeSynthesizer) -> HashMap<String, i32> {
     let mut map = HashMap::new();
     for index in 0..MAX_NATIVE_PARAMETERS {
@@ -1027,6 +1031,34 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_factory_preset_in_isolated_process() {
+        fn render_probe(engine: &mut Engine) -> Vec<f32> {
+            for (note_id, pitch) in [36, 60, 84].into_iter().enumerate() {
+                engine.play_note(pitch, 0.7, note_id as u64 + 1);
+            }
+            (0..256)
+                .flat_map(|_| engine.process()[0])
+                .collect::<Vec<_>>()
+        }
+
+        fn assert_sane(samples: &[f32], label: &str) {
+            assert!(
+                samples.iter().all(|sample| sample.is_finite()),
+                "{label} rendered non-finite audio"
+            );
+            let peak = samples.iter().copied().map(f32::abs).fold(0.0, f32::max);
+            let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
+                / samples.len() as f32)
+                .sqrt();
+            let dc = samples.iter().sum::<f32>() / samples.len() as f32;
+            assert!(peak > 0.000_01, "{label} rendered silence");
+            assert!(peak <= 4.0, "{label} rendered pathological peak {peak}");
+            assert!(
+                dc.abs() <= 0.25,
+                "{label} rendered pathological DC offset {dc}"
+            );
+            assert!(rms.is_finite(), "{label} rendered non-finite RMS");
+        }
+
         let preset = std::env::var("DAW_AI_PRESET_PROBE_ID").expect("preset probe ID");
         let mode = std::env::var("DAW_AI_PRESET_PROBE_MODE").expect("preset probe mode");
         let mut instrument = crate::model::Project::initial().tracks[0]
@@ -1037,9 +1069,8 @@ mod tests {
             let mut first =
                 Engine::new_with_graph_effects(&instrument, &[], &[], &[], 1, 16_000.0, false)
                     .expect("first preset engine");
-            for _ in 0..64 {
-                first.process();
-            }
+            let rendered = render_probe(&mut first);
+            assert_sane(&rendered, "first preset engine");
         }
         let (effects, effect_order) = if mode == "direct" {
             (Vec::new(), Vec::new())
@@ -1070,13 +1101,8 @@ mod tests {
         )
         .expect("preset engine");
         eprintln!("probe {preset} [{mode}]: processing");
-        engine.play_note(60, 0.8, 1);
-        let energy = (0..64)
-            .map(|_| engine.process())
-            .flat_map(|block| block[0])
-            .map(f32::abs)
-            .sum::<f32>();
-        assert!(energy.is_finite(), "preset rendered non-finite audio");
+        let rendered = render_probe(&mut engine);
+        assert_sane(&rendered, "preset engine");
         eprintln!("probe {preset} [{mode}]: complete");
     }
 
@@ -1434,7 +1460,7 @@ mod tests {
         for name in SURGE_EFFECT_TYPES
             .iter()
             .skip(1)
-            .filter(|name| **name != "Audio Input")
+            .filter(|name| is_headless_safe_effect(name))
         {
             let effect = Effect {
                 id: 77,
@@ -1447,9 +1473,31 @@ mod tests {
                 tempo_sync_parameters: Vec::new(),
                 deactivated_parameters: Vec::new(),
             };
-            let mut engine = Engine::new(&instrument, &[effect], &[77], &[], 1, 16_000.0)
+            for iteration in 1..=2 {
+                let mut engine = Engine::new(
+                    &instrument,
+                    std::slice::from_ref(&effect),
+                    &[77],
+                    &[],
+                    1,
+                    16_000.0,
+                )
                 .unwrap_or_else(|error| panic!("{name} did not load: {error}"));
-            engine.process();
+                engine.play_note(48, 0.8, iteration);
+                let samples = (0..256)
+                    .flat_map(|_| engine.process()[0])
+                    .collect::<Vec<_>>();
+                assert!(
+                    samples.iter().all(|sample| sample.is_finite()),
+                    "{name} emitted non-finite audio on render {iteration}"
+                );
+                let peak = samples.iter().copied().map(f32::abs).fold(0.0, f32::max);
+                let dc = samples.iter().sum::<f32>() / samples.len() as f32;
+                assert!(
+                    peak > 0.000_01 && peak <= 4.0 && dc.abs() <= 0.25,
+                    "{name} emitted invalid audio on render {iteration}: peak={peak}, dc={dc}"
+                );
+            }
         }
     }
 

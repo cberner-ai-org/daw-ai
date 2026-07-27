@@ -1633,7 +1633,7 @@ impl Studio {
         name: &str,
         mix: f32,
     ) -> Result<(), StudioError> {
-        if crate::surge::effect_type_index(name).is_none()
+        if !crate::surge::is_headless_safe_effect(name)
             || !mix.is_finite()
             || !(0.0..=1.0).contains(&mix)
         {
@@ -2080,7 +2080,7 @@ impl Studio {
         name: &str,
         mix: f32,
     ) -> Result<u64, StudioError> {
-        if crate::surge::effect_type_index(name).is_none()
+        if !crate::surge::is_headless_safe_effect(name)
             || !mix.is_finite()
             || !(0.0..=1.0).contains(&mix)
         {

@@ -99,7 +99,6 @@ const EFFECT_NAMES: &[&str] = &[
     "Frequency Shifter",
     "Conditioner",
     "Chorus",
-    "Vocoder",
     "Reverb 2",
     "Flanger",
     "Ring Modulator",
@@ -112,11 +111,9 @@ const EFFECT_NAMES: &[&str] = &[
     "Ensemble",
     "Combulator",
     "Nimbus",
-    "Tape",
     "Treemonster",
     "Waveshaper",
     "Mid-Side Tool",
-    "Spring Reverb",
     "Bonsai",
     "Floaty Delay",
     "Convolution",
@@ -2509,6 +2506,7 @@ pub(crate) fn render_audio_request_cancellable(
         request.end,
         cancelled,
     )?;
+    validate_feedback_audio(&regions.mix)?;
     let measurements = audio_measurements(&request, "Surge XT", &regions);
     Ok(AudioRender {
         description: format!(
@@ -2518,6 +2516,42 @@ pub(crate) fn render_audio_request_cancellable(
         measurements,
         wav: audio_analysis::wav_bytes(&regions.mix.samples),
     })
+}
+
+fn validate_feedback_audio(region: &audio_analysis::AudioRegion) -> Result<(), String> {
+    validate_feedback_samples(&region.samples, region.event_count)
+}
+
+fn validate_feedback_samples(samples: &[f32], event_count: usize) -> Result<(), String> {
+    if !samples.iter().all(|sample| sample.is_finite()) {
+        return Err(
+            "Surge XT produced non-finite audio; choose another preset or effect".to_owned(),
+        );
+    }
+    let peak = samples.iter().copied().map(f32::abs).fold(0.0, f32::max);
+    if peak > 4.0 {
+        return Err(format!(
+            "Surge XT produced a pathological peak ({:.2} full scale); choose another preset or effect",
+            peak
+        ));
+    }
+    let dc_offset = if samples.is_empty() {
+        0.0
+    } else {
+        samples.iter().sum::<f32>() / samples.len() as f32
+    };
+    if dc_offset.abs() > 0.25 {
+        return Err(format!(
+            "Surge XT produced a pathological DC offset ({dc_offset:.2}); choose another preset or effect"
+        ));
+    }
+    if event_count > 0 && peak <= 0.000_01 {
+        return Err(format!(
+            "Surge XT rendered silence despite {} MIDI events; choose another preset or effect",
+            event_count
+        ));
+    }
+    Ok(())
 }
 
 fn audio_measurements(
@@ -4555,6 +4589,69 @@ mod tests {
 
         assert_eq!(omitted.track_ids, expected);
         assert_eq!(explicit.track_ids, expected);
+    }
+
+    #[test]
+    fn unsafe_headless_effects_are_not_exposed_or_mutable() {
+        let declarations = tool_declarations(true);
+        let add_effect = declarations
+            .iter()
+            .find(|tool| tool["name"] == "add_effect")
+            .expect("effect declaration");
+        let names = add_effect["parameters"]["properties"]["name"]["enum"]
+            .as_array()
+            .expect("effect names");
+        for unsafe_name in ["Audio Input", "Spring Reverb", "Tape", "Vocoder"] {
+            assert!(
+                !names.iter().any(|name| name == unsafe_name),
+                "{unsafe_name} must not be exposed"
+            );
+            let mut studio = Studio::new();
+            let track_id = studio.project().tracks[0].id;
+            assert_eq!(
+                studio.create_effect(track_id, unsafe_name, 0.5),
+                Err(StudioError::InvalidSoundTool)
+            );
+        }
+    }
+
+    #[test]
+    fn feedback_render_rejects_pathological_native_audio() {
+        let project = project_with_effect("Tape");
+        let request = AudioRenderRequest {
+            track_ids: vec![project.tracks[0].id],
+            project,
+            start: 0.0,
+            end: 1.0,
+            description: "pathological Tape render".to_owned(),
+        };
+        let error = render_audio_request(request).expect_err("Tape output must be rejected");
+        assert!(
+            error.contains("pathological"),
+            "unexpected render error: {error}"
+        );
+
+        assert!(validate_feedback_samples(&[0.1, -0.1], 1).is_ok());
+        assert!(
+            validate_feedback_samples(&[f32::NAN], 0)
+                .unwrap_err()
+                .contains("non-finite")
+        );
+        assert!(
+            validate_feedback_samples(&[5.0, -5.0], 0)
+                .unwrap_err()
+                .contains("peak")
+        );
+        assert!(
+            validate_feedback_samples(&[0.5, 0.5], 0)
+                .unwrap_err()
+                .contains("DC offset")
+        );
+        assert!(
+            validate_feedback_samples(&[0.0, 0.0], 1)
+                .unwrap_err()
+                .contains("silence")
+        );
     }
 
     #[test]
