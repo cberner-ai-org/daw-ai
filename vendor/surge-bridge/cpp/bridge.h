@@ -1,12 +1,17 @@
 #pragma once
 
+#include <cstddef>
+
 class SurgeSynthesizer;
 class SurgePatch;
 class Parameter;
 
 extern "C" {
 	SurgeSynthesizer* create_engine(float sr);
-	SurgePatch* create_patch();
+    bool surge_load_builtin_wavetables(SurgeSynthesizer* surge,
+                                       const char* windows, std::size_t windows_size,
+                                       const char* initial, std::size_t initial_size);
+    SurgePatch* create_patch();
     void destroy_engine(SurgeSynthesizer* surge);
     void destroy_patch(SurgePatch* patch);
     void destroy_parameter(Parameter* p);

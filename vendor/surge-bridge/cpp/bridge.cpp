@@ -27,6 +27,23 @@ extern "C" {
         return surge;
 	}
 
+    bool surge_load_builtin_wavetables(SurgeSynthesizer* surge,
+                                       const char* windows, std::size_t windows_size,
+                                       const char* initial, std::size_t initial_size) {
+        if (!surge || !windows || !initial ||
+            !surge->storage.load_wt_wt_mem(windows, windows_size, &surge->storage.WindowWT)) {
+            return false;
+        }
+        for (auto& scene : surge->storage.getPatch().scene) {
+            for (auto& oscillator : scene.osc) {
+                if (!surge->storage.load_wt_wt_mem(initial, initial_size, &oscillator.wt)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     SurgePatch* create_patch() {
         SurgeStorage::SurgeStorageConfig sconf;
         sconf.scanWavetableAndPatches = false;

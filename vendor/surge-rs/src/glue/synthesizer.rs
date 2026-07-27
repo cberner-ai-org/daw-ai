@@ -38,9 +38,25 @@ pub struct SurgeSynthesizer {
 
 impl SurgeSynthesizer {
     pub fn new(sample_rate: f32) -> Self {
+        static WINDOW_WAVETABLE: &[u8] = include_bytes!(
+            "../../../surge-sys/sbmod/surge/resources/surge-shared/windows.wt"
+        );
+        static INITIAL_WAVETABLE: &[u8] = include_bytes!(
+            "../../../surge-sys/sbmod/surge/resources/surge-shared/memoryWavetable.wt"
+        );
         unsafe {
             let ptr = hell_ffi::create_engine(sample_rate);
             assert!(!ptr.is_null(), "a surge burnt the bridge down (failed to create the engine).");
+            assert!(
+                hell_ffi::surge_load_builtin_wavetables(
+                    ptr,
+                    WINDOW_WAVETABLE.as_ptr().cast(),
+                    WINDOW_WAVETABLE.len(),
+                    INITIAL_WAVETABLE.as_ptr().cast(),
+                    INITIAL_WAVETABLE.len(),
+                ),
+                "failed to load Surge XT's built-in wavetables"
+            );
             Self { ptr }
         }
     }
