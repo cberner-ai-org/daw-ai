@@ -242,7 +242,7 @@ impl PromptEngine {
             };
             return EditPlan {
                 action,
-                summary: format!("Removed {effect_name} from {target_name} in the selection"),
+                summary: format!("Removed {effect_name} from the {target_name} track"),
             };
         }
 
@@ -311,7 +311,7 @@ impl PromptEngine {
                     mix: 0.42,
                     target,
                 },
-                summary: format!("Added spacious reverb to {target_name}"),
+                summary: format!("Added spacious reverb across the {target_name} track"),
             };
         }
 
@@ -333,7 +333,7 @@ impl PromptEngine {
                     mix: 0.58,
                     target,
                 },
-                summary: format!("Added harmonic drive to {target_name}"),
+                summary: format!("Added harmonic drive across the {target_name} track"),
             };
         }
 
@@ -359,7 +359,7 @@ impl PromptEngine {
                     amount: 0.3,
                     target,
                 },
-                summary: format!("Opened the tone of {target_name}"),
+                summary: format!("Opened the tone across the {target_name} track"),
             };
         }
 
@@ -369,7 +369,7 @@ impl PromptEngine {
                     amount: -0.3,
                     target,
                 },
-                summary: format!("Warmed and softened {target_name}"),
+                summary: format!("Warmed and softened the {target_name} track"),
             };
         }
 

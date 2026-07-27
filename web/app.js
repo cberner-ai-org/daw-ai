@@ -1054,6 +1054,11 @@
         ${modulator.trigger !== "free" ? `<label>Source track
           <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="sourceTrackId" data-control-key="${track.id}-modulator-${modulator.id}-sourceTrackId" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} source track`)}"><option value="${track.id}" selected>${escapeHtml(track.name)} (#${track.id})</option></select>
         </label>` : ""}
+        <label class="tool-control">Polarity
+          <select data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="polarity" data-control-key="${track.id}-modulator-${modulator.id}-polarity" aria-label="${escapeHtml(`${track.name} ${modulator.name} modulator #${modulator.id} polarity`)}">${selectOptions(["increase", "decrease"], modulator.polarity)}</select>
+        </label>
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "attackMs", modulator.parameters.attackMs, 0, 1000, "ms")}
+        ${soundRange(track, "modulator", modulator.id, modulator.name, "releaseMs", modulator.parameters.releaseMs, 1, 5000, "ms")}
         <label class="tool-control">Surge Formula (Lua)
           <textarea data-sound-tool="modulator" data-track-id="${track.id}" data-tool-id="${modulator.id}" data-parameter="formula" data-control-key="${track.id}-modulator-${modulator.id}-formula" aria-label="${escapeHtml(`${track.name} ${modulator.name} formula`)}">${escapeHtml(modulator.formula || "")}</textarea>
         </label>
