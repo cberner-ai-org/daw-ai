@@ -42,8 +42,7 @@ the user and coding assistant have access to the machine DAW AI is deployed on, 
 
 The following sound tools should be implemented and available to the AI model.
 
-These are all implemented in the DAW AI backend. The client-side JS contains a basic editor to modify the sound graph and view it,
-but all execution of it is in the backend server process.
+These are all implemented in the DAW AI backend, not client-side.
 
 The MIDI clips are built into DAW AI, but everything else: Instrument, Effects, Modulation, Routing primarily relies on
 those implementations in Surge XT. DAW AI adds only a minimal layer on top to expose them to Gemini, persist settings...etc.
