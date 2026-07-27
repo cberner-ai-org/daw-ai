@@ -1107,6 +1107,7 @@ pub enum StudioError {
     InvalidSelection,
     UnknownTrack,
     InvalidMix,
+    InvalidDuration,
     InvalidChannel,
     LastTrack,
     UnknownSoundTool,
@@ -1200,6 +1201,26 @@ impl Studio {
         {
             return Err(StudioError::InvalidSelection);
         }
+        Ok(())
+    }
+
+    pub fn set_duration(&mut self, duration: f32) -> Result<(), StudioError> {
+        if !duration.is_finite() || !(1.0..=300.0).contains(&duration) {
+            return Err(StudioError::InvalidDuration);
+        }
+        self.remember();
+        self.project.duration = duration;
+        for track in &mut self.project.tracks {
+            track.clips.retain(|clip| clip.start < duration);
+            for clip in &mut track.clips {
+                clip.end = clip.end.min(duration);
+            }
+        }
+        self.project.edits.retain(|edit| edit.start < duration);
+        for edit in &mut self.project.edits {
+            edit.end = edit.end.min(duration);
+        }
+        self.project.version += 1;
         Ok(())
     }
 
@@ -4973,6 +4994,33 @@ mod tests {
             .expect("valid mix change");
         assert_eq!(studio.project().tracks[0].volume, 0.5);
         assert!(studio.project().tracks[0].muted);
+    }
+
+    #[test]
+    fn duration_changes_are_bounded_and_trim_arrangement_content() {
+        let mut studio = Studio::new();
+        assert_eq!(studio.set_duration(0.99), Err(StudioError::InvalidDuration));
+        assert_eq!(
+            studio.set_duration(300.01),
+            Err(StudioError::InvalidDuration)
+        );
+
+        let previous_version = studio.project().version;
+        studio.set_duration(10.0).expect("valid duration");
+        assert_eq!(studio.project().duration, 10.0);
+        assert_eq!(studio.project().version, previous_version + 1);
+        assert!(
+            studio
+                .project()
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .all(|clip| clip.start < 10.0 && clip.end <= 10.0)
+        );
+        Project::from_json(&studio.project().to_json()).expect("resized project remains valid");
+
+        assert!(studio.undo(), "duration change is undoable");
+        assert_eq!(studio.project().duration, 32.0);
     }
 
     #[test]

@@ -56,6 +56,7 @@
             <h1 id="project-name">Loading studio...</h1>
           </div>
           <div class="heading-actions">
+            <button class="text-button" id="ai-duration-button" type="button">Duration</button>
             <a class="text-button" id="export-button" href="/api/export.wav" download="project.wav">Export WAV</a>
             <button class="text-button" id="undo-button" type="button">Undo</button>
             <button class="text-button" id="reset-button" type="button">Reset project</button>
@@ -153,7 +154,10 @@
             <p class="eyebrow">ADVANCED VIEW</p>
             <h2 id="advanced-title">Sound details</h2>
           </div>
-          <button class="text-button close-button" id="close-advanced" type="button">Back to AI Mode</button>
+          <div class="heading-actions">
+            <button class="text-button" id="advanced-duration-button" type="button">Duration</button>
+            <button class="text-button close-button" id="close-advanced" type="button">Back to AI Mode</button>
+          </div>
         </div>
         <p class="drawer-intro">Edit MIDI in a piano roll, inspect typed routing, and select a sound-graph node to change its parameters. Gemini sees the same graph.</p>
         <form class="channel-creator" id="channel-creator">
@@ -182,6 +186,13 @@
           </div>
         </div>
         <p class="debug-intro">Copy this report into a coding assistant when you need help. Backend warnings and errors are also written to the server's stderr.</p>
+        <section class="debug-settings" aria-labelledby="audio-metrics-heading">
+          <div>
+            <strong id="audio-metrics-heading">Audio metrics for Gemini</strong>
+            <span>Gemini always receives the rendered audio. Turn this off to omit objective audio measurements.</span>
+          </div>
+          <label class="switch-control"><input id="audio-metrics-toggle" type="checkbox" checked> Include metrics</label>
+        </section>
         <section class="debug-settings" aria-labelledby="gemini-session-heading">
           <div>
             <strong id="gemini-session-heading">AI sessions</strong>

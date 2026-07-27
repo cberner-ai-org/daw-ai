@@ -290,6 +290,7 @@ fn request_needs_user_scope(request: &Request) -> bool {
             | "/api/edits"
             | "/api/channels"
             | "/api/mix"
+            | "/api/duration"
             | "/api/sound-tools"
             | "/api/undo"
             | "/api/reset"
@@ -414,6 +415,7 @@ struct EditRequest {
     end: f32,
     project: crate::model::Project,
     reference_audio: Option<crate::gemini::ReferenceAudio>,
+    include_audio_metrics: bool,
 }
 
 struct EditFailure {
@@ -988,6 +990,7 @@ impl Router {
             ("POST", "/api/edits") => self.start_edit(&request.body),
             ("POST", "/api/channels") => self.change_channel(&request.body),
             ("POST", "/api/mix") => self.change_mix(&request.body),
+            ("POST", "/api/duration") => self.change_duration(&request.body),
             ("POST", "/api/sound-tools") => self.change_sound_tool(&request.body),
             ("POST", "/api/logs") => Self::client_log(&request.body),
             ("POST", "/api/undo") => self.undo(),
@@ -995,8 +998,8 @@ impl Router {
             ("POST", "/api/history") => self.select_history(&request.body),
             (
                 _,
-                "/api/edits" | "/api/channels" | "/api/mix" | "/api/sound-tools" | "/api/logs"
-                | "/api/undo" | "/api/reset",
+                "/api/edits" | "/api/channels" | "/api/mix" | "/api/duration" | "/api/sound-tools"
+                | "/api/logs" | "/api/undo" | "/api/reset",
             ) => Response::json(405, error_json("method not allowed")).with_header("Allow", "POST"),
             (_, "/api/project" | "/api/health" | "/api/gemini-sessions") => {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
@@ -1034,6 +1037,7 @@ impl Router {
             Ok(audio) => audio,
             Err(message) => return Response::json(422, error_json(message)),
         };
+        let include_audio_metrics = include_audio_metrics(&form);
         let project = {
             let studio = self.lock_studio();
             if let Err(error) = studio.validate_edit(start, end, prompt) {
@@ -1074,6 +1078,7 @@ impl Router {
             end,
             project,
             reference_audio,
+            include_audio_metrics,
         };
         let worker = self.clone();
         let spawn = thread::Builder::new()
@@ -1418,7 +1423,7 @@ impl Router {
                     "rendering",
                     "Rendering the current sound graph with the Rust audio engine",
                 );
-                let result = render_audio_request(request);
+                let result = render_audio_for_edit(request, edit.include_audio_metrics);
                 self.edit_jobs.set_running(
                     job_id,
                     "planning",
@@ -1535,6 +1540,25 @@ impl Router {
                 gate.wait_until_released();
                 Ok(PromptEngine::interpret_project(prompt, project, start, end))
             }
+        }
+    }
+
+    fn change_duration(&self, body: &str) -> Response {
+        let form = parse_form(body);
+        let Some(duration) = form
+            .get("duration")
+            .and_then(|value| value.parse::<f32>().ok())
+        else {
+            return Response::json(422, error_json("duration is required"));
+        };
+        let mut studio = self.lock_studio();
+        let mut candidate = studio.clone();
+        match candidate.set_duration(duration) {
+            Ok(()) => match self.commit(&mut studio, candidate) {
+                Ok(()) => Response::json(200, studio.to_json()),
+                Err(response) => response,
+            },
+            Err(error) => Response::json(422, studio_error(error)),
         }
     }
 
@@ -2031,6 +2055,23 @@ impl Router {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+fn include_audio_metrics(form: &HashMap<String, String>) -> bool {
+    form.get("include_audio_metrics")
+        .is_none_or(|value| value != "false")
+}
+
+fn render_audio_for_edit(
+    request: crate::gemini_tools::AudioRenderRequest,
+    include_metrics: bool,
+) -> Result<crate::gemini_tools::AudioRender, String> {
+    render_audio_request(request).map(|mut audio| {
+        if !include_metrics {
+            audio.measurements = serde_json::Value::Null;
+        }
+        audio
+    })
 }
 
 struct Request {
@@ -2742,6 +2783,7 @@ const fn studio_error_message(error: StudioError) -> &'static str {
         StudioError::InvalidSelection => "select a valid part of the track",
         StudioError::UnknownTrack => "track not found",
         StudioError::InvalidMix => "invalid mixer setting",
+        StudioError::InvalidDuration => "duration must be between 1 second and 5 minutes",
         StudioError::InvalidChannel => "invalid channel change",
         StudioError::LastTrack => "create another track before deleting the only track",
         StudioError::UnknownSoundTool => "sound tool not found",
@@ -2889,6 +2931,53 @@ mod tests {
                 .iter()
                 .any(|preset| preset == "Factory/Leads/Classic Lead 1")
         }));
+    }
+
+    #[test]
+    fn changes_project_duration_with_server_side_bounds() {
+        let router = Router::demo();
+        let changed = router.handle(&request("POST", "/api/duration", "duration=300"));
+        assert_eq!(changed.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&changed.body).expect("duration response")["duration"],
+            300.0
+        );
+        assert_eq!(
+            router
+                .handle(&request("POST", "/api/duration", "duration=301"))
+                .status,
+            422
+        );
+        assert_eq!(
+            router
+                .handle(&request("POST", "/api/duration", "duration=0.5"))
+                .status,
+            422
+        );
+    }
+
+    #[test]
+    fn metrics_opt_out_keeps_audio_on_every_gemini_render() {
+        let disabled = parse_form("include_audio_metrics=false");
+        assert!(!include_audio_metrics(&disabled));
+        assert!(include_audio_metrics(&parse_form("")));
+
+        for start in [0.0, 0.1] {
+            let rendered = render_audio_for_edit(
+                crate::gemini_tools::AudioRenderRequest {
+                    project: Project::demo(),
+                    track_ids: vec![2],
+                    start,
+                    end: start + 0.1,
+                    description: "Test render".to_owned(),
+                },
+                include_audio_metrics(&disabled),
+            )
+            .expect("Gemini audio render");
+            assert!(rendered.measurements.is_null());
+            assert!(rendered.wav.starts_with(b"RIFF"));
+            assert!(rendered.wav.len() > 44);
+        }
     }
 
     #[test]
@@ -3146,6 +3235,7 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
+            include_audio_metrics: true,
         };
         let plan = |preset: &str, summary: &str| EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3283,6 +3373,7 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
+            include_audio_metrics: true,
         };
         let first_plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3415,6 +3506,7 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
+            include_audio_metrics: true,
         };
         let plan = EditPlan {
             action: crate::prompt::Action::Configure {

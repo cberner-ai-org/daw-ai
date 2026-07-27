@@ -30,6 +30,8 @@
     editProgressTrack: document.querySelector("#edit-progress-track"),
     editProgressFill: document.querySelector("#edit-progress-fill"),
     undoButton: document.querySelector("#undo-button"),
+    aiDurationButton: document.querySelector("#ai-duration-button"),
+    advancedDurationButton: document.querySelector("#advanced-duration-button"),
     resetButton: document.querySelector("#reset-button"),
     savedState: document.querySelector("#saved-state"),
     historyCount: document.querySelector("#history-count"),
@@ -49,6 +51,7 @@
     clearDebug: document.querySelector("#clear-debug"),
     refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
     geminiSessionList: document.querySelector("#gemini-session-list"),
+    audioMetricsToggle: document.querySelector("#audio-metrics-toggle"),
     sessionHistoryList: document.querySelector("#session-history-list"),
     toast: document.querySelector("#toast"),
     toastMessage: document.querySelector("#toast-message"),
@@ -85,6 +88,7 @@
   const RECONCILED_REQUEST_TIMEOUT_MS = 2000;
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
+  const AUDIO_METRICS_STORAGE_KEY = "daw-ai.audio-metrics.v1";
   const AUDIO_RETRY_DELAYS_MS = [250, 500, 1000];
   const AUDIO_SEEK_DEBOUNCE_MS = 200;
   const TOAST_DISMISS_MS = 4200;
@@ -485,6 +489,23 @@
       state.centeredInitialSelection = true;
       window.requestAnimationFrame(centerSelectionOnNarrowTimeline);
     }
+  }
+
+  async function editDuration() {
+    if (!state.project) return;
+    const entered = window.prompt("Song duration in seconds (1-300)", String(state.project.duration));
+    if (entered === null) return;
+    const duration = Number(entered);
+    if (!Number.isFinite(duration) || duration < 1 || duration > 300) {
+      showToast("Enter a duration between 1 second and 5 minutes", true);
+      return;
+    }
+    await enqueueProjectMutation(() => applyProjectMutation({
+      path: "/api/duration",
+      values: { duration: String(duration) },
+      context: "updating the song duration",
+      successMessage: "Song duration updated",
+    }));
   }
 
   async function loadProjectHistory(expectedVersion = state.project?.version) {
@@ -2007,6 +2028,7 @@
           prompt,
           start: String(selectionStart),
           end: String(selectionEnd),
+          include_audio_metrics: String(pending.includeAudioMetrics !== false),
         });
         if (pending.referenceAudio) {
           editBody.set("reference_audio_name", pending.referenceAudio.name);
@@ -2130,6 +2152,7 @@
         end: state.selectionEnd,
         acceptedJob: null,
         referenceAudio,
+        includeAudioMetrics: elements.audioMetricsToggle.checked,
       };
       if (!persistPendingEdit(pending) && referenceAudio) {
         throw new Error("Could not preserve the reference audio for edit recovery");
@@ -2415,6 +2438,8 @@
   elements.playButton.addEventListener("click", () => void audio.toggle());
   elements.rewindButton.addEventListener("click", () => audio.seek(0));
   elements.undoButton.addEventListener("click", () => void undo());
+  elements.aiDurationButton.addEventListener("click", () => void editDuration());
+  elements.advancedDurationButton.addEventListener("click", () => void editDuration());
   elements.resetButton.addEventListener("click", () => void reset());
   elements.selectionModeButton.addEventListener("click", () => setTouchSelectionMode(!state.touchSelectionMode));
   elements.skipLink.addEventListener("click", skipToTimeline);
@@ -2432,6 +2457,13 @@
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
   elements.refreshGeminiSessions.addEventListener("click", () => void loadGeminiSessions());
+  elements.audioMetricsToggle.addEventListener("change", () => {
+    try {
+      window.localStorage.setItem(AUDIO_METRICS_STORAGE_KEY, String(elements.audioMetricsToggle.checked));
+    } catch (_error) {
+      // An unavailable preference store should not prevent edits.
+    }
+  });
   elements.sessionHistoryList.addEventListener("click", (event) => {
     void enqueueProjectMutation(() => selectProjectHistory(event));
   });
@@ -2470,6 +2502,12 @@
   });
 
   async function initialize() {
+    try {
+      elements.audioMetricsToggle.checked =
+        window.localStorage.getItem(AUDIO_METRICS_STORAGE_KEY) !== "false";
+    } catch (_error) {
+      // Keep metrics enabled when preference storage is unavailable.
+    }
     const pending = readPendingEdit();
     if (pending) {
       if (!elements.promptInput.value) elements.promptInput.value = pending.submittedText;
