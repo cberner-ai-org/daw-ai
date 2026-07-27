@@ -49,6 +49,12 @@ unsafe extern "C" {
         rate: f32,
         tempo_sync: bool,
     ) -> bool;
+    pub fn surge_set_lfo_phase(
+        surge: *mut SurgeSynthesizer,
+        scene: i32,
+        lfo: i32,
+        phase: f32,
+    ) -> bool;
     pub fn surge_parameter_is_bipolar(
         surge: *mut SurgeSynthesizer,
         parameter: i32,

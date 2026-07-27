@@ -145,6 +145,15 @@ extern "C" {
         return true;
     }
 
+    bool surge_set_lfo_phase(SurgeSynthesizer* surge, int scene, int lfo, float phase) {
+        if (!surge || scene < 0 || scene >= n_scenes || lfo < 0 || lfo >= n_lfos) {
+            return false;
+        }
+        surge->storage.getPatch().scene[scene].lfo[lfo].start_phase.set_value_f01(
+            std::clamp(phase, 0.0f, 1.0f));
+        return true;
+    }
+
     Parameter* surge_parameter(SurgeSynthesizer* surge, int parameter) {
         if (!surge || parameter < 0 ||
             parameter >= static_cast<int>(surge->storage.getPatch().param_ptr.size())) {

@@ -255,6 +255,29 @@ impl Engine {
         self.synth.set_tempo(bpm);
     }
 
+    pub(crate) fn set_free_modulator_phases(
+        &mut self,
+        modulators: &[Modulator],
+        project_time: f64,
+        bpm: f64,
+    ) -> Result<(), String> {
+        for (slot, modulator) in modulators
+            .iter()
+            .filter(|modulator| modulator.enabled && modulator.trigger == "free")
+            .enumerate()
+        {
+            let cycles = if modulator.rate_mode == "tempo" {
+                project_time * bpm / 60.0 * f64::from(modulator.rate)
+            } else {
+                project_time * f64::from(modulator.rate)
+            };
+            if !self.synth.set_lfo_phase(0, slot as i32 + 6, cycles as f32) {
+                return Err("Surge XT rejected the free-running LFO phase".to_owned());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn release_note(&mut self, key: u8, note_id: u64) {
         self.synth
             .release_note(0, key.min(127) as i8, 0, note_id as i32);
@@ -728,40 +751,58 @@ pub(crate) fn preset_effects(preset: &str) -> Result<Vec<Effect>, String> {
         let mix = engine
             .parameter_value(&format!("{slot} Mix"))
             .unwrap_or(1.0);
+        let (parameters, tempo_sync_parameters, deactivated_parameters) =
+            effect_state_for_slot(&engine, slot);
         effects.push(Effect {
             id: 0,
             name: (*name).to_owned(),
             preset_slot: Some(slot_index),
             mix,
             enabled: true,
-            parameters: effect_parameters_for_slot(&engine, slot),
+            parameters,
             parameter_overrides: Vec::new(),
-            tempo_sync_parameters: Vec::new(),
-            deactivated_parameters: Vec::new(),
+            tempo_sync_parameters,
+            deactivated_parameters,
         });
     }
     Ok(effects)
 }
 
-fn effect_parameters_for_slot(engine: &Engine, slot: &str) -> BTreeMap<String, f32> {
-    engine
-        .parameters
-        .keys()
-        .filter_map(|native| {
-            native
-                .strip_prefix(&format!("{slot} "))
-                .filter(|parameter| {
-                    *parameter != "FX Type"
-                        && *parameter != "Mix"
-                        && !is_generic_effect_parameter(parameter)
-                })
-                .and_then(|parameter| {
-                    engine
-                        .parameter_value(native)
-                        .map(|value| (parameter.to_owned(), value))
-                })
-        })
-        .collect()
+fn effect_state_for_slot(
+    engine: &Engine,
+    slot: &str,
+) -> (BTreeMap<String, f32>, Vec<String>, Vec<String>) {
+    let mut parameters = BTreeMap::new();
+    let mut tempo_sync = Vec::new();
+    let mut deactivated = Vec::new();
+    for native in engine.parameters.keys() {
+        let Some(parameter) = native
+            .strip_prefix(&format!("{slot} "))
+            .filter(|parameter| {
+                *parameter != "FX Type"
+                    && *parameter != "Mix"
+                    && !is_generic_effect_parameter(parameter)
+            })
+        else {
+            continue;
+        };
+        let Some(index) = engine.parameters.get(native) else {
+            continue;
+        };
+        let mut id = SurgeId::empty();
+        if !engine.synth.from_synth_side_id(*index, &mut id) {
+            continue;
+        }
+        parameters.insert(parameter.to_owned(), engine.synth.get_parameter01(&mut id));
+        if engine.synth.parameter_can_temposync(&id) && engine.synth.parameter_is_temposync(&id) {
+            tempo_sync.push(parameter.to_owned());
+        }
+        if engine.synth.parameter_can_deactivate(&id) && engine.synth.parameter_is_deactivated(&id)
+        {
+            deactivated.push(parameter.to_owned());
+        }
+    }
+    (parameters, tempo_sync, deactivated)
 }
 
 pub(crate) fn effect_parameter_values(name: &str) -> BTreeMap<String, f32> {

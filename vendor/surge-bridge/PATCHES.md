@@ -20,5 +20,8 @@ tempo sync, and deactivation.
 DAW-AI can also restore Surge XT's tempo-sync and deactivation flags when an
 embedded preset effect moves to a different native slot.
 
+DAW-AI can set Surge XT's native LFO start phase so independently rendered
+stream ranges share one absolute project-time phase.
+
 Headless parameter writes reject oscillator types whose required wavetable data
 is absent from the current patch, preventing invalid native oscillator state.

@@ -22,6 +22,7 @@ extern "C" {
                              int trigger_mode, bool unipolar, const char* formula);
     bool surge_set_lfo_rate(SurgeSynthesizer* surge, int scene, int lfo,
                             float rate, bool tempo_sync);
+    bool surge_set_lfo_phase(SurgeSynthesizer* surge, int scene, int lfo, float phase);
     bool surge_parameter_is_bipolar(SurgeSynthesizer* surge, int parameter);
     bool surge_parameter_is_discrete(SurgeSynthesizer* surge, int parameter);
     bool surge_parameter_is_boolean(SurgeSynthesizer* surge, int parameter);

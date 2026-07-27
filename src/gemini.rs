@@ -1079,7 +1079,9 @@ fn midi_notes_field(object: &Object, loop_beats: f64) -> Result<Vec<MidiNote>, P
             let pitch = integer_field(event, "pitch")?;
             let velocity = number_field(event, "velocity")?;
             if !(0.0..loop_beats).contains(&time)
-                || !(f64::from(MIN_MIDI_NOTE_BEATS)..=loop_beats).contains(&duration)
+                || !(f64::from(MIN_MIDI_NOTE_BEATS)
+                    ..=loop_beats.min(f64::from(crate::model::MAX_MIDI_NOTE_DURATION_BEATS)))
+                    .contains(&duration)
                 || pitch > 127
                 || !(0.01..=1.0).contains(&velocity)
             {
