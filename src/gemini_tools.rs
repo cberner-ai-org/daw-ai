@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +27,8 @@ pub(crate) const PRESET_TOOL_NAME: &str = "list_surge_presets";
 pub(crate) const INSTRUMENT_PARAMETER_TOOL_NAME: &str = "list_instrument_parameters";
 pub(crate) const SOUND_TOOL_PARAMETER_TOOL_NAME: &str = "list_sound_tool_parameters";
 const SET_INSTRUMENT_PARAMETER_TOOL_NAME: &str = "set_instrument_parameter";
+const SET_INSTRUMENT_PARAMETERS_TOOL_NAME: &str = "set_instrument_parameters";
+const UPDATE_EFFECT_PARAMETERS_TOOL_NAME: &str = "update_effect_parameters";
 const GRAPH_FILE: &str = "sound-graph.json";
 const REQUEST_FILE: &str = "request.json";
 const SESSION_FILE: &str = "session.json";
@@ -44,11 +47,13 @@ pub(crate) const MUTATION_TOOL_NAMES: &[&str] = &[
     "delete_midi_clip",
     "add_effect",
     "update_effect",
+    UPDATE_EFFECT_PARAMETERS_TOOL_NAME,
     "delete_effect",
     "add_modulator",
     "update_modulator",
     "delete_modulator",
     SET_INSTRUMENT_PARAMETER_TOOL_NAME,
+    SET_INSTRUMENT_PARAMETERS_TOOL_NAME,
     "set_track_volume",
     "set_track_mute",
     "set_tempo",
@@ -166,7 +171,7 @@ impl EditSession {
         start: f32,
         end: f32,
     ) -> io::Result<Self> {
-        Self::create_in(&session_root(), project, prompt, start, end)
+        Self::create_in(&session_root(), project, prompt, start, end, false)
     }
 
     pub(crate) fn create_in(
@@ -175,6 +180,7 @@ impl EditSession {
         prompt: &str,
         start: f32,
         end: f32,
+        batch_parameter_tools: bool,
     ) -> io::Result<Self> {
         apply_session_retention_with(root, SessionRetention::configured())?;
         let path = reserve_session_directory(root)?;
@@ -201,6 +207,7 @@ impl EditSession {
                     "end": end,
                     "appliedSteps": 0,
                     "audioListens": 0,
+                    "batchParameterTools": batch_parameter_tools,
                     "detail": "Gemini session started"
                 })
                 .to_string(),
@@ -392,7 +399,7 @@ impl Drop for EditSession {
     }
 }
 
-pub(crate) fn tool_declarations() -> Vec<JsonValue> {
+pub(crate) fn tool_declarations(batch_parameter_tools: bool) -> Vec<JsonValue> {
     let audio_schema = serde_json::from_str::<JsonValue>(AUDIO_REGION_SCHEMA)
         .expect("embedded audio schema is valid JSON");
     let mut tools = vec![
@@ -488,7 +495,7 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
             ),
         ),
     ];
-    tools.extend(mutation_tool_declarations());
+    tools.extend(mutation_tool_declarations(batch_parameter_tools));
     tools
 }
 
@@ -510,7 +517,7 @@ fn function(name: &str, description: &str, parameters: JsonValue) -> JsonValue {
     })
 }
 
-fn mutation_tool_declarations() -> Vec<JsonValue> {
+fn mutation_tool_declarations(batch_parameter_tools: bool) -> Vec<JsonValue> {
     let id = || serde_json::json!({"type":"integer","minimum":1});
     let notes = || {
         serde_json::json!({
@@ -534,7 +541,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             "events":notes()
         })
     };
-    vec![
+    let mut tools = vec![
         function(
             "new_track",
             "Create one neutral Surge XT track with Init and no clips, effects, or modulators. Choose a short descriptive role label and a color from the palette. Returns its stable ID.",
@@ -707,7 +714,47 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             "Undo the most recent successful graph mutation made in this edit session.",
             object_schema(serde_json::json!({}), &[]),
         ),
-    ]
+    ];
+    if batch_parameter_tools {
+        let changes = serde_json::json!({
+            "type":"array",
+            "minItems":1,
+            "maxItems":32,
+            "items":{
+                "type":"object",
+                "properties":{
+                    "parameter":{"type":"string","minLength":1,"maxLength":64},
+                    "value":{"type":"string","minLength":1,"maxLength":96}
+                },
+                "required":["parameter","value"],
+                "additionalProperties":false
+            }
+        });
+        tools.push(function(
+            SET_INSTRUMENT_PARAMETERS_TOOL_NAME,
+            "Atomically set several Surge XT instrument controls on one track. Copy each parameter unchanged from list_instrument_parameters. The whole call fails without changes if any item is invalid.",
+            object_schema(
+                serde_json::json!({
+                    "trackId":id(),
+                    "changes":changes.clone()
+                }),
+                &["trackId", "changes"],
+            ),
+        ));
+        tools.push(function(
+            UPDATE_EFFECT_PARAMETERS_TOOL_NAME,
+            "Atomically update several controls on one effect. Copy each parameter unchanged from list_sound_tool_parameters. The whole call fails without changes if any item is invalid.",
+            object_schema(
+                serde_json::json!({
+                    "trackId":id(),
+                    "effectId":id(),
+                    "changes":changes
+                }),
+                &["trackId", "effectId", "changes"],
+            ),
+        ));
+    }
+    tools
 }
 
 fn parameter_schema(id_name: &str) -> JsonValue {
@@ -1686,6 +1733,31 @@ pub(crate) fn apply_agent_mutation(
             format!("Added {effect_name} effect {effect_id} to track {track_id}")
         }
         "update_effect" => update_parameter(&mut studio, object, "effect", "effectId")?,
+        UPDATE_EFFECT_PARAMETERS_TOOL_NAME => {
+            let track_id = required_id(object, "trackId")?;
+            let effect_id = required_id(object, "effectId")?;
+            let changes = parameter_changes(object)?;
+            for (parameter, value) in &changes {
+                update_parameter(
+                    &mut studio,
+                    &serde_json::json!({
+                        "trackId":track_id,
+                        "effectId":effect_id,
+                        "parameter":parameter,
+                        "value":value
+                    })
+                    .as_object()
+                    .expect("batch effect change is an object")
+                    .clone(),
+                    "effect",
+                    "effectId",
+                )?;
+            }
+            format!(
+                "Updated {} parameters on effect {effect_id} on track {track_id}",
+                changes.len()
+            )
+        }
         "delete_effect" => {
             let track_id = required_id(object, "trackId")?;
             let effect_id = required_id(object, "effectId")?;
@@ -1776,6 +1848,35 @@ pub(crate) fn apply_agent_mutation(
                     )
                 })?;
             format!("Set Surge XT instrument parameter {parameter} on track {track_id}")
+        }
+        SET_INSTRUMENT_PARAMETERS_TOOL_NAME => {
+            let track_id = required_id(object, "trackId")?;
+            let tool_id = studio
+                .project()
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .map(|track| track.instrument.id)
+                .ok_or_else(|| format!("track {track_id} does not exist"))?;
+            let changes = parameter_changes(object)?;
+            for (parameter, value) in &changes {
+                studio
+                    .configure_sound_tool(track_id, "instrument", tool_id, None, parameter, value)
+                    .map_err(|error| {
+                        parameter_error_message(
+                            error,
+                            studio.project(),
+                            track_id,
+                            "instrument",
+                            tool_id,
+                            parameter,
+                        )
+                    })?;
+            }
+            format!(
+                "Set {} Surge XT instrument parameters on track {track_id}",
+                changes.len()
+            )
         }
         "set_parameter" => {
             let track_id = required_id(object, "trackId")?;
@@ -1983,6 +2084,31 @@ fn required_string<'a>(object: &'a Map<String, JsonValue>, name: &str) -> Result
         .and_then(JsonValue::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("{name} must be a nonempty string"))
+}
+
+fn parameter_changes(object: &Map<String, JsonValue>) -> Result<Vec<(&str, &str)>, String> {
+    let changes = object
+        .get("changes")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "changes must be an array".to_owned())?;
+    if changes.is_empty() || changes.len() > 32 {
+        return Err("changes must contain between 1 and 32 items".to_owned());
+    }
+    let mut seen = BTreeSet::new();
+    changes
+        .iter()
+        .map(|change| {
+            let change = change
+                .as_object()
+                .ok_or_else(|| "each change must be an object".to_owned())?;
+            let parameter = required_string(change, "parameter")?;
+            let value = required_string(change, "value")?;
+            if !seen.insert(parameter) {
+                return Err(format!("parameter {parameter} appears more than once"));
+            }
+            Ok((parameter, value))
+        })
+        .collect()
 }
 
 fn clip_arguments(
@@ -2977,7 +3103,7 @@ mod tests {
 
     #[test]
     fn declares_direct_graph_editing_and_audio_tools() {
-        let declarations = tool_declarations();
+        let declarations = tool_declarations(false);
         let names = declarations
             .iter()
             .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str))
@@ -2994,7 +3120,19 @@ mod tests {
                 SOUND_TOOL_PARAMETER_TOOL_NAME,
             ]
         );
-        assert_eq!(&names[7..], MUTATION_TOOL_NAMES);
+        assert!(!names.contains(&SET_INSTRUMENT_PARAMETERS_TOOL_NAME));
+        assert!(!names.contains(&UPDATE_EFFECT_PARAMETERS_TOOL_NAME));
+        assert_eq!(
+            &names[7..],
+            MUTATION_TOOL_NAMES
+                .iter()
+                .copied()
+                .filter(|name| {
+                    *name != SET_INSTRUMENT_PARAMETERS_TOOL_NAME
+                        && *name != UPDATE_EFFECT_PARAMETERS_TOOL_NAME
+                })
+                .collect::<Vec<_>>()
+        );
         assert!(
             declarations[1]["description"]
                 .as_str()
@@ -3076,6 +3214,123 @@ mod tests {
         assert_eq!(
             update_modulator["parameters"]["properties"]["value"]["maxLength"],
             8_192
+        );
+
+        let batch = tool_declarations(true);
+        for name in [
+            SET_INSTRUMENT_PARAMETERS_TOOL_NAME,
+            UPDATE_EFFECT_PARAMETERS_TOOL_NAME,
+        ] {
+            let declaration = batch
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .expect("enabled batch declaration");
+            assert_eq!(
+                declaration["parameters"]["properties"]["changes"]["maxItems"],
+                32
+            );
+        }
+    }
+
+    #[test]
+    fn batch_parameter_mutations_are_atomic_and_reject_duplicates() {
+        let project = project_with_effect("Tape");
+        let track = &project.tracks[0];
+        let track_id = track.id;
+        let effect_id = track.effects[0].id;
+        let session = EditSession::create(&project, "batch controls", 0.0, 1.0).expect("session");
+
+        let response: JsonValue = serde_json::from_str(
+            &apply_agent_mutation(
+                session.path(),
+                UPDATE_EFFECT_PARAMETERS_TOOL_NAME,
+                &serde_json::json!({
+                    "trackId":track_id,
+                    "effectId":effect_id,
+                    "changes":[
+                        {"parameter":"mix","value":"0.2"},
+                        {"parameter":"Amount","value":"0.7"}
+                    ]
+                }),
+            )
+            .expect("effect batch"),
+        )
+        .expect("batch response");
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap()
+                .contains("2 parameters")
+        );
+        let updated = session.take_update().unwrap().expect("one atomic update");
+        let effect = &updated.1.tracks[0].effects[0];
+        assert!((effect.mix - 0.2).abs() < 0.001);
+        assert!(
+            effect
+                .parameters
+                .get("Amount")
+                .is_some_and(|value| (*value - 0.7).abs() < 0.001)
+        );
+        assert!(effect.parameter_overrides.contains(&"Amount".to_owned()));
+        assert!(session.take_update().unwrap().is_none());
+
+        let before = current_project(session.path()).unwrap().to_json();
+        let error = apply_agent_mutation(
+            session.path(),
+            SET_INSTRUMENT_PARAMETERS_TOOL_NAME,
+            &serde_json::json!({
+                "trackId":track_id,
+                "changes":[
+                    {"parameter":"native:264","value":"0.4"},
+                    {"parameter":"native:999999","value":"0.5"}
+                ]
+            }),
+        )
+        .expect_err("invalid second item rejects batch");
+        assert!(error.contains("native:999999"));
+        assert_eq!(current_project(session.path()).unwrap().to_json(), before);
+        assert!(session.take_update().unwrap().is_none());
+
+        let error = apply_agent_mutation(
+            session.path(),
+            SET_INSTRUMENT_PARAMETERS_TOOL_NAME,
+            &serde_json::json!({
+                "trackId":track_id,
+                "changes":[
+                    {"parameter":"native:264","value":"0.4"},
+                    {"parameter":"native:264","value":"0.5"}
+                ]
+            }),
+        )
+        .expect_err("duplicate parameter rejected");
+        assert!(error.contains("appears more than once"));
+        assert_eq!(current_project(session.path()).unwrap().to_json(), before);
+
+        let response: JsonValue = serde_json::from_str(
+            &apply_agent_mutation(
+                session.path(),
+                SET_INSTRUMENT_PARAMETERS_TOOL_NAME,
+                &serde_json::json!({
+                    "trackId":track_id,
+                    "changes":[
+                        {"parameter":"native:264","value":"0.4"},
+                        {"parameter":"native:265","value":"0.6"}
+                    ]
+                }),
+            )
+            .expect("instrument batch"),
+        )
+        .expect("batch response");
+        assert!(response["message"].as_str().unwrap().contains("2 Surge XT"));
+        let updated = session.take_update().unwrap().expect("one atomic update");
+        assert_eq!(
+            updated.1.tracks[0]
+                .instrument
+                .native_overrides
+                .iter()
+                .filter(|(parameter, _)| matches!(**parameter, 264 | 265))
+                .count(),
+            2
         );
     }
 

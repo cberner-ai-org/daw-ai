@@ -113,18 +113,27 @@ impl GeminiPlanner {
         end: f32,
         project: &Project,
         reference_audio: Option<ReferenceAudio>,
+        batch_parameter_tools: bool,
         cancellation: Arc<AtomicBool>,
         mut render_audio: impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
         mut on_update: impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     ) -> Result<GeminiEdit, PlannerError> {
-        let session = EditSession::create_in(session_root, project, prompt, start, end)
-            .map_err(PlannerError::Io)?;
+        let session = EditSession::create_in(
+            session_root,
+            project,
+            prompt,
+            start,
+            end,
+            batch_parameter_tools,
+        )
+        .map_err(PlannerError::Io)?;
         let result = run_session_with_reference(
             &session,
             prompt,
             start,
             end,
             reference_audio.as_ref(),
+            batch_parameter_tools,
             cancellation,
             &mut render_audio,
             &mut on_update,
@@ -152,6 +161,7 @@ fn run_session_with_reference(
     start: f32,
     end: f32,
     reference_audio: Option<&ReferenceAudio>,
+    batch_parameter_tools: bool,
     cancellation: Arc<AtomicBool>,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -165,6 +175,7 @@ fn run_session_with_reference(
         start,
         end,
         reference_audio,
+        batch_parameter_tools,
         render_audio,
         on_update,
         &|| cancellation.load(Ordering::SeqCst),
@@ -201,6 +212,7 @@ fn run_session_with_transport(
         start,
         end,
         None,
+        false,
         render_audio,
         on_update,
         is_cancelled,
@@ -215,13 +227,14 @@ fn run_session_with_transport_reference(
     start: f32,
     end: f32,
     reference_audio: Option<&ReferenceAudio>,
+    batch_parameter_tools: bool,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     is_cancelled: &impl Fn() -> bool,
     transport: &mut impl FnMut(usize, &JsonValue, Duration) -> Result<String, PlannerError>,
 ) -> Result<GeminiEdit, PlannerError> {
     let started = Instant::now();
-    let tools = tool_declarations();
+    let tools = tool_declarations(batch_parameter_tools);
     let mut input = reference_audio.map_or_else(
         || JsonValue::String(planner_task(prompt, start, end)),
         |audio| {
@@ -1575,6 +1588,7 @@ mod tests {
             0.0,
             4.0,
             Some(&reference),
+            false,
             &mut render_audio_request,
             &mut |edit| Ok(edit.project),
             &|| false,

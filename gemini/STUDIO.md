@@ -34,6 +34,7 @@ For selection controls, `update_effect` accepts either an exact returned display
 - `add_effect`, `update_effect`, and `delete_effect` mutate Surge effects.
 - `add_modulator`, `update_modulator`, and `delete_modulator` mutate modulation.
 - `set_instrument_parameter` edits one native Surge instrument parameter.
+- When exposed, `set_instrument_parameters` and `update_effect_parameters` atomically apply several discovered controls to one instrument or effect. A rejected item rejects the whole batch.
 - `set_track_volume`, `set_track_mute`, and `set_tempo` edit DAW-owned state.
 - `undo` restores the state before the latest successful mutation in this session.
 

@@ -615,6 +615,7 @@ async function run() {
         panelPadding: parseFloat(getComputedStyle(document.querySelector('#debug-panel')).paddingTop),
         reportHeight: document.querySelector('#debug-report').getBoundingClientRect().height,
         settingsDisplay: getComputedStyle(document.querySelector('.debug-settings')).display,
+        batchParameterTools: document.querySelector('#batch-parameter-tools').checked,
       };
     })()`);
     assert.deepEqual(
@@ -626,6 +627,7 @@ async function run() {
       "the two chartered studio views must be exposed as tabs",
     );
     assert.equal(debugView.debugVisible && debugView.aiHidden, true, "Debug must replace the AI Mode panel");
+    assert.equal(debugView.batchParameterTools, false, "batch parameter tools must default off");
     assert.ok(
       debugView.panelPadding >= 20 &&
         debugView.reportHeight >= 400 &&
@@ -638,6 +640,15 @@ async function run() {
     assert.match(
       await evaluate(cdp, appSession, "document.querySelector('#gemini-session-list').textContent"),
       /No AI sessions recorded yet/,
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, `(() => {
+        const toggle = document.querySelector('#batch-parameter-tools');
+        toggle.click();
+        return localStorage.getItem('daw-ai.batch-parameter-tools.v1');
+      })()`),
+      "true",
+      "the Debug experiment toggle must persist locally",
     );
     const sessions = await evaluate(
       cdp,
@@ -947,6 +958,7 @@ async function run() {
       window.__refusedEditRequests = 0;
       window.__refusedEditBody = null;
       window.__persistedReferenceAtRequest = null;
+      window.__persistedBatchAtRequest = null;
       window.fetch = function fetch(resource, options) {
         if (resource === '/api/edits') {
           window.__refusedEditRequests += 1;
@@ -954,6 +966,9 @@ async function run() {
           window.__persistedReferenceAtRequest = JSON.parse(
             localStorage.getItem('daw-ai.pending-edit.v1'),
           ).referenceAudio;
+          window.__persistedBatchAtRequest = JSON.parse(
+            localStorage.getItem('daw-ai.pending-edit.v1'),
+          ).batchParameterTools;
           return Promise.resolve(new Response(JSON.stringify({ error: 'Edit request refused' }), {
             status: 422,
             headers: { 'Content-Type': 'application/json' },
@@ -998,6 +1013,16 @@ async function run() {
     assert.equal(refusedEditBody.reference_audio_name, "one-shot.wav");
     assert.equal(refusedEditBody.reference_audio_type, "audio/wav");
     assert.equal(refusedEditBody.reference_audio_data, "____");
+    assert.equal(
+      refusedEditBody.batch_parameter_tools,
+      "true",
+      "the selected batch-tool variant must travel with the edit request",
+    );
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__persistedBatchAtRequest"),
+      true,
+      "the variant must be retained with an unaccepted recoverable edit",
+    );
     assert.equal(
       await evaluate(cdp, appSession, `(() => {
         const encodedData = window.__refusedEditBody.match(/reference_audio_data=([^&]*)/)[1];

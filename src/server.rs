@@ -427,6 +427,7 @@ struct EditRequest {
     end: f32,
     project: crate::model::Project,
     reference_audio: Option<crate::gemini::ReferenceAudio>,
+    batch_parameter_tools: bool,
 }
 
 struct EditFailure {
@@ -1153,6 +1154,10 @@ impl Router {
             Ok(audio) => audio,
             Err(message) => return Response::json(422, error_json(message)),
         };
+        let batch_parameter_tools = match parse_optional_boolean(&form, "batch_parameter_tools") {
+            Ok(value) => value,
+            Err(message) => return Response::json(422, error_json(message)),
+        };
         let project = {
             let studio = self.lock_studio();
             if let Err(error) = studio.validate_edit(start, end, prompt) {
@@ -1193,6 +1198,7 @@ impl Router {
             end,
             project,
             reference_audio,
+            batch_parameter_tools,
         };
         let worker = self.clone();
         let spawn = thread::Builder::new()
@@ -1530,6 +1536,7 @@ impl Router {
             edit.end,
             &edit.project,
             edit.reference_audio.clone(),
+            edit.batch_parameter_tools,
             cancellation,
             |request| {
                 self.edit_jobs.set_running(
@@ -2368,6 +2375,17 @@ fn parse_form(body: &str) -> HashMap<String, String> {
         .collect()
 }
 
+fn parse_optional_boolean(
+    form: &HashMap<String, String>,
+    name: &str,
+) -> Result<bool, &'static str> {
+    match form.get(name).map(String::as_str) {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err("boolean setting must be true or false"),
+    }
+}
+
 fn parse_reference_audio(
     form: &HashMap<String, String>,
 ) -> Result<Option<crate::gemini::ReferenceAudio>, &'static str> {
@@ -2970,6 +2988,7 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
+            batch_parameter_tools: false,
         };
         let plan = |preset: &str, summary: &str| EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3107,6 +3126,7 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
+            batch_parameter_tools: false,
         };
         let first_plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3239,6 +3259,7 @@ mod tests {
             end: 8.0,
             project: project.clone(),
             reference_audio: None,
+            batch_parameter_tools: false,
         };
         let plan = EditPlan {
             action: crate::prompt::Action::Configure {
@@ -3643,6 +3664,26 @@ mod tests {
             );
         }
         assert_eq!(decode_base64("____"), Some(vec![255, 255, 255]));
+    }
+
+    #[test]
+    fn validates_optional_batch_parameter_setting() {
+        assert!(!parse_optional_boolean(&HashMap::new(), "batch_parameter_tools").unwrap());
+        assert!(
+            parse_optional_boolean(
+                &parse_form("batch_parameter_tools=true"),
+                "batch_parameter_tools"
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            parse_optional_boolean(
+                &parse_form("batch_parameter_tools=enabled"),
+                "batch_parameter_tools"
+            )
+            .unwrap_err(),
+            "boolean setting must be true or false"
+        );
     }
 
     #[test]
