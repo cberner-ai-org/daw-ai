@@ -357,9 +357,14 @@ impl Drop for EditSession {
     }
 }
 
-pub(crate) fn tool_declarations() -> Vec<JsonValue> {
+pub(crate) fn tool_declarations_with_audio_metrics(include_audio_metrics: bool) -> Vec<JsonValue> {
     let audio_schema = serde_json::from_str::<JsonValue>(AUDIO_REGION_SCHEMA)
         .expect("embedded audio schema is valid JSON");
+    let audio_description = if include_audio_metrics {
+        "Optionally render all tracks (the default) or a list of model-chosen track IDs and absolute project start/end times from the latest sound graph as WAV audio with objective mix and per-track measurements. Listening is optional but recommended after every major change; you decide whether and when to listen. The listening range is independent of the selected edit scope."
+    } else {
+        "Optionally render all tracks (the default) or a list of model-chosen track IDs and absolute project start/end times from the latest sound graph as WAV audio. Listen to and reason from the audio itself; objective measurements are disabled for this edit. Listening is optional but recommended after every major change; you decide whether and when to listen. The listening range is independent of the selected edit scope."
+    };
     let mut tools = vec![
         serde_json::json!({
             "type": "function",
@@ -381,7 +386,7 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
         serde_json::json!({
             "type": "function",
             "name": AUDIO_TOOL_NAME,
-            "description": "Optionally render all tracks (the default) or a list of model-chosen track IDs and absolute project start/end times from the latest sound graph as WAV audio with objective mix and per-track measurements. Listening is optional but recommended after every major change; you decide whether and when to listen. The listening range is independent of the selected edit scope.",
+            "description": audio_description,
             "parameters": audio_schema
         }),
         function(
@@ -2706,7 +2711,7 @@ mod tests {
 
     #[test]
     fn declares_direct_graph_editing_and_audio_tools() {
-        let declarations = tool_declarations();
+        let declarations = tool_declarations_with_audio_metrics(true);
         let names = declarations
             .iter()
             .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str))
@@ -2728,6 +2733,13 @@ mod tests {
                 .unwrap()
                 .contains("you decide whether and when to listen")
         );
+        let without_metrics = tool_declarations_with_audio_metrics(false);
+        let audio_description = without_metrics[1]["description"]
+            .as_str()
+            .expect("audio tool description");
+        assert!(audio_description.contains("as WAV audio"));
+        assert!(audio_description.contains("objective measurements are disabled"));
+        assert!(!audio_description.contains("with objective mix and per-track measurements"));
         let midi = declarations
             .iter()
             .find(|tool| tool["name"] == "add_midi_clip")

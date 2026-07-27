@@ -442,6 +442,7 @@
       }
     }
     state.project = project;
+    audio.playhead = clamp(audio.playhead, 0, project.duration);
     return project;
   }
 
