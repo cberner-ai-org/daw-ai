@@ -779,6 +779,37 @@ async function run() {
       ),
       "restored timeline duration",
     );
+    await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, appSession, `(() => {
+        const [minutes, seconds] = document.querySelector('#current-time').textContent.split(':');
+        return Number(minutes) * 60 + Number(seconds) > 1.2;
+      })()`),
+      "playhead beyond shortened duration",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      document.querySelector('#play-button').click();
+      window.prompt = () => '1';
+      document.querySelector('#ai-duration-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.querySelector('#current-time').textContent === '0:01.0' &&
+          Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')) === 1`,
+      ),
+      "playhead clamped to shortened duration",
+    );
+    await evaluate(cdp, appSession, "document.querySelector('#undo-button').click()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')) === ${durationBaseline.duration}`,
+      ),
+      "shortened duration undo",
+    );
     await evaluate(cdp, appSession, "document.querySelector('#debug-button').click()");
     assert.equal(
       await evaluate(cdp, appSession, "document.querySelector('#audio-metrics-toggle').checked"),

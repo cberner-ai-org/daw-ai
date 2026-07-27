@@ -1416,6 +1416,7 @@ impl Router {
             edit.end,
             &edit.project,
             edit.reference_audio.clone(),
+            edit.include_audio_metrics,
             cancellation,
             |request| {
                 self.edit_jobs.set_running(
