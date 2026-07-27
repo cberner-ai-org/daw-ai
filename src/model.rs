@@ -1795,6 +1795,30 @@ impl Studio {
         Ok(track_id)
     }
 
+    pub(crate) fn set_track_identity(
+        &mut self,
+        track_id: u64,
+        name: &str,
+        color: &str,
+    ) -> Result<(), StudioError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 16 || !TRACK_COLOR_PALETTE.contains(&color) {
+            return Err(StudioError::InvalidChannel);
+        }
+        let track_index = self
+            .project
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or(StudioError::UnknownTrack)?;
+        self.remember();
+        let track = &mut self.project.tracks[track_index];
+        track.name = name.to_owned();
+        track.color = color.to_owned();
+        self.project.version += 1;
+        Ok(())
+    }
+
     pub fn delete_channel(&mut self, track_id: u64) -> Result<(), StudioError> {
         let Some(index) = self
             .project

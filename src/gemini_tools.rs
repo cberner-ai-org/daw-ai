@@ -35,6 +35,7 @@ const UNDO_GRAPH_FILE: &str = "undo-sound-graph.json";
 pub(crate) const MUTATION_TOOL_NAMES: &[&str] = &[
     "new_track",
     "delete_track",
+    "set_track_identity",
     "set_surge_preset",
     "add_midi_clip",
     "update_midi_clip",
@@ -487,6 +488,18 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             object_schema(serde_json::json!({"trackId":id()}), &["trackId"]),
         ),
         function(
+            "set_track_identity",
+            "Set an existing track's short display name and palette color. Use this to give the initial Empty Track a musical identity once its purpose is known.",
+            object_schema(
+                serde_json::json!({
+                    "trackId":id(),
+                    "name":{"type":"string","minLength":1,"maxLength":16,"description":"Short musical role or purpose, such as Lead or Bass Drop."},
+                    "color":{"type":"string","enum":TRACK_COLOR_PALETTE,"description":"Display color chosen from the DAW-AI track palette."}
+                }),
+                &["trackId", "name", "color"],
+            ),
+        ),
+        function(
             "set_surge_preset",
             "Load one installed Surge XT factory preset onto a track using a stable preset ID returned by list_surge_presets.",
             object_schema(
@@ -818,6 +831,7 @@ fn read_sound_node(
                     "role":track.role.as_str(),"color":track.color,"volume":track.volume,
                     "muted":track.muted,
                     "controls":[
+                        {"parameters":["name","color"],"mutationTool":"set_track_identity","colorPalette":TRACK_COLOR_PALETTE},
                         {"parameter":"volume","value":track.volume,"minimum":0,"maximum":1.5,"mutationTool":"set_track_volume"},
                         {"parameter":"muted","value":track.muted,"mutationTool":"set_track_mute"}
                     ],
@@ -1516,6 +1530,21 @@ pub(crate) fn apply_agent_mutation(
             let id = required_id(object, "trackId")?;
             studio.delete_channel(id).map_err(studio_error_message)?;
             format!("Deleted track {id}")
+        }
+        "set_track_identity" => {
+            let track_id = required_id(object, "trackId")?;
+            let name = required_string(object, "name")?;
+            let color = required_string(object, "color")?;
+            if name.trim().is_empty() || name.chars().count() > 16 {
+                return Err("name must contain between 1 and 16 characters".to_owned());
+            }
+            if !TRACK_COLOR_PALETTE.contains(&color) {
+                return Err("color must be chosen from the set_track_identity palette".to_owned());
+            }
+            studio
+                .set_track_identity(track_id, name, color)
+                .map_err(studio_error_message)?;
+            format!("Named track {track_id} {name} and set its color to {color}")
         }
         "set_surge_preset" => {
             let track_id = required_id(object, "trackId")?;
@@ -2785,6 +2814,20 @@ mod tests {
                 .map(Vec::len),
             Some(TRACK_COLOR_PALETTE.len())
         );
+        let set_track_identity = declarations
+            .iter()
+            .find(|tool| tool["name"] == "set_track_identity")
+            .expect("track identity declaration");
+        assert_eq!(
+            set_track_identity["parameters"]["required"],
+            serde_json::json!(["trackId", "name", "color"])
+        );
+        assert_eq!(
+            set_track_identity["parameters"]["properties"]["color"]["enum"]
+                .as_array()
+                .map(Vec::len),
+            Some(TRACK_COLOR_PALETTE.len())
+        );
         let update_modulator = declarations
             .iter()
             .find(|tool| tool["name"] == "update_modulator")
@@ -3358,6 +3401,77 @@ mod tests {
         let (_, project) = session.take_update().unwrap().expect("published undo");
         assert_eq!(project.tracks.len(), original.tracks.len());
         assert!(!project.tracks.iter().any(|track| track.id == track_id));
+    }
+
+    #[test]
+    fn existing_initial_track_can_be_named_and_colored() {
+        let original = Project::initial();
+        let track_id = original.tracks[0].id;
+        let session =
+            EditSession::create(&original, "make a bass line", 0.0, 4.0).expect("edit session");
+
+        apply_agent_mutation(
+            session.path(),
+            "set_track_identity",
+            &serde_json::json!({"trackId":track_id,"name":"Bass","color":"#8ca9ff"}),
+        )
+        .expect("set initial track identity");
+        let (_, project) = session.take_update().unwrap().expect("identity update");
+        assert_eq!(project.tracks.len(), 1);
+        assert_eq!(project.tracks[0].name, "Bass");
+        assert_eq!(project.tracks[0].color, "#8ca9ff");
+
+        apply_agent_mutation(session.path(), "undo", &serde_json::json!({})).expect("undo");
+        let (_, project) = session.take_update().unwrap().expect("undo update");
+        assert_eq!(project.tracks[0].name, "Empty Track");
+        assert_eq!(project.tracks[0].color, original.tracks[0].color);
+    }
+
+    #[test]
+    fn track_identity_rejects_invalid_names_and_colors_with_actionable_errors() {
+        let original = Project::initial();
+        let track_id = original.tracks[0].id;
+        let session =
+            EditSession::create(&original, "make a bass line", 0.0, 4.0).expect("edit session");
+
+        let error = apply_agent_mutation(
+            session.path(),
+            "set_track_identity",
+            &serde_json::json!({"trackId":track_id,"name":" ","color":"#8ca9ff"}),
+        )
+        .expect_err("blank name");
+        assert_eq!(error, "name must be a nonempty string");
+        assert!(session.take_update().unwrap().is_none());
+
+        let error = apply_agent_mutation(
+            session.path(),
+            "set_track_identity",
+            &serde_json::json!({
+                "trackId":track_id,
+                "name":"This name is much too long",
+                "color":"#8ca9ff"
+            }),
+        )
+        .expect_err("overlong name");
+        assert_eq!(error, "name must contain between 1 and 16 characters");
+        assert!(session.take_update().unwrap().is_none());
+
+        let error = apply_agent_mutation(
+            session.path(),
+            "set_track_identity",
+            &serde_json::json!({"trackId":track_id,"name":"Bass","color":"#000000"}),
+        )
+        .expect_err("unknown color");
+        assert_eq!(
+            error,
+            "color must be chosen from the set_track_identity palette"
+        );
+        assert!(session.take_update().unwrap().is_none());
+
+        let graph = ProjectStore::open(session.path().join(GRAPH_FILE))
+            .expect("sound graph")
+            .1;
+        assert_eq!(graph.project().to_json(), original.to_json());
     }
 
     #[test]
