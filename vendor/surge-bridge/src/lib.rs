@@ -2,6 +2,13 @@ pub use surge_sys::*;
 
 unsafe extern "C" {
     pub fn create_engine(sr: f32) -> *mut SurgeSynthesizer;
+    pub fn surge_load_builtin_wavetables(
+        surge: *mut SurgeSynthesizer,
+        windows: *const std::ffi::c_char,
+        windows_size: usize,
+        initial: *const std::ffi::c_char,
+        initial_size: usize,
+    ) -> bool;
     pub fn create_patch() -> *mut SurgePatch;
     pub fn destroy_engine(surge: *mut SurgeSynthesizer);
     pub fn destroy_patch(patch: *mut SurgePatch);

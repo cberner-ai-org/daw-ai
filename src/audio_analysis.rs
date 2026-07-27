@@ -2123,14 +2123,13 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_headless_preset_returns_an_error_before_native_rendering() {
-        let mut project = Project::initial();
+    fn factory_wavetable_preset_renders_in_headless_engine() {
+        let mut project = Project::demo();
         project.tracks[0].instrument.preset = "Factory/FX/Space Adventure 1".to_owned();
-        let error = match render_region_with_tracks(&project, &[1], 0.0, 1.0) {
-            Ok(_) => panic!("unsafe preset reached Surge"),
-            Err(error) => error,
-        };
-        assert!(error.contains("crashes the headless audio renderer"));
+        let track_id = project.tracks[0].id;
+        let rendered = render_region_with_tracks(&project, &[track_id], 0.0, 1.0)
+            .expect("factory wavetable preset render");
+        assert!(rendered.mix.samples.iter().any(|sample| sample.abs() > 0.0));
     }
 
     fn sample_difference(left: &[f32], right: &[f32]) -> f32 {

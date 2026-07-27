@@ -1497,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn headless_choices_exclude_oscillator_types_without_required_data() {
+    fn headless_choices_include_oscillator_types_with_embedded_data() {
         let mut instrument = crate::model::Project::demo().tracks[1].instrument.clone();
         instrument.preset = "Factory/Basses/Behemoth".to_owned();
         instrument.native_overrides.insert(234, 2.0 / 11.0);
@@ -1511,7 +1511,13 @@ mod tests {
             oscillator_type
                 .choices
                 .iter()
-                .all(|(_, display)| display != "Wavetable" && display != "Window")
+                .any(|(_, display)| display == "Wavetable")
+        );
+        assert!(
+            oscillator_type
+                .choices
+                .iter()
+                .any(|(_, display)| display == "Window")
         );
 
         let mut engine = Engine::new(&instrument, &[], &[], &[], 1, 16_000.0).expect("safe engine");

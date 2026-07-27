@@ -3137,7 +3137,7 @@ mod tests {
             original.to_json()
         );
 
-        let error = prepare_instrument_audition(
+        let wavetable_request = prepare_instrument_audition(
             session.path(),
             &serde_json::json!({
                 "presetId":"Factory/FX/Space Adventure 1",
@@ -3145,8 +3145,11 @@ mod tests {
                 "events":[{"time":0,"duration":0.25,"pitch":60,"velocity":0.8}]
             }),
         )
-        .expect_err("unsafe audition preset");
-        assert!(error.contains("crashes the headless audio renderer"));
+        .expect("factory wavetable audition preset");
+        assert_eq!(
+            wavetable_request.project.tracks[0].instrument.preset,
+            "Factory/FX/Space Adventure 1"
+        );
     }
 
     #[test]

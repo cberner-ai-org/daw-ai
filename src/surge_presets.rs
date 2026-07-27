@@ -4,17 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::{env, fs};
 
 pub(crate) const FACTORY_PREFIX: &str = "Factory/";
-const HEADLESS_UNSAFE_PRESETS: &[&str] = &[
-    "Factory/FX/Space Adventure 1",
-    "Factory/Pads/Computers In Space",
-    "Factory/Pads/Primes",
-    "Factory/Polysynths/Eyan",
-    "Factory/Polysynths/Fonk",
-    "Factory/Polysynths/Japanese Space-ulation Wheel",
-    "Factory/Polysynths/Jim",
-    "Factory/Polysynths/Past Tense",
-    "Factory/Sequences/Burial Ground",
-];
+const HEADLESS_UNSAFE_PRESETS: &[&str] = &[];
 
 #[cfg(test)]
 pub(crate) fn headless_unsafe_presets() -> &'static [&'static str] {
