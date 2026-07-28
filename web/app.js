@@ -167,6 +167,7 @@
       if (!this.project || !this.streamToken || this.playbackState !== "idle") return Promise.resolve();
       window.clearTimeout(this.spectrumPreparationRetryTimer);
       this.spectrumPreparationRetryTimer = null;
+      this.cancelSpectrumLoad();
       if (this.playhead >= this.project.duration - 0.01) this.playhead = 0;
       this.playbackState = "starting";
       this.playbackGeneration += 1;
@@ -375,6 +376,14 @@
           this.spectrumLoading = false;
         }
       }
+    }
+
+    cancelSpectrumLoad() {
+      if (!this.spectrumLoading) return;
+      this.spectrumLoadGeneration += 1;
+      this.spectrumAbortController?.abort();
+      this.spectrumAbortController = null;
+      this.spectrumLoading = false;
     }
 
     async prepareSpectrum(project, start) {

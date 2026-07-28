@@ -377,6 +377,37 @@ async function run() {
       60_000,
     );
     await cdp.send("Target.closeTarget", { targetId: startupPage.targetId });
+    const playbackPriorityPage = await openPageWithScript(cdp, appUrl, `(() => {
+      const originalFetch = window.fetch;
+      window.__spectrumPendingAtPlay = false;
+      window.__spectrumAbortedForPlay = false;
+      window.fetch = function fetch(resource, options) {
+        if (typeof resource === 'string' && resource.startsWith('/api/track-spectrum/')) {
+          window.__spectrumPendingAtPlay = true;
+          return new Promise((resolve, reject) => {
+            options.signal.addEventListener('abort', () => {
+              window.__spectrumAbortedForPlay = true;
+              reject(new DOMException('Spectrum request aborted for playback', 'AbortError'));
+            }, { once: true });
+          });
+        }
+        return originalFetch(resource, options);
+      };
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        playbackPriorityPage.sessionId,
+        `window.__spectrumPendingAtPlay && !document.querySelector('#play-button').disabled`,
+      ),
+      "pending spectrum prefetch before playback",
+    );
+    await evaluate(cdp, playbackPriorityPage.sessionId, "document.querySelector('#play-button').click()");
+    await waitFor(
+      async () => evaluate(cdp, playbackPriorityPage.sessionId, "window.__spectrumAbortedForPlay"),
+      "spectrum cancellation before playback",
+    );
+    await cdp.send("Target.closeTarget", { targetId: playbackPriorityPage.targetId });
     const degradedSpectrumPage = await openPageWithScript(cdp, appUrl, `(() => {
       const originalFetch = window.fetch;
       window.__failedSpectrumRequests = 0;
@@ -1320,7 +1351,7 @@ async function run() {
           )`,
         ),
       "track response to backend spectrum timeline",
-      60_000,
+      30_000,
     ).catch(async (error) => {
       const diagnostics = await evaluate(cdp, appSession, `({
         audioState: document.documentElement.dataset.audioState,
