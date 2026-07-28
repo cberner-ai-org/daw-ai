@@ -874,6 +874,7 @@ pub(crate) struct AudioRenderRequest {
     pub(crate) start: f32,
     pub(crate) end: f32,
     pub(crate) description: String,
+    pub(crate) require_audible_output: bool,
 }
 
 pub(crate) fn read_sound_graph(
@@ -2524,6 +2525,7 @@ pub(crate) fn prepare_audio_render(
         start,
         end,
         description,
+        require_audible_output: false,
     })
 }
 
@@ -2614,6 +2616,7 @@ pub(crate) fn prepare_instrument_audition(
             "Auditioned {preset_id}{effect_description} for {duration_beats:.3} beats ({duration_seconds:.3} seconds) at {} BPM",
             current.bpm
         ),
+        require_audible_output: true,
     })
 }
 
@@ -2632,7 +2635,7 @@ pub(crate) fn render_audio_request_cancellable(
         request.end,
         cancelled,
     )?;
-    validate_feedback_audio(&regions.mix)?;
+    validate_feedback_audio(&regions.mix, request.require_audible_output)?;
     let measurements = audio_measurements(&request, "Surge XT", &regions);
     Ok(AudioRender {
         description: format!(
@@ -2644,11 +2647,18 @@ pub(crate) fn render_audio_request_cancellable(
     })
 }
 
-fn validate_feedback_audio(region: &audio_analysis::AudioRegion) -> Result<(), String> {
-    validate_feedback_samples(&region.samples, region.event_count)
+fn validate_feedback_audio(
+    region: &audio_analysis::AudioRegion,
+    require_audible_output: bool,
+) -> Result<(), String> {
+    validate_feedback_samples(&region.samples, region.event_count, require_audible_output)
 }
 
-fn validate_feedback_samples(samples: &[f32], event_count: usize) -> Result<(), String> {
+fn validate_feedback_samples(
+    samples: &[f32],
+    event_count: usize,
+    require_audible_output: bool,
+) -> Result<(), String> {
     if !samples.iter().all(|sample| sample.is_finite()) {
         return Err(
             "Surge XT produced non-finite audio; choose another preset or effect".to_owned(),
@@ -2671,7 +2681,7 @@ fn validate_feedback_samples(samples: &[f32], event_count: usize) -> Result<(), 
             "Surge XT produced a pathological DC offset ({dc_offset:.2}); choose another preset or effect"
         ));
     }
-    if event_count > 0 && peak <= 0.000_01 {
+    if require_audible_output && event_count > 0 && peak <= 0.000_01 {
         return Err(format!(
             "Surge XT rendered silence despite {} MIDI events; choose another preset or effect",
             event_count
@@ -4801,6 +4811,7 @@ mod tests {
             start: 0.0,
             end: 1.0,
             description: "pathological Tape render".to_owned(),
+            require_audible_output: false,
         };
         let error = render_audio_request(request).expect_err("Tape output must be rejected");
         assert!(
@@ -4808,27 +4819,44 @@ mod tests {
             "unexpected render error: {error}"
         );
 
-        assert!(validate_feedback_samples(&[0.1, -0.1], 1).is_ok());
+        assert!(validate_feedback_samples(&[0.1, -0.1], 1, false).is_ok());
         assert!(
-            validate_feedback_samples(&[f32::NAN], 0)
+            validate_feedback_samples(&[f32::NAN], 0, false)
                 .unwrap_err()
                 .contains("non-finite")
         );
         assert!(
-            validate_feedback_samples(&[5.0, -5.0], 0)
+            validate_feedback_samples(&[5.0, -5.0], 0, false)
                 .unwrap_err()
                 .contains("peak")
         );
         assert!(
-            validate_feedback_samples(&[0.5, 0.5], 0)
+            validate_feedback_samples(&[0.5, 0.5], 0, false)
                 .unwrap_err()
                 .contains("DC offset")
         );
+        assert!(validate_feedback_samples(&[0.0, 0.0], 1, false).is_ok());
         assert!(
-            validate_feedback_samples(&[0.0, 0.0], 1)
+            validate_feedback_samples(&[0.0, 0.0], 1, true)
                 .unwrap_err()
                 .contains("silence")
         );
+    }
+
+    #[test]
+    fn feedback_render_accepts_intentionally_silent_tracks() {
+        let mut project = Project::demo();
+        project.tracks[0].volume = 0.0;
+        let request = AudioRenderRequest {
+            track_ids: vec![project.tracks[0].id],
+            project,
+            start: 0.0,
+            end: 1.0,
+            description: "muted-by-gain track".to_owned(),
+            require_audible_output: false,
+        };
+
+        render_audio_request(request).expect("intentional graph silence must remain measurable");
     }
 
     #[test]
