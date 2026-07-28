@@ -19,9 +19,9 @@ use crate::gemini_tools::{
     ANALYZE_AUDIO_TOOL_NAME, AUDIO_TOOL_NAME, AUDITION_TOOL_NAME, AudioRender, AudioRenderRequest,
     EditSession, INSTRUMENT_PARAMETER_TOOL_NAME, LOAD_TOOL_GROUP_NAME, PRESET_TOOL_NAME,
     READ_TOOL_NAME, SOUND_TOOL_PARAMETER_TOOL_NAME, SessionVariants, apply_agent_mutation,
-    base64_audio, dynamic_tool_declarations, is_mutation_tool, list_instrument_parameters,
-    list_sound_tool_parameters, list_surge_presets, prepare_audio_render,
-    prepare_instrument_audition, read_sound_graph, tool_declarations,
+    base64_audio, dynamic_tool_declarations, is_batch_mutation_tool, is_mutation_tool,
+    list_instrument_parameters, list_sound_tool_parameters, list_surge_presets,
+    prepare_audio_render, prepare_instrument_audition, read_sound_graph, tool_declarations,
 };
 use crate::model::Project;
 #[cfg(test)]
@@ -388,13 +388,21 @@ fn run_session_with_transport_options(
                     ),
                 }
             } else if index == 0
-                && dynamic_tools
                 && !tools.iter().any(|tool| tool["name"] == call.name)
+                && (dynamic_tools || (!batch_parameter_tools && is_batch_mutation_tool(&call.name)))
             {
-                ToolOutput::text(format!(
-                    "Tool error: {} is not currently available; call {LOAD_TOOL_GROUP_NAME} for the required editing group",
-                    call.name
-                ))
+                let message = if dynamic_tools {
+                    format!(
+                        "Tool error: {} is not currently available; call {LOAD_TOOL_GROUP_NAME} for the required editing group",
+                        call.name
+                    )
+                } else {
+                    format!(
+                        "Tool error: {} is not available in the current session",
+                        call.name
+                    )
+                };
+                ToolOutput::text(message)
             } else if index == 0 {
                 execute_tool(
                     session,
@@ -1681,6 +1689,57 @@ mod tests {
         .expect("dynamic tool session");
 
         assert!(rejected_stale_call);
+        assert_eq!(result.project.bpm, 140);
+        assert_eq!(session.stats().unwrap().0, 1);
+    }
+
+    #[test]
+    fn disabled_batch_tools_cannot_execute_undeclared_calls() {
+        let session =
+            EditSession::create(&Project::demo(), "change tempo", 0.0, 4.0).expect("session");
+        let responses = [
+            serde_json::json!({
+                "id":"batch","status":"requires_action","steps":[{
+                    "type":"function_call","id":"batch-stale",
+                    "name":"set_instrument_parameters",
+                    "arguments":{"trackId":2,"changes":[{"parameter":"native:264","value":"0.4"}]}
+                }]
+            }),
+            serde_json::json!({
+                "id":"tempo","status":"requires_action","steps":[{
+                    "type":"function_call","id":"tempo-allowed","name":"set_tempo",
+                    "arguments":{"bpm":140}
+                }]
+            }),
+            serde_json::json!({"id":"done","status":"completed","steps":[]}),
+        ];
+        let mut response_index = 0;
+        let mut rejected_batch_call = false;
+        let result = run_session_with_transport_options(
+            &session,
+            "change tempo",
+            0.0,
+            4.0,
+            false,
+            false,
+            false,
+            &mut render_audio_request,
+            &mut |edit| Ok(edit.project),
+            &|| false,
+            &mut |sequence, request, _| {
+                if sequence == 2 {
+                    rejected_batch_call = request
+                        .to_string()
+                        .contains("not available in the current session");
+                }
+                let response = responses[response_index].to_string();
+                response_index += 1;
+                Ok(response)
+            },
+        )
+        .expect("non-batch session");
+
+        assert!(rejected_batch_call);
         assert_eq!(result.project.bpm, 140);
         assert_eq!(session.stats().unwrap().0, 1);
     }

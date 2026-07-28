@@ -39,7 +39,7 @@ For selection controls, `update_effect` accepts either an exact returned display
 - `undo` restores the state before the latest successful mutation in this session.
 
 Clip placement is in beats. Convert seconds to beats with `seconds * bpm / 60`. Keep mutations inside the selected region.
-Mutation and render responses include the current BPM and both beat and second equivalents; use those returned values instead of estimating section boundaries.
+Mutation responses and `analyze_audio` include the current BPM and both beat and second equivalents; use those returned values instead of estimating section boundaries.
 
 ## Modulation
 

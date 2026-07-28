@@ -1693,6 +1693,13 @@ pub(crate) fn is_mutation_tool(name: &str) -> bool {
     MUTATION_TOOL_NAMES.contains(&name)
 }
 
+pub(crate) fn is_batch_mutation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        SET_INSTRUMENT_PARAMETERS_TOOL_NAME | UPDATE_EFFECT_PARAMETERS_TOOL_NAME
+    )
+}
+
 pub(crate) fn apply_agent_mutation(
     session_path: &Path,
     name: &str,
