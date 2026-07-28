@@ -518,6 +518,74 @@ async function run() {
       "long projects must warm only their opening spectrum window",
     );
     await cdp.send("Target.closeTarget", { targetId: longProjectPage.targetId });
+    const stalePrefetchPage = await openPageWithScript(cdp, appUrl, `(() => {
+      const originalFetch = window.fetch;
+      const originalPlay = HTMLMediaElement.prototype.play;
+      window.__staleSpectrumStarts = [];
+      window.fetch = async function fetch(resource, options) {
+        if (resource === '/api/project') {
+          const response = await originalFetch(resource, options);
+          const project = await response.json();
+          project.duration = 130;
+          return new Response(JSON.stringify(project), {
+            status: response.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (typeof resource === 'string' && resource.startsWith('/api/track-spectrum/')) {
+          window.__staleSpectrumStarts.push(Number(resource.split('/')[5]));
+          return new Promise((resolve, reject) => {
+            options?.signal?.addEventListener('abort', () => {
+              reject(new DOMException('Spectrum request replaced', 'AbortError'));
+            }, { once: true });
+          });
+        }
+        return originalFetch(resource, options);
+      };
+      HTMLMediaElement.prototype.play = function play() {
+        this.dispatchEvent(new Event('playing'));
+        return Promise.resolve();
+      };
+      window.__restoreStaleSpectrumPlay = () => {
+        HTMLMediaElement.prototype.play = originalPlay;
+      };
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        stalePrefetchPage.sessionId,
+        `!document.querySelector('#play-button').disabled &&
+          JSON.stringify(window.__staleSpectrumStarts) === '[0]'`,
+      ),
+      "opening spectrum request before a distant seek",
+    );
+    await evaluate(cdp, stalePrefetchPage.sessionId, `(() => {
+      const lane = document.querySelector('.track-lane');
+      lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true }));
+      for (let index = 0; index < 260; index += 1) {
+        lane.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'ArrowRight', bubbles: true, cancelable: true,
+        }));
+      }
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        stalePrefetchPage.sessionId,
+        "window.__staleSpectrumStarts.at(-1) === 64000",
+      ),
+      "replacement spectrum request for distant playback",
+    ).catch(async (error) => {
+      const diagnostics = await evaluate(cdp, stalePrefetchPage.sessionId, `({
+        audioState: document.documentElement.dataset.audioState,
+        displayedTime: document.querySelector('#current-time').textContent,
+        starts: window.__staleSpectrumStarts,
+      })`);
+      throw new Error(`${error.message}: ${JSON.stringify(diagnostics)}`);
+    });
+    await evaluate(cdp, stalePrefetchPage.sessionId, "window.__restoreStaleSpectrumPlay()");
+    await cdp.send("Target.closeTarget", { targetId: stalePrefetchPage.targetId });
     const delayedPrefetchPage = await openPageWithScript(cdp, appUrl, `(() => {
       const originalFetch = window.fetch;
       window.__spectrumTrackIds = [];
