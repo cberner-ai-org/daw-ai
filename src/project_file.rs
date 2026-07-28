@@ -3,12 +3,10 @@ use std::collections::HashSet;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::model::{
-    ChannelOperation, ChannelOperationAction, Clip, ClipEvent, Edit, EditOperation, Effect,
-    Instrument, MAX_MIDI_EVENTS_PER_CLIP, MAX_PROMPT_CHARACTERS, MIN_MIDI_NOTE_BEATS, Modulator,
-    PROJECT_SCHEMA_VERSION, Project, ProjectFileError, Routing, SURGE_ENGINE, Track, TrackRole,
-    automation_target_range, valid_operation_id, valid_surge_preset,
+    Clip, ClipEvent, Edit, EditOperation, Effect, Instrument, MAX_MIDI_EVENTS_PER_CLIP,
+    MAX_PROMPT_CHARACTERS, MIN_MIDI_NOTE_BEATS, Modulator, PROJECT_SCHEMA_VERSION, Project,
+    ProjectFileError, Routing, SURGE_ENGINE, Track, valid_operation_id, valid_surge_preset,
 };
-use crate::prompt::{Action, AutomationPoint, MAX_COMPOUND_ACTIONS, MidiNote};
 
 const MAX_TRACKS: usize = 128;
 const MAX_TOOLS_PER_TRACK: usize = 256;
@@ -70,22 +68,11 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
             "edits supports at most {MAX_EDITS} entries"
         )));
     }
-    let mut edits = edit_values
+    let edits = edit_values
         .iter()
         .enumerate()
         .map(|(index, value)| parse_edit(value, index, duration, &mut ids))
         .collect::<Result<Vec<_>, _>>()?;
-    for edit in &mut edits {
-        validate_loaded_automation(&mut edit.action, &tracks)?;
-    }
-    let mut operation_ids = HashSet::new();
-    if edits
-        .iter()
-        .filter_map(|edit| edit.operation_id.as_deref())
-        .any(|operation_id| !operation_ids.insert(operation_id))
-    {
-        return Err(invalid("edit operation IDs must be unique"));
-    }
     let operation_values = array(root, "editOperations")?;
     if operation_values.len() > MAX_EDITS {
         return Err(invalid(format!(
@@ -104,24 +91,6 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     {
         return Err(invalid("edit operation records must be unique"));
     }
-    let channel_operation_values = array(root, "channelOperations")?;
-    if channel_operation_values.len() > MAX_EDITS {
-        return Err(invalid(format!(
-            "channelOperations supports at most {MAX_EDITS} entries"
-        )));
-    }
-    let channel_operations = channel_operation_values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| parse_channel_operation(value, index, version))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut channel_operation_ids = HashSet::new();
-    if channel_operations
-        .iter()
-        .any(|operation| !channel_operation_ids.insert(operation.operation_id.as_str()))
-    {
-        return Err(invalid("channel operation records must be unique"));
-    }
     if !ids.is_disjoint(&event_ids) {
         return Err(invalid(
             "MIDI event IDs must not collide with sound graph object IDs",
@@ -136,7 +105,6 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         tracks,
         edits,
         edit_operations,
-        channel_operations,
     })
 }
 
@@ -151,7 +119,6 @@ fn parse_track(
     let track = object(value, &context)?;
     let id = unique_id(track, "id", ids, &context)?;
     let name = limited_string(track, "name", 1, 160)?;
-    let role = parse_role(string(track, "role")?)?;
     let color = limited_string(track, "color", 1, 32)?;
     let volume = range(track, "volume", 0.0, 1.5)?;
     let muted = boolean(track, "muted")?;
@@ -240,7 +207,6 @@ fn parse_track(
     let parsed = Track {
         id,
         name,
-        role,
         color,
         volume,
         muted,
@@ -728,15 +694,10 @@ fn parse_edit(
     }
     Ok(Edit {
         id,
-        operation_id: edit
-            .get("operationId")
-            .map(|_| limited_string(edit, "operationId", 1, 128))
-            .transpose()?,
         start,
         end,
         prompt: limited_string(edit, "prompt", 1, MAX_PROMPT_CHARACTERS)?,
         summary: limited_string(edit, "summary", 1, 160)?,
-        action: parse_action(field(edit, "action")?, 0)?,
     })
 }
 
@@ -765,16 +726,12 @@ fn parse_edit_operation(
     }
     let status = match string(operation, "status")? {
         "running" => crate::model::EditOperationStatus::Running,
-        "partial" | "failed_with_changes" => crate::model::EditOperationStatus::Failed,
+        "failed_with_changes" => crate::model::EditOperationStatus::Failed,
         "interrupted_with_changes" => crate::model::EditOperationStatus::Interrupted,
         "completed" => crate::model::EditOperationStatus::Completed,
         _ => return Err(invalid(format!("{context} status is invalid"))),
     };
-    let initial_version = operation
-        .get("initialVersion")
-        .map(|_| integer(operation, "initialVersion"))
-        .transpose()?
-        .unwrap_or_else(|| project_version.saturating_sub(applied_steps));
+    let initial_version = integer(operation, "initialVersion")?;
     if initial_version > project_version {
         return Err(invalid(format!(
             "{context} initialVersion cannot exceed its projectVersion"
@@ -788,288 +745,6 @@ fn parse_edit_operation(
         initial_version,
         project_version,
         message: limited_string(operation, "message", 1, 160)?,
-    })
-}
-
-fn parse_channel_operation(
-    value: &JsonValue,
-    index: usize,
-    current_version: u64,
-) -> Result<ChannelOperation, ProjectFileError> {
-    let operation = object(value, "channel operation")?;
-    let context = format!("channel operation {}", index + 1);
-    let operation_id = limited_string(operation, "operationId", 1, 128)?;
-    if !valid_operation_id(&operation_id) {
-        return Err(invalid(format!("{context} ID is invalid")));
-    }
-    let track_id = integer(operation, "trackId")?;
-    if track_id == 0 {
-        return Err(invalid(format!(
-            "{context} trackId must be greater than zero"
-        )));
-    }
-    let project_version = integer(operation, "projectVersion")?;
-    if project_version > current_version {
-        return Err(invalid(format!(
-            "{context} projectVersion cannot exceed the project version"
-        )));
-    }
-    let role = match operation.get("role") {
-        Some(JsonValue::Null) => None,
-        Some(_) => Some(
-            TrackRole::from_name(string(operation, "role")?)
-                .ok_or_else(|| invalid(format!("{context} role is invalid")))?,
-        ),
-        None => return Err(invalid(format!("{context} role is required"))),
-    };
-    let action = match string(operation, "action")? {
-        "add" if role.is_some() => ChannelOperationAction::Add,
-        "delete" if role.is_none() => ChannelOperationAction::Delete,
-        _ => {
-            return Err(invalid(format!(
-                "{context} action and role are inconsistent"
-            )));
-        }
-    };
-    Ok(ChannelOperation {
-        operation_id,
-        action,
-        track_id,
-        role,
-        project_version,
-    })
-}
-
-fn parse_action(value: &JsonValue, depth: usize) -> Result<Action, ProjectFileError> {
-    if depth > 8 {
-        return Err(invalid("compound action nesting is too deep"));
-    }
-    let action = object(value, "edit action")?;
-    let action_type = string(action, "type")?;
-    if action_type == "graph-mutation" {
-        return Ok(Action::GraphMutation);
-    }
-    if action_type == "compound" {
-        let values = array(action, "actions")?;
-        if values.is_empty() || values.len() > MAX_COMPOUND_ACTIONS {
-            return Err(invalid(
-                "compound actions require one to nine child actions",
-            ));
-        }
-        return Ok(Action::Compound {
-            actions: values
-                .iter()
-                .map(|value| parse_action(value, depth + 1))
-                .collect::<Result<Vec<_>, _>>()?,
-        });
-    }
-    if action_type == "timed" {
-        let start = relative_range(action, "start")?;
-        let end = relative_range(action, "end")?;
-        if end <= start {
-            return Err(invalid("timed edit end must be after its start"));
-        }
-        return Ok(Action::Timed {
-            start,
-            end,
-            action: Box::new(parse_action(field(action, "action")?, depth + 1)?),
-        });
-    }
-    let target = action_target(action)?;
-    match action_type {
-        "gain" => Ok(Action::Gain {
-            amount: range(action, "value", 0.0, 2.0)?,
-            target,
-        }),
-        "mute" => Ok(Action::Mute { target }),
-        "midi-clip" => {
-            let role = required_target(target, "midi-clip")?;
-            let loop_beats = range(action, "loopBeats", 0.25, 16.0)?;
-            let start = relative_range(action, "start")?;
-            let end = relative_range(action, "end")?;
-            if end <= start {
-                return Err(invalid("midi-clip edit end must be after its start"));
-            }
-            let events = array(action, "events")?;
-            if events.len() > 32 {
-                return Err(invalid("midi-clip edit supports at most 32 events"));
-            }
-            Ok(Action::MidiClip {
-                track_id: integer(action, "trackId")?,
-                target: role,
-                label: limited_string(action, "label", 1, 64)?,
-                start,
-                end,
-                loop_beats,
-                notes: events
-                    .iter()
-                    .map(|event| parse_midi_note(event, loop_beats))
-                    .collect::<Result<Vec<_>, _>>()?,
-            })
-        }
-        "add-track" => Ok(Action::AddTrack {
-            role: required_target(target, "add-track")?,
-        }),
-        "instrument" => Ok(Action::Instrument {
-            preset: surge_preset(string(action, "name")?)?,
-            target: required_target(target, "instrument")?,
-        }),
-        "modulator" => Ok(Action::Modulator {
-            parameter: limited_string(action, "name", 1, 64)?,
-            shape: modulator_shape(string(action, "shape")?)?,
-            rate: range(action, "rate", 0.01, 20.0)?,
-            depth: range(action, "value", 0.0, 1.0)?,
-            target: required_target(target, "modulator")?,
-        }),
-        "configure" => {
-            let clip_id = integer(action, "clipId")?;
-            Ok(Action::Configure {
-                track_id: integer(action, "trackId")?,
-                target: required_target(target, "configure")?,
-                tool: sound_tool(string(action, "tool")?)?,
-                tool_id: integer(action, "toolId")?,
-                clip_id: (clip_id != 0).then_some(clip_id),
-                parameter: sound_parameter(string(action, "parameter")?)?,
-                value: limited_string(action, "setting", 1, 64)?,
-            })
-        }
-        "automation" => {
-            let points = array(action, "points")?;
-            if !(2..=16).contains(&points.len()) {
-                return Err(invalid("automation requires between 2 and 16 points"));
-            }
-            let points = points
-                .iter()
-                .map(|point| {
-                    let point = object(point, "automation point")?;
-                    Ok(AutomationPoint {
-                        time: relative_range(point, "time")?,
-                        value: finite_number(point, "value")?,
-                    })
-                })
-                .collect::<Result<Vec<_>, ProjectFileError>>()?;
-            validate_automation_points(&points)?;
-            let parameter = limited_string(action, "name", 1, 64)?;
-            Ok(Action::Automation {
-                track_id: integer(action, "trackId")?,
-                parameter,
-                curve: automation_curve(string(action, "curve")?)?,
-                points,
-                target: required_target(target, "automation")?,
-            })
-        }
-        "effect" => Ok(Action::Effect {
-            name: effect_name(string(action, "name")?, false)?,
-            mix: range(action, "value", 0.0, 1.0)?,
-            target,
-        }),
-        "remove-effect" => Ok(Action::RemoveEffect {
-            name: effect_name(string(action, "name")?, true)?,
-            target,
-        }),
-        "filter" => Ok(Action::Filter {
-            amount: range(action, "value", -1.0, 1.0)?,
-            target,
-        }),
-        "rhythm" => Ok(Action::Rhythm {
-            amount: range(action, "value", -1.0, 1.0)?,
-            target,
-        }),
-        "tempo" if target.is_none() => Ok(Action::Tempo {
-            bpm: bounded_integer(action, "value", 60, 180)? as u16,
-        }),
-        _ => Err(invalid(format!("unsupported edit action: {action_type}"))),
-    }
-}
-
-fn validate_automation_points(points: &[AutomationPoint]) -> Result<(), ProjectFileError> {
-    if points.first().map(|point| point.time) != Some(0.0)
-        || points.last().map(|point| point.time) != Some(1.0)
-        || points
-            .windows(2)
-            .any(|points| points[1].time <= points[0].time)
-    {
-        Err(invalid(
-            "automation point times must increase from 0 through 1",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_loaded_automation(
-    action: &mut Action,
-    tracks: &[Track],
-) -> Result<(), ProjectFileError> {
-    match action {
-        Action::GraphMutation => {}
-        Action::Compound { actions } => {
-            for action in actions {
-                validate_loaded_automation(action, tracks)?;
-            }
-        }
-        Action::Timed { action, .. } => validate_loaded_automation(action, tracks)?,
-        Action::Automation {
-            track_id,
-            parameter,
-            curve,
-            points,
-            target,
-        } => {
-            let track = if *track_id == 0 {
-                tracks.iter().rev().find(|track| {
-                    track.role == *target && automation_target_range(track, parameter).is_some()
-                })
-            } else {
-                tracks.iter().find(|track| {
-                    track.id == *track_id
-                        && track.role == *target
-                        && automation_target_range(track, parameter).is_some()
-                })
-            }
-            .ok_or_else(|| invalid("automation target does not exist on its owning track"))?;
-            *track_id = track.id;
-            let (minimum, maximum) = automation_target_range(track, parameter)
-                .expect("validated automation target exists");
-            if points.iter().any(|point| {
-                !(minimum..=maximum).contains(&point.value)
-                    || !crate::model::valid_automation_value(track, parameter, curve, point.value)
-            }) {
-                return Err(invalid("automation value or curve is invalid"));
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn automation_curve(value: &str) -> Result<&'static str, ProjectFileError> {
-    match value {
-        "linear" => Ok("linear"),
-        "hold" => Ok("hold"),
-        _ => Err(invalid("automation curve is unsupported")),
-    }
-}
-
-fn parse_midi_note(value: &JsonValue, loop_beats: f32) -> Result<MidiNote, ProjectFileError> {
-    let event = object(value, "MIDI note")?;
-    if event.get("type").is_some() && string(event, "type")? != "note" {
-        return Err(invalid("MIDI edit event type must be note"));
-    }
-    let time = finite_number(event, "time")?;
-    if !(0.0..loop_beats).contains(&time) {
-        return Err(invalid("MIDI edit event time must be inside its loop"));
-    }
-    Ok(MidiNote {
-        time,
-        duration: range(
-            event,
-            "duration",
-            MIN_MIDI_NOTE_BEATS,
-            loop_beats.min(crate::model::MAX_MIDI_NOTE_DURATION_BEATS),
-        )?,
-        pitch: bounded_integer(event, "pitch", 0, 127)? as u8,
-        velocity: range(event, "velocity", 0.01, 1.0)?,
     })
 }
 
@@ -1087,92 +762,6 @@ fn validate_modulator_targets(track: &Track) -> Result<(), ProjectFileError> {
         }
     }
     Ok(())
-}
-
-fn action_target(action: &Object) -> Result<Option<TrackRole>, ProjectFileError> {
-    match string(action, "target")? {
-        "all" => Ok(None),
-        value => parse_role(value).map(Some),
-    }
-}
-
-fn required_target(target: Option<TrackRole>, action: &str) -> Result<TrackRole, ProjectFileError> {
-    target.ok_or_else(|| invalid(format!("{action} requires a track role target")))
-}
-
-fn parse_role(value: &str) -> Result<TrackRole, ProjectFileError> {
-    match value {
-        "neutral" => Ok(TrackRole::Neutral),
-        "drums" => Ok(TrackRole::Drums),
-        "bass" => Ok(TrackRole::Bass),
-        "chords" => Ok(TrackRole::Chords),
-        "lead" => Ok(TrackRole::Lead),
-        "texture" => Ok(TrackRole::Texture),
-        _ => Err(invalid(format!("unknown track role: {value}"))),
-    }
-}
-
-fn surge_preset(value: &str) -> Result<&'static str, ProjectFileError> {
-    match value {
-        "Init" => Ok("Init"),
-        _ => Err(invalid("unsupported Surge XT preset")),
-    }
-}
-
-fn modulator_shape(value: &str) -> Result<&'static str, ProjectFileError> {
-    match value {
-        "sine" => Ok("sine"),
-        "triangle" => Ok("triangle"),
-        "square" => Ok("square"),
-        "random" => Ok("random"),
-        "envelope" => Ok("envelope"),
-        _ => Err(invalid("unsupported modulator shape")),
-    }
-}
-
-fn sound_tool(value: &str) -> Result<&'static str, ProjectFileError> {
-    match value {
-        "instrument" => Ok("instrument"),
-        "effect" => Ok("effect"),
-        "modulator" => Ok("modulator"),
-        "event" => Ok("event"),
-        "routing" => Ok("routing"),
-        _ => Err(invalid("unsupported configurable sound tool")),
-    }
-}
-
-fn sound_parameter(value: &str) -> Result<&'static str, ProjectFileError> {
-    match value {
-        "preset" => Ok("preset"),
-        "pitch" => Ok("pitch"),
-        "mix" => Ok("mix"),
-        "enabled" => Ok("enabled"),
-        "shape" => Ok("shape"),
-        "rate" => Ok("rate"),
-        "rateMode" => Ok("rateMode"),
-        "trigger" => Ok("trigger"),
-        "depth" => Ok("depth"),
-        "target" => Ok("target"),
-        "time" => Ok("time"),
-        "duration" => Ok("duration"),
-        "velocity" => Ok("velocity"),
-        "position" => Ok("position"),
-        _ => Err(invalid("unsupported sound-tool parameter")),
-    }
-}
-
-fn effect_name(value: &str, allow_all: bool) -> Result<&'static str, ProjectFileError> {
-    match value {
-        "Reverb 2" => Ok("Reverb 2"),
-        "Delay" => Ok("Delay"),
-        "Chorus" => Ok("Chorus"),
-        "EQ" => Ok("EQ"),
-        "Conditioner" => Ok("Conditioner"),
-        "Distortion" => Ok("Distortion"),
-        "Nimbus" => Ok("Nimbus"),
-        "Effects" if allow_all => Ok("Effects"),
-        _ => Err(invalid(format!("unsupported effect: {value}"))),
-    }
 }
 
 fn expect_type(value: &Object, expected: &str) -> Result<(), ProjectFileError> {
@@ -1326,10 +915,6 @@ fn normalize_native_overrides(instrument: &mut Instrument) {
     }
 }
 
-fn relative_range(object: &Object, name: &str) -> Result<f32, ProjectFileError> {
-    range(object, name, 0.0, 1.0)
-}
-
 fn integer(object: &Object, name: &str) -> Result<u64, ProjectFileError> {
     let value = field(object, name)?
         .as_f64()
@@ -1459,20 +1044,13 @@ mod tests {
 
     #[test]
     fn rejects_projects_missing_current_schema_fields() {
-        for pointer in ["/channelOperations", "/tracks/0/instrument/nativeOverrides"] {
-            let mut project: JsonValue =
-                serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
-            project
-                .pointer_mut(pointer.rsplit_once('/').expect("field pointer").0)
-                .and_then(JsonValue::as_object_mut)
-                .expect("field parent")
-                .remove(pointer.rsplit_once('/').expect("field pointer").1);
-
-            assert!(
-                parse_project(&project.to_string()).is_err(),
-                "accepted project without {pointer}"
-            );
-        }
+        let mut project: JsonValue =
+            serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+        project["tracks"][0]["instrument"]
+            .as_object_mut()
+            .expect("instrument")
+            .remove("nativeOverrides");
+        assert!(parse_project(&project.to_string()).is_err());
     }
 
     #[test]
@@ -1583,6 +1161,9 @@ mod tests {
 
         project["schemaVersion"] = JsonValue::from(2);
         assert!(parse_project(&project.to_string()).is_err());
+
+        project["schemaVersion"] = JsonValue::from(3);
+        assert!(parse_project(&project.to_string()).is_err());
     }
 
     #[test]
@@ -1611,116 +1192,6 @@ mod tests {
 
         let error = parse_project(&project.to_json()).expect_err("cross-track native route");
         assert!(error.to_string().contains("unsupported"));
-    }
-
-    #[test]
-    fn round_trips_materialized_edits() {
-        let mut studio = crate::model::Studio::new();
-        studio
-            .apply_prompt(4.0, 8.0, "add drive to the bass")
-            .expect("valid edit");
-        let source = studio.project().to_json();
-        let parsed = parse_project(&source).expect("valid edited graph");
-        assert_eq!(parsed.to_json(), source);
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn persisted_automation_is_cross_validated() {
-        let mut studio = crate::model::Studio::new();
-        let bass_id = studio.project().tracks[1].id;
-        studio
-            .apply_plan(
-                0.0,
-                4.0,
-                "automate bass volume",
-                crate::prompt::EditPlan {
-                    summary: "Automated bass volume".to_owned(),
-                    action: Action::Automation {
-                        track_id: bass_id,
-                        parameter: "track.volume".to_owned(),
-                        curve: "linear",
-                        points: vec![
-                            AutomationPoint {
-                                time: 0.0,
-                                value: 0.2,
-                            },
-                            AutomationPoint {
-                                time: 1.0,
-                                value: 1.2,
-                            },
-                        ],
-                        target: TrackRole::Bass,
-                    },
-                },
-            )
-            .expect("valid automation");
-        let source = studio.project().to_json();
-        parse_project(&source).expect("stable automation owner");
-
-        let mut unknown_track: JsonValue = serde_json::from_str(&source).unwrap();
-        unknown_track["edits"][0]["action"]["trackId"] = JsonValue::from(999_999_u64);
-        assert!(parse_project(&unknown_track.to_string()).is_err());
-
-        let mut out_of_range: JsonValue = serde_json::from_str(&source).unwrap();
-        out_of_range["edits"][0]["action"]["points"][1]["value"] = JsonValue::from(99.0);
-        assert!(parse_project(&out_of_range.to_string()).is_err());
-
-        let mut missing_owner: JsonValue = serde_json::from_str(&source).unwrap();
-        missing_owner["edits"][0]["action"]
-            .as_object_mut()
-            .expect("automation action")
-            .remove("trackId");
-        assert!(parse_project(&missing_owner.to_string()).is_err());
-
-        let mut unsupported_tuning: JsonValue = serde_json::from_str(&source).unwrap();
-        unsupported_tuning["edits"][0]["action"]["name"] =
-            JsonValue::String("instrument.oscillator1.tuning".to_owned());
-        unsupported_tuning["edits"][0]["action"]["points"][0]["value"] = JsonValue::from(-12.0);
-        unsupported_tuning["edits"][0]["action"]["points"][1]["value"] = JsonValue::from(12.0);
-        assert!(parse_project(&unsupported_tuning.to_string()).is_err());
-    }
-    #[test]
-    fn accepts_retained_clip_slices_with_shared_event_ids() {
-        let mut studio = crate::model::Studio::new();
-        studio
-            .apply_prompt(0.0, 4.0, "add a lead")
-            .expect("valid lead edit");
-        studio
-            .apply_prompt(1.0, 3.0, "rewrite the lead MIDI clip")
-            .expect("valid MIDI replacement");
-        let source = studio.project().to_json();
-
-        let parsed = parse_project(&source).expect("valid retained clip slices");
-        assert_eq!(parsed.to_json(), source);
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn rejects_duplicate_ids_and_invalid_routing() {
-        let duplicate = Project::demo()
-            .to_json()
-            .replacen("\"id\":201", "\"id\":1", 1);
-        assert!(parse_project(&duplicate).is_err());
-
-        let routing = Project::demo()
-            .to_json()
-            .replacen("\"effect:110\"", "\"effect:999\"", 1);
-        assert!(parse_project(&routing).is_err());
-
-        let control = Project::demo().to_json().replacen(
-            "{\"source\":\"modulator:150\",\"target\":\"instrument.cutoff\"}",
-            "{\"source\":\"modulator:999\",\"target\":\"instrument.cutoff\"}",
-            1,
-        );
-        assert!(parse_project(&control).is_err());
-
-        let edge = Project::demo().to_json().replacen(
-            "\"target\":\"master\",\"type\":\"audio\"",
-            "\"target\":\"effect:999\",\"type\":\"audio\"",
-            1,
-        );
-        assert!(parse_project(&edge).is_err());
     }
 
     #[test]

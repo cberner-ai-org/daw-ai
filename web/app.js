@@ -737,7 +737,6 @@
           .join("");
         const clips = midiClips;
         const markers = state.project.edits
-          .filter((edit) => editAppliesToTrack(edit, track))
           .map((edit) => {
             const left = (edit.start / duration) * 100;
             const width = ((edit.end - edit.start) / duration) * 100;
@@ -747,7 +746,7 @@
         return `<div class="track-row" style="--track-color:${track.color}">
           <div class="track-label">
             <span class="track-color" aria-hidden="true"></span>
-            <span class="track-meta"><strong>${escapeHtml(track.name)}</strong><span>${escapeHtml(track.role)}</span></span>
+            <span class="track-meta"><strong>${escapeHtml(track.name)}</strong></span>
             <span class="track-spectrum" data-spectrum-track="${track.id}" aria-label="${escapeHtml(track.name)} spectrum analyzer">${Array.from({ length: 8 }, () => "<i></i>").join("")}</span>
           </div>
           <div class="track-lane" data-track-id="${track.id}" role="slider" tabindex="0" aria-label="${escapeHtml(track.name)} timeline selection" aria-valuemin="0" aria-valuemax="${duration}" aria-valuenow="${state.selectionStart}" aria-valuetext="Selected ${state.selectionStart.toFixed(1)} to ${state.selectionEnd.toFixed(1)} seconds. Arrow keys move; Shift plus Arrow keys resize.">${clips}${markers}</div>
@@ -876,17 +875,6 @@
       showError(error, context);
       return false;
     }
-  }
-
-  function editAppliesToTrack(edit, track) {
-    return actionAppliesToTrack(edit.action, track);
-  }
-
-  function actionAppliesToTrack(action, track) {
-    if (action.type === "compound") return action.actions.some((child) => actionAppliesToTrack(child, track));
-    if (action.type === "timed") return actionAppliesToTrack(action.action, track);
-    if (action.type === "automation") return action.trackId === track.id;
-    return action.target === "all" || action.target === track.role;
   }
 
   function timelineTimeFromPointer(event) {

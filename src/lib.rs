@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod audio_analysis;
 mod audio_stream;
 mod concurrency;

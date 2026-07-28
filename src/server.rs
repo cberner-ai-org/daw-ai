@@ -21,16 +21,15 @@ use crate::gemini_tools::render_audio_request;
 #[cfg(test)]
 use crate::http::{AUDIO_REQUEST_HEADER, MAX_REQUEST_HEADER_BYTES, parse_authority};
 use crate::http::{Request, Response, valid_user_id, write_response_head};
-use crate::model::{
-    ChannelOperationAction, Project, Studio, StudioError, json_string, valid_operation_id,
-};
+use crate::model::{Project, Studio, StudioError, json_string, valid_operation_id};
 #[cfg(test)]
-use crate::project_history::{MAX_HISTORY_BYTES, load_project_history};
+use crate::project_history::MAX_HISTORY_BYTES;
 use crate::project_history::{
     ProjectHistory, open_project_with_history, project_document, save_project_state,
     trim_project_history,
 };
-use crate::prompt::{EditPlan, PromptEngine};
+#[cfg(debug_assertions)]
+use crate::prompt::EditPlan;
 use crate::storage::{ProjectStore, replace_file, replace_text_file};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
@@ -40,8 +39,6 @@ const AUDIO_RANGE_SAMPLES: usize =
     (audio_analysis::MAX_REGION_SECONDS * audio_analysis::SAMPLE_RATE as f32) as usize;
 const PLAYBACK_CHUNK_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 2;
 const AUDIO_STREAM_LOOKAHEAD_SAMPLES: usize = PLAYBACK_CHUNK_SAMPLES * 2;
-const TRACK_STEM_WINDOW_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 12;
-const TRACK_STEMS_MAGIC: &[u8; 8] = b"DAWSTEM1";
 const TRACK_SPECTRUM_MAGIC: &[u8; 8] = b"DAWSPEC1";
 const SPECTRUM_FFT_SAMPLES: usize = 1024;
 const SPECTRUM_FRAME_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize / 30;
@@ -49,7 +46,8 @@ const SPECTRUM_BANDS: usize = 8;
 const MAX_TRACK_SPECTRUM_WINDOW_MS: u64 = 64_000;
 const SPECTRUM_RENDER_CHUNK_SAMPLES: usize = SPECTRUM_FRAME_SAMPLES * 60;
 const GEMINI_POLL_INTERVAL_MS: u64 = 1_000;
-const DEMO_POLL_INTERVAL_MS: u64 = 25;
+#[cfg(debug_assertions)]
+const TEST_AI_POLL_INTERVAL_MS: u64 = 25;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
@@ -147,15 +145,6 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
                     new_user_cookie.as_deref(),
                 );
             }
-            if request.path.starts_with("/api/track-stems/") {
-                let cancellation_stream = stream.try_clone()?;
-                return scoped.write_track_stems_with_cancel(
-                    &request,
-                    stream,
-                    || stream_disconnected(&cancellation_stream),
-                    new_user_cookie.as_deref(),
-                );
-            }
             if request.path.starts_with("/api/track-spectrum/") {
                 let cancellation_stream = stream.try_clone()?;
                 return scoped.write_track_spectrum_with_cancel(
@@ -225,20 +214,11 @@ fn audio_byte_range(value: &str, total_length: usize) -> Result<ByteRange, ()> {
     bounded_audio_byte_range(value, total_length, AUDIO_RANGE_SAMPLES * 4)
 }
 
-fn instrument_parameter_path(path: &str) -> Option<(u64, &str)> {
-    let suffix = path.strip_prefix("/api/instrument-parameters/")?;
-    let (track_id, group) = suffix.split_once('/')?;
-    if group.contains('/') {
-        return None;
-    }
-    Some((track_id.parse().ok()?, group))
-}
-
 #[derive(Clone)]
 struct Router {
     studio: Arc<Mutex<Studio>>,
     store: Option<ProjectStore>,
-    planner: Planner,
+    ai: Ai,
     edit_jobs: Arc<EditJobs>,
     audio_renderer: Arc<AudioRenderer>,
     spectrum_cache: Arc<Mutex<()>>,
@@ -249,7 +229,7 @@ struct Router {
 
 struct UserRegistry {
     root: PathBuf,
-    planner: Planner,
+    ai: Ai,
     users: Mutex<HashMap<String, CachedUser>>,
 }
 
@@ -315,19 +295,14 @@ fn request_needs_user_scope(request: &Request) -> bool {
             | "/api/gemini-sessions"
             | "/api/history"
             | "/api/edits"
-            | "/api/channels"
-            | "/api/mix"
             | "/api/duration"
-            | "/api/sound-tools"
             | "/api/undo"
             | "/api/reset"
             | "/api/audio-access"
             | "/api/export.wav"
     ) || request.path.starts_with("/api/edits/")
-        || request.path.starts_with("/api/instrument-parameters/")
         || request.path.starts_with("/api/edit-operations/")
         || (request.path.starts_with("/api/audio-stream/") && request.user_id().is_some())
-        || (request.path.starts_with("/api/track-stems/") && request.user_id().is_some())
         || (request.path.starts_with("/api/track-spectrum/") && request.user_id().is_some())
 }
 
@@ -353,11 +328,12 @@ impl CachedUser {
 }
 
 #[derive(Clone)]
-enum Planner {
+enum Ai {
     Gemini,
-    Demo,
+    #[cfg(debug_assertions)]
+    Deterministic(Duration),
     #[cfg(test)]
-    GatedDemo(Arc<PlannerGate>),
+    GatedDeterministic(Arc<PlannerGate>),
 }
 
 #[cfg(test)]
@@ -830,106 +806,6 @@ fn planner_failure(error: PlannerError) -> EditFailure {
 }
 
 impl Router {
-    fn write_track_stems_with_cancel(
-        &self,
-        request: &Request,
-        output: &mut impl Write,
-        is_cancelled: impl Fn() -> bool,
-        set_cookie: Option<&str>,
-    ) -> io::Result<()> {
-        let Some(public_host) = request.public_host() else {
-            return Response::json(400, error_json("invalid host")).write(output);
-        };
-        if request.method != "GET" {
-            return Response::json(405, error_json("method not allowed"))
-                .with_header("Allow", "GET")
-                .write(output);
-        }
-        let Some((token, version, start_milliseconds, window_milliseconds)) =
-            track_stems_stream(&request.path)
-        else {
-            return Response::json(404, error_json("track stems not found")).write(output);
-        };
-        if token != self.audio_token.as_str() || !request.is_trusted_request(public_host) {
-            return Response::json(403, error_json("cross-origin audio request rejected"))
-                .write(output);
-        }
-
-        let project = self.lock_studio().project().clone();
-        if version != project.version {
-            return Response::json(
-                409,
-                error_json("project changed before stems were rendered"),
-            )
-            .write(output);
-        }
-        let start_sample = audio_analysis::playback_start_sample_milliseconds(start_milliseconds);
-        let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
-        if start_sample >= project_end_sample {
-            return Response::json(422, error_json("track stem start is outside the project"))
-                .write(output);
-        }
-        let window_samples =
-            window_milliseconds.map_or(TRACK_STEM_WINDOW_SAMPLES, |milliseconds| {
-                audio_analysis::playback_start_sample_milliseconds(milliseconds.clamp(1, 12_000))
-                    .clamp(1, TRACK_STEM_WINDOW_SAMPLES)
-            });
-        let end_sample = (start_sample + window_samples).min(project_end_sample);
-        let sample_count = end_sample - start_sample;
-        let track_count = project.tracks.len();
-        let chunk_count = sample_count.div_ceil(PLAYBACK_CHUNK_SAMPLES);
-        let header_length = 28usize.saturating_add(track_count.saturating_mul(8));
-        let total_length = header_length
-            .saturating_add(chunk_count.saturating_mul(4))
-            .saturating_add(sample_count.saturating_mul(4).saturating_mul(track_count));
-        write_response_head(
-            output,
-            200,
-            "application/vnd.daw-ai.track-stems",
-            total_length,
-            &[("Cache-Control", "no-store")],
-            set_cookie,
-        )?;
-        output.write_all(TRACK_STEMS_MAGIC)?;
-        output.write_all(&audio_analysis::SAMPLE_RATE.to_le_bytes())?;
-        output.write_all(&(track_count as u32).to_le_bytes())?;
-        output.write_all(&(sample_count as u64).to_le_bytes())?;
-        output.write_all(&(PLAYBACK_CHUNK_SAMPLES as u32).to_le_bytes())?;
-        for track in &project.tracks {
-            output.write_all(&track.id.to_le_bytes())?;
-        }
-
-        let mut cursor = start_sample;
-        while cursor < end_sample {
-            if is_cancelled() {
-                return Ok(());
-            }
-            let end = (cursor + PLAYBACK_CHUNK_SAMPLES).min(end_sample);
-            let stems = match self.audio_renderer.stream_stems_sample_range(
-                &project,
-                cursor,
-                end,
-                &is_cancelled,
-            ) {
-                Ok(stems) => stems,
-                Err(AudioRenderError::Render(error)) => {
-                    eprintln!("error: could not render track stems: {error}");
-                    return Err(io::Error::other("could not render track stems"));
-                }
-                Err(AudioRenderError::Cancelled) => return Ok(()),
-            };
-            output.write_all(&((end - cursor) as u32).to_le_bytes())?;
-            for (expected, (track_id, region)) in project.tracks.iter().zip(stems) {
-                if expected.id != track_id {
-                    return Err(io::Error::other("track stem order changed during render"));
-                }
-                output.write_all(&audio_analysis::pcm_bytes(&region.samples))?;
-            }
-            cursor = end;
-        }
-        Ok(())
-    }
-
     fn write_track_spectrum_with_cancel(
         &self,
         request: &Request,
@@ -1133,10 +1009,13 @@ impl Router {
     }
 
     fn new(_port: u16) -> io::Result<Self> {
-        let planner = match std::env::var("DAW_AI_PROMPT_ENGINE") {
-            Ok(value) if value == "demo" => Planner::Demo,
-            _ => Planner::Gemini,
+        #[cfg(debug_assertions)]
+        let ai = match std::env::var("DAW_AI_TEST_AI") {
+            Ok(value) if value == "deterministic" => Ai::Deterministic(Duration::from_secs(2)),
+            _ => Ai::Gemini,
         };
+        #[cfg(not(debug_assertions))]
+        let ai = Ai::Gemini;
         let project_path = std::env::var_os(crate::storage::PROJECT_PATH_ENV)
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
@@ -1151,14 +1030,14 @@ impl Router {
         save_project_state(&store, studio.project(), &history)?;
         let users = Arc::new(UserRegistry {
             root,
-            planner: planner.clone(),
+            ai: ai.clone(),
             users: Mutex::new(HashMap::new()),
         });
         Ok(Self {
             history: Arc::new(Mutex::new(history)),
             studio: Arc::new(Mutex::new(studio)),
             store: Some(store),
-            planner,
+            ai,
             edit_jobs: Arc::new(EditJobs::new()),
             audio_renderer: Arc::new(AudioRenderer::default()),
             spectrum_cache: Arc::new(Mutex::new(())),
@@ -1175,7 +1054,7 @@ impl Router {
             ))),
             studio: Arc::new(Mutex::new(Studio::new())),
             store: None,
-            planner: Planner::Demo,
+            ai: Ai::Deterministic(Duration::ZERO),
             edit_jobs: Arc::new(EditJobs::new()),
             audio_renderer: Arc::new(AudioRenderer::default()),
             spectrum_cache: Arc::new(Mutex::new(())),
@@ -1265,7 +1144,7 @@ impl Router {
             history: Arc::new(Mutex::new(history)),
             studio: Arc::new(Mutex::new(studio)),
             store: Some(store),
-            planner: registry.planner.clone(),
+            ai: registry.ai.clone(),
             edit_jobs: Arc::new(EditJobs::new()),
             audio_renderer: Arc::new(AudioRenderer::default()),
             spectrum_cache: Arc::new(Mutex::new(())),
@@ -1337,27 +1216,11 @@ impl Router {
         if request.path.starts_with("/api/edits/") {
             return Response::json(404, error_json("edit job not found"));
         }
-        if let Some((track_id, group)) = instrument_parameter_path(&request.path) {
-            return if request.method == "GET" {
-                self.instrument_parameters(track_id, group)
-            } else {
-                Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
-            };
-        }
-
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/") => Response::static_asset("text/html; charset=utf-8", INDEX_HTML),
             ("GET", "/app.css") => Response::static_asset("text/css; charset=utf-8", APP_CSS),
             ("GET", "/app.js") => Response::static_asset("text/javascript; charset=utf-8", APP_JS),
             ("GET", "/api/health") => Response::json(200, "{\"status\":\"ok\"}".to_owned()),
-            ("GET", "/api/surge-presets") => {
-                let presets = crate::surge_presets::render_safe_catalog()
-                    .into_iter()
-                    .map(|preset| json_string(&preset.id))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                Response::json(200, format!("{{\"presets\":[{presets}]}}"))
-            }
             ("GET", "/api/project") => {
                 let studio = self.lock_studio();
                 self.project_response(&studio)
@@ -1365,19 +1228,14 @@ impl Router {
             ("GET", "/api/gemini-sessions") => self.gemini_sessions(),
             ("GET", "/api/history") => self.history_response(),
             ("POST", "/api/edits") => self.start_edit(&request.body),
-            ("POST", "/api/channels") => self.change_channel(&request.body),
-            ("POST", "/api/mix") => self.change_mix(&request.body),
             ("POST", "/api/duration") => self.change_duration(&request.body),
-            ("POST", "/api/sound-tools") => self.change_sound_tool(&request.body),
             ("POST", "/api/logs") => Self::client_log(&request.body),
             ("POST", "/api/undo") => self.undo(),
             ("POST", "/api/reset") => self.reset(),
             ("POST", "/api/history") => self.select_history(&request.body),
-            (
-                _,
-                "/api/edits" | "/api/channels" | "/api/mix" | "/api/duration" | "/api/sound-tools"
-                | "/api/logs" | "/api/undo" | "/api/reset",
-            ) => Response::json(405, error_json("method not allowed")).with_header("Allow", "POST"),
+            (_, "/api/edits" | "/api/duration" | "/api/logs" | "/api/undo" | "/api/reset") => {
+                Response::json(405, error_json("method not allowed")).with_header("Allow", "POST")
+            }
             (_, "/api/project" | "/api/health" | "/api/gemini-sessions") => {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
             }
@@ -1438,11 +1296,12 @@ impl Router {
                 return Response::json(200, recovered_operation_json(operation));
             }
         }
-        let poll_after_ms = match &self.planner {
-            Planner::Gemini => GEMINI_POLL_INTERVAL_MS,
-            Planner::Demo => DEMO_POLL_INTERVAL_MS,
+        let poll_after_ms = match &self.ai {
+            Ai::Gemini => GEMINI_POLL_INTERVAL_MS,
+            #[cfg(debug_assertions)]
+            Ai::Deterministic(_) => TEST_AI_POLL_INTERVAL_MS,
             #[cfg(test)]
-            Planner::GatedDemo(_) => DEMO_POLL_INTERVAL_MS,
+            Ai::GatedDeterministic(_) => TEST_AI_POLL_INTERVAL_MS,
         };
         let Ok((job_id, operation_id, created)) =
             self.edit_jobs.create(poll_after_ms, operation_id)
@@ -1760,34 +1619,16 @@ impl Router {
             "planning",
             "The AI producer is planning, editing, and listening to the sound graph",
         );
-        if matches!(&self.planner, Planner::Gemini) {
-            return self.perform_gemini_edit(job_id, edit);
+        match &self.ai {
+            Ai::Gemini => self.perform_gemini_edit(job_id, edit),
+            #[cfg(debug_assertions)]
+            Ai::Deterministic(delay) => self.perform_deterministic_edit(job_id, edit, *delay),
+            #[cfg(test)]
+            Ai::GatedDeterministic(gate) => {
+                gate.wait_until_released();
+                self.perform_deterministic_edit(job_id, edit, Duration::ZERO)
+            }
         }
-        let plan = self
-            .plan_edit(&edit.prompt, edit.start, edit.end, &edit.project)
-            .map_err(|message| EditFailure::new(503, message))?;
-        if self.edit_jobs.is_interrupted(job_id) {
-            return Err(EditFailure::new(409, "edit interrupted by the user"));
-        }
-        self.edit_jobs.set_running(
-            job_id,
-            "applying",
-            "Validating and saving the updated sound graph",
-        );
-        let mut studio = self.lock_studio();
-        if studio.project().version != edit.project.version {
-            return Err(EditFailure::new(
-                409,
-                "the project changed; submit the edit again",
-            ));
-        }
-        let mut candidate = studio.clone();
-        let summary = candidate
-            .apply_plan_for_operation(edit.start, edit.end, &edit.prompt, edit.operation_id, plan)
-            .map_err(|error| EditFailure::new(422, studio_error_message(error)))?;
-        self.commit(&mut studio, candidate)
-            .map_err(|_| EditFailure::new(500, "could not save the sound graph"))?;
-        Ok(summary)
     }
 
     fn perform_gemini_edit(&self, job_id: u64, edit: EditRequest) -> Result<String, EditFailure> {
@@ -1843,6 +1684,41 @@ impl Router {
         )
         .map_err(planner_failure)?;
         Ok(completed.plan.summary)
+    }
+
+    #[cfg(debug_assertions)]
+    fn perform_deterministic_edit(
+        &self,
+        job_id: u64,
+        edit: EditRequest,
+        delay: Duration,
+    ) -> Result<String, EditFailure> {
+        thread::sleep(delay);
+        let summary = "Applied deterministic test edit".to_owned();
+        let mut project = edit.project.clone();
+        let track = project
+            .tracks
+            .first_mut()
+            .ok_or_else(|| EditFailure::new(422, "track not found"))?;
+        track.muted = !track.muted;
+        let mut expected_version = edit.project.version;
+        let mut published_update = false;
+        self.commit_gemini_update(
+            job_id,
+            &edit,
+            &mut expected_version,
+            &mut published_update,
+            GeminiEdit {
+                plan: EditPlan {
+                    summary: summary.clone(),
+                },
+                project,
+            },
+        )
+        .map_err(planner_failure)?;
+        self.complete_gemini_operation(job_id, &edit, &mut expected_version, &summary)
+            .map_err(planner_failure)?;
+        Ok(summary)
     }
 
     fn commit_gemini_update(
@@ -1912,24 +1788,6 @@ impl Router {
         Ok(())
     }
 
-    fn plan_edit(
-        &self,
-        prompt: &str,
-        start: f32,
-        end: f32,
-        project: &crate::model::Project,
-    ) -> Result<EditPlan, String> {
-        match &self.planner {
-            Planner::Demo => Ok(PromptEngine::interpret_project(prompt, project, start, end)),
-            Planner::Gemini => unreachable!("Gemini edits use incremental planning"),
-            #[cfg(test)]
-            Planner::GatedDemo(gate) => {
-                gate.wait_until_released();
-                Ok(PromptEngine::interpret_project(prompt, project, start, end))
-            }
-        }
-    }
-
     fn change_duration(&self, body: &str) -> Response {
         let form = parse_form(body);
         let Some(duration) = form
@@ -1942,160 +1800,7 @@ impl Router {
         let mut candidate = studio.clone();
         match candidate.set_duration(duration) {
             Ok(()) => match self.commit(&mut studio, candidate) {
-                Ok(()) => Response::json(200, studio.to_json()),
-                Err(response) => response,
-            },
-            Err(error) => Response::json(422, studio_error(error)),
-        }
-    }
-
-    fn change_mix(&self, body: &str) -> Response {
-        let form = parse_form(body);
-        let Some(track_id) = form
-            .get("track_id")
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            return Response::json(422, error_json("track_id is required"));
-        };
-        let volume = match form.get("volume") {
-            Some(value) => match value.parse::<f32>() {
-                Ok(volume) => Some(volume),
-                Err(_) => return Response::json(422, error_json("volume must be a number")),
-            },
-            None => None,
-        };
-        let muted = match form.get("muted") {
-            Some(value) if value == "true" => Some(true),
-            Some(value) if value == "false" => Some(false),
-            Some(_) => return Response::json(422, error_json("muted must be true or false")),
-            None => None,
-        };
-
-        let mut studio = self.lock_studio();
-        let mut candidate = studio.clone();
-        match candidate.set_mix(track_id, volume, muted) {
-            Ok(()) => match self.commit(&mut studio, candidate) {
-                Ok(()) => Response::json(200, studio.to_json()),
-                Err(response) => response,
-            },
-            Err(error) => Response::json(422, studio_error(error)),
-        }
-    }
-
-    fn change_channel(&self, body: &str) -> Response {
-        let form = parse_form(body);
-        let operation_id = form.get("operation_id").map(String::as_str);
-        if operation_id.is_some_and(|operation_id| !valid_operation_id(operation_id)) {
-            return Response::json(422, error_json("operation ID is invalid"));
-        }
-        #[derive(Clone, Copy)]
-        enum Change {
-            Add(crate::model::TrackRole),
-            Delete(u64),
-        }
-        let change = match form.get("action").map(String::as_str) {
-            Some("add") => form
-                .get("role")
-                .and_then(|role| crate::model::TrackRole::from_name(role))
-                .map(Change::Add),
-            Some("delete") => form
-                .get("track_id")
-                .and_then(|track_id| track_id.parse::<u64>().ok())
-                .map(Change::Delete),
-            _ => None,
-        };
-        let Some(change) = change else {
-            return Response::json(422, studio_error(StudioError::InvalidChannel));
-        };
-        let mut studio = self.lock_studio();
-        if let Some(operation_id) = operation_id {
-            if let Some(recorded) = studio
-                .project()
-                .channel_operations
-                .iter()
-                .find(|recorded| recorded.operation_id == operation_id)
-            {
-                let matches = match change {
-                    Change::Add(role) => {
-                        recorded.action == ChannelOperationAction::Add
-                            && recorded.role == Some(role)
-                    }
-                    Change::Delete(track_id) => {
-                        recorded.action == ChannelOperationAction::Delete
-                            && recorded.track_id == track_id
-                    }
-                };
-                return if matches {
-                    Response::json(200, studio.to_json())
-                } else {
-                    Response::json(409, error_json("channel operation ID was already used"))
-                };
-            }
-        }
-        let mut candidate = studio.clone();
-        let result = match change {
-            Change::Add(role) => candidate
-                .add_channel(role)
-                .map(|track_id| (ChannelOperationAction::Add, track_id, Some(role))),
-            Change::Delete(track_id) => candidate
-                .delete_channel(track_id)
-                .map(|()| (ChannelOperationAction::Delete, track_id, None)),
-        };
-        match result {
-            Ok((action, track_id, role)) => {
-                if operation_id.is_some_and(|operation_id| {
-                    !candidate.record_channel_operation(operation_id, action, track_id, role)
-                }) {
-                    return Response::json(
-                        409,
-                        error_json("channel operation ID was already used"),
-                    );
-                }
-                match self.commit(&mut studio, candidate) {
-                    Ok(()) => Response::json(200, studio.to_json()),
-                    Err(response) => response,
-                }
-            }
-            Err(error) => Response::json(422, studio_error(error)),
-        }
-    }
-
-    fn change_sound_tool(&self, body: &str) -> Response {
-        let form = parse_form(body);
-        let Some(track_id) = form
-            .get("track_id")
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            return Response::json(422, error_json("track_id is required"));
-        };
-        let Some(tool) = form.get("tool") else {
-            return Response::json(422, error_json("tool is required"));
-        };
-        let Some(tool_id) = form
-            .get("tool_id")
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            return Response::json(422, error_json("tool_id is required"));
-        };
-        let clip_id = match form.get("clip_id") {
-            Some(value) => match value.parse::<u64>() {
-                Ok(value) => Some(value),
-                Err(_) => return Response::json(422, error_json("clip_id must be an integer")),
-            },
-            None => None,
-        };
-        let Some(parameter) = form.get("parameter") else {
-            return Response::json(422, error_json("parameter is required"));
-        };
-        let Some(value) = form.get("value") else {
-            return Response::json(422, error_json("value is required"));
-        };
-
-        let mut studio = self.lock_studio();
-        let mut candidate = studio.clone();
-        match candidate.configure_sound_tool(track_id, tool, tool_id, clip_id, parameter, value) {
-            Ok(()) => match self.commit(&mut studio, candidate) {
-                Ok(()) => Response::json(200, studio.to_json()),
+                Ok(()) => self.project_response(&studio),
                 Err(response) => response,
             },
             Err(error) => Response::json(422, studio_error(error)),
@@ -2207,21 +1912,10 @@ impl Router {
                 let (summary, source, prompt, start, end) = if index == 0 {
                     ("Initial project", "Project", None, None, None)
                 } else if let Some(edit) = edit {
-                    let source = edit
-                        .operation_id
-                        .as_ref()
-                        .and_then(|operation_id| {
-                            project
-                                .edit_operations
-                                .iter()
-                                .find(|operation| &operation.operation_id == operation_id)
-                        })
-                        .or_else(|| {
-                            project
-                                .edit_operations
-                                .iter()
-                                .find(|operation| operation.project_version == project.version)
-                        })
+                    let source = project
+                        .edit_operations
+                        .iter()
+                        .find(|operation| operation.project_version == project.version)
                         .map_or("Gemini", |operation| operation.source.as_str());
                     (
                         edit.summary.as_str(),
@@ -2295,62 +1989,6 @@ impl Router {
             .current
             > 0;
         Response::json(200, studio.to_json_with_can_undo(can_undo))
-    }
-
-    fn instrument_parameters(&self, track_id: u64, group: &str) -> Response {
-        let studio = self.lock_studio();
-        let Some(track) = studio
-            .project()
-            .tracks
-            .iter()
-            .find(|track| track.id == track_id)
-        else {
-            return Response::json(404, error_json("track not found"));
-        };
-        let common = match group {
-            "common" => true,
-            "advanced" => false,
-            _ => return Response::json(422, error_json("parameter group is invalid")),
-        };
-        let parameters = crate::surge::instrument_parameters_for_instrument(&track.instrument)
-            .into_iter()
-            .filter(|parameter| parameter.common == common)
-            .map(|parameter| {
-                let requested_override = track
-                    .instrument
-                    .native_overrides
-                    .get(&parameter.id)
-                    .copied();
-                let overridden = requested_override
-                    .is_some_and(|value| (value - parameter.value).abs() < 0.000_01);
-                serde_json::json!({
-                    "parameter": format!("native:{}", parameter.id),
-                    "name": parameter.name,
-                    "value": parameter.value,
-                    "presetValue": parameter.preset_value,
-                    "display": parameter.display,
-                    "overridden": overridden,
-                    "kind": if parameter.boolean {
-                        "boolean"
-                    } else if !parameter.choices.is_empty() || parameter.discrete {
-                        "selection"
-                    } else {
-                        "continuous"
-                    },
-                    "choices": parameter.choices.into_iter().map(|(value, display)| {
-                        serde_json::json!({"value": value, "display": display})
-                    }).collect::<Vec<_>>(),
-                    "modulation": {
-                        "free": parameter.scene_modulatable,
-                        "midi": parameter.voice_modulatable
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        Response::json(
-            200,
-            serde_json::json!({"parameters": parameters}).to_string(),
-        )
     }
 
     fn commit(
@@ -2622,18 +2260,6 @@ fn playback_audio_stream(path: &str) -> Option<(&str, u64, u64)> {
         return None;
     }
     Some((token, version, start_milliseconds))
-}
-
-fn track_stems_stream(path: &str) -> Option<(&str, u64, u64, Option<u64>)> {
-    let mut parts = path.strip_prefix("/api/track-stems/")?.split('/');
-    let token = parts.next()?;
-    let version = parts.next()?.parse::<u64>().ok()?;
-    let start_milliseconds = parts.next()?.parse::<u64>().ok()?;
-    let window_milliseconds = parts.next().map(str::parse::<u64>).transpose().ok()?;
-    if token.is_empty() || parts.next().is_some() {
-        return None;
-    }
-    Some((token, version, start_milliseconds, window_milliseconds))
 }
 
 fn track_spectrum_stream(path: &str) -> Option<(&str, u64, u64, Option<u64>)> {
@@ -2929,7 +2555,7 @@ mod tests {
                 history: Arc::new(Mutex::new(ProjectHistory::new(studio.project().clone()))),
                 studio: Arc::new(Mutex::new(studio)),
                 store: Some(store),
-                planner: Planner::Demo,
+                ai: Ai::Deterministic(Duration::ZERO),
                 edit_jobs: Arc::new(EditJobs::new()),
                 audio_renderer: Arc::new(AudioRenderer::default()),
                 spectrum_cache: Arc::new(Mutex::new(())),
@@ -2989,19 +2615,6 @@ mod tests {
         let project = router.handle(&request("GET", "/api/project", ""));
         assert_eq!(project.status, 200);
         assert!(project.body.contains("\"tracks\""));
-    }
-
-    #[test]
-    fn serves_installed_surge_presets_to_the_advanced_ui() {
-        let response = Router::demo().handle(&request("GET", "/api/surge-presets", ""));
-        assert_eq!(response.status, 200);
-        let catalog: serde_json::Value =
-            serde_json::from_str(&response.body).expect("preset catalog JSON");
-        assert!(catalog["presets"].as_array().is_some_and(|presets| {
-            presets
-                .iter()
-                .any(|preset| preset == "Factory/Leads/Classic Lead 1")
-        }));
     }
 
     #[test]
@@ -3103,7 +2716,7 @@ mod tests {
         ));
         let completed = wait_for_edit(&router, &response);
         assert_eq!(completed["status"], "completed");
-        assert!(completed["message"].as_str().unwrap().contains("Lifted"));
+        assert_eq!(completed["message"], "Applied deterministic test edit");
         assert!(completed.get("project").is_none());
 
         let project = router.handle(&request("GET", "/api/project", ""));
@@ -3118,511 +2731,6 @@ mod tests {
             router.handle(&request("POST", "/api/edits/1", "")).status,
             405
         );
-    }
-
-    #[test]
-    fn sound_tool_api_updates_the_shared_graph() {
-        let router = Router::demo();
-        let response = router.handle(&request(
-            "POST",
-            "/api/sound-tools",
-            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Factory%2FLeads%2FClassic+Lead+1",
-        ));
-        assert_eq!(response.status, 200);
-        assert!(
-            response
-                .body
-                .contains("\"preset\":\"Factory/Leads/Classic Lead 1\"")
-        );
-
-        let invalid = router.handle(&request(
-            "POST",
-            "/api/sound-tools",
-            "track_id=2&tool=instrument&tool_id=201&parameter=attack&value=99",
-        ));
-        assert_eq!(invalid.status, 422);
-        let project = router.handle(&request("GET", "/api/project", ""));
-        assert!(
-            project
-                .body
-                .contains("\"preset\":\"Factory/Leads/Classic Lead 1\"")
-        );
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn instrument_parameter_api_reports_legacy_graph_overrides() {
-        let router = Router::demo();
-        {
-            let mut project = Project::demo();
-            let instrument = &mut project.tracks[1].instrument;
-            instrument.native_overrides.clear();
-            instrument.cutoff = 0.123;
-            instrument.parameter_overrides.push("cutoff".to_owned());
-            *router.lock_studio() = Studio::from_project(project);
-        }
-
-        let response = router.handle(&request("GET", "/api/instrument-parameters/2/common", ""));
-        assert_eq!(response.status, 200);
-        let response: serde_json::Value =
-            serde_json::from_str(&response.body).expect("instrument parameters");
-        let cutoff = response["parameters"]
-            .as_array()
-            .expect("parameter list")
-            .iter()
-            .find(|parameter| parameter["graphParameter"] == "cutoff")
-            .expect("cutoff parameter");
-        assert!((cutoff["value"].as_f64().expect("cutoff value") - 0.123).abs() < 0.000_001);
-        assert_ne!(cutoff["presetValue"], cutoff["value"]);
-        assert_eq!(cutoff["overridden"], true);
-
-        let advanced = router.handle(&request("GET", "/api/instrument-parameters/2/advanced", ""));
-        assert_eq!(advanced.status, 200);
-        let advanced: serde_json::Value =
-            serde_json::from_str(&advanced.body).expect("advanced instrument parameters");
-        let mute = advanced["parameters"]
-            .as_array()
-            .expect("advanced parameter list")
-            .iter()
-            .find(|parameter| {
-                parameter["name"]
-                    .as_str()
-                    .is_some_and(|name| name.ends_with("Osc 1 Mute"))
-            })
-            .expect("oscillator mute");
-        assert_eq!(mute["kind"], "boolean");
-        assert!(!mute["choices"].as_array().expect("mute choices").is_empty());
-        assert_eq!(mute["modulation"]["free"], false);
-        assert_eq!(mute["modulation"]["midi"], false);
-    }
-
-    #[test]
-    fn channel_api_adds_and_deletes_complete_tracks() {
-        let router = Router::demo();
-        let added = router.handle(&request(
-            "POST",
-            "/api/channels",
-            "operation_id=add-lead&action=add&role=lead",
-        ));
-        assert_eq!(added.status, 200);
-        let added: serde_json::Value = serde_json::from_str(&added.body).expect("added project");
-        let tracks = added["tracks"].as_array().expect("tracks");
-        assert_eq!(tracks.len(), 4);
-        let lead = tracks.last().expect("lead track");
-        assert_eq!(lead["role"], "lead");
-        assert_eq!(lead["volume"], 1.0);
-        assert_eq!(lead["instrument"]["preset"], "Init");
-        assert!(lead["clips"].as_array().expect("clips").is_empty());
-        assert!(lead["effects"].as_array().expect("effects").is_empty());
-        assert!(
-            lead["modulators"]
-                .as_array()
-                .expect("modulators")
-                .is_empty()
-        );
-        let track_id = lead["id"].as_u64().expect("lead track ID");
-        assert_eq!(added["channelOperations"][0]["operationId"], "add-lead");
-        assert_eq!(added["channelOperations"][0]["trackId"], track_id);
-        let duplicate = router.handle(&request(
-            "POST",
-            "/api/channels",
-            "operation_id=add-lead&action=add&role=lead",
-        ));
-        assert_eq!(duplicate.status, 200);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&duplicate.body).expect("duplicate add")
-                ["tracks"]
-                .as_array()
-                .expect("tracks")
-                .len(),
-            4
-        );
-        assert_eq!(
-            router
-                .handle(&request(
-                    "POST",
-                    "/api/channels",
-                    "operation_id=add-lead&action=add&role=texture",
-                ))
-                .status,
-            409
-        );
-
-        let deleted = router.handle(&request(
-            "POST",
-            "/api/channels",
-            &format!("operation_id=delete-lead&action=delete&track_id={track_id}"),
-        ));
-        assert_eq!(deleted.status, 200);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&deleted.body)
-                .expect("deleted project")["tracks"]
-                .as_array()
-                .expect("tracks")
-                .len(),
-            3
-        );
-        assert_eq!(
-            router
-                .handle(&request("POST", "/api/channels", "action=add&role=unknown"))
-                .status,
-            422
-        );
-    }
-
-    #[test]
-    fn gemini_updates_commit_as_incremental_recoverable_steps() {
-        let router = Router::demo();
-        let (job_id, operation_id, _) = router.edit_jobs.create(750, None).expect("edit job");
-        let project = router.lock_studio().project().clone();
-        let edit = EditRequest {
-            operation_id: operation_id.clone(),
-            prompt: "shape the bass in two steps".to_owned(),
-            start: 4.0,
-            end: 8.0,
-            project: project.clone(),
-            batch_parameter_tools: false,
-            slim_prompt: false,
-            dynamic_tools: false,
-        };
-        let plan = |preset: &str, summary: &str| EditPlan {
-            action: crate::prompt::Action::Configure {
-                track_id: 2,
-                target: crate::model::TrackRole::Bass,
-                tool: "instrument",
-                tool_id: 201,
-                clip_id: None,
-                parameter: "preset",
-                value: preset.to_owned(),
-            },
-            summary: summary.to_owned(),
-        };
-        let mut session = Studio::from_project(project);
-        let first_plan = plan("Factory/Leads/Classic Lead 1", "Brightened the bass");
-        session
-            .apply_plan(4.0, 8.0, &edit.prompt, first_plan.clone())
-            .expect("first session step");
-        let mut expected_version = edit.project.version;
-        let mut published_update = false;
-        router
-            .commit_gemini_update(
-                job_id,
-                &edit,
-                &mut expected_version,
-                &mut published_update,
-                GeminiEdit {
-                    plan: first_plan,
-                    project: session.project().clone(),
-                },
-            )
-            .expect("first live step");
-        assert!(
-            router
-                .lock_studio()
-                .project()
-                .edits
-                .iter()
-                .all(|edit| edit.operation_id.is_none())
-        );
-
-        let second_plan = plan("Factory/Polysynths/Anthemish 1", "Softened the bass");
-        session
-            .apply_plan(4.0, 8.0, &edit.prompt, second_plan.clone())
-            .expect("second session step");
-        router
-            .commit_gemini_update(
-                job_id,
-                &edit,
-                &mut expected_version,
-                &mut published_update,
-                GeminiEdit {
-                    plan: second_plan,
-                    project: session.project().clone(),
-                },
-            )
-            .expect("second live step");
-        router
-            .complete_gemini_operation(
-                job_id,
-                &edit,
-                &mut expected_version,
-                "Finished shaping the bass",
-            )
-            .expect("terminal operation marker");
-
-        let studio = router.lock_studio();
-        assert_eq!(studio.project().version, 4);
-        assert_eq!(
-            studio.project().tracks[1].instrument.preset,
-            "Factory/Polysynths/Anthemish 1"
-        );
-        assert_eq!(studio.project().edits.len(), 2);
-        assert!(
-            studio
-                .project()
-                .edits
-                .iter()
-                .all(|edit| edit.operation_id.is_none())
-        );
-        let operation = &studio.project().edit_operations[0];
-        assert_eq!(operation.operation_id, operation_id);
-        assert_eq!(operation.source, "Gemini");
-        assert_eq!(
-            operation.status,
-            crate::model::EditOperationStatus::Completed
-        );
-        assert_eq!(operation.applied_steps, 2);
-        assert_eq!(operation.message, "Finished shaping the bass");
-        crate::model::Project::from_json(&studio.project().to_json())
-            .expect("persistable incremental graph");
-        drop(studio);
-        let history: serde_json::Value =
-            serde_json::from_str(&router.history_response().body).expect("history JSON");
-        assert_eq!(history["entries"][1]["source"], "Gemini");
-        assert_eq!(history["entries"][2]["source"], "Gemini");
-
-        let status: serde_json::Value = serde_json::from_str(
-            &router
-                .edit_jobs
-                .response(job_id)
-                .expect("incremental job status")
-                .body,
-        )
-        .expect("incremental job JSON");
-        assert_eq!(status["appliedSteps"], 2);
-        assert_eq!(status["projectVersion"], 4);
-        assert_eq!(status["phase"], "finalizing");
-
-        router.edit_jobs.remove(job_id);
-        let recovered = router.handle(&request(
-            "POST",
-            "/api/edits",
-            &format!(
-                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps"
-            ),
-        ));
-        assert_eq!(recovered.status, 200);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&recovered.body)
-                .expect("recovered terminal operation")["status"],
-            "completed"
-        );
-    }
-
-    #[test]
-    fn partial_gemini_update_is_not_recovered_as_a_completed_operation() {
-        let router = Router::demo();
-        let (job_id, operation_id, _) = router.edit_jobs.create(750, None).expect("edit job");
-        let project = router.lock_studio().project().clone();
-        let edit = EditRequest {
-            operation_id: operation_id.clone(),
-            prompt: "shape the bass in two steps".to_owned(),
-            start: 4.0,
-            end: 8.0,
-            project: project.clone(),
-            batch_parameter_tools: false,
-            slim_prompt: false,
-            dynamic_tools: false,
-        };
-        let first_plan = EditPlan {
-            action: crate::prompt::Action::Configure {
-                track_id: 2,
-                target: crate::model::TrackRole::Bass,
-                tool: "instrument",
-                tool_id: 201,
-                clip_id: None,
-                parameter: "preset",
-                value: "Factory/Leads/Classic Lead 1".to_owned(),
-            },
-            summary: "Brightened the bass".to_owned(),
-        };
-        let mut session = Studio::from_project(project);
-        session
-            .apply_plan(4.0, 8.0, &edit.prompt, first_plan.clone())
-            .expect("first of two session steps");
-        let mut expected_version = edit.project.version;
-        let mut published_update = false;
-        router
-            .commit_gemini_update(
-                job_id,
-                &edit,
-                &mut expected_version,
-                &mut published_update,
-                GeminiEdit {
-                    plan: first_plan,
-                    project: session.project().clone(),
-                },
-            )
-            .expect("first live step");
-        assert!(
-            router
-                .lock_studio()
-                .project()
-                .edits
-                .iter()
-                .all(|edit| edit.operation_id.as_deref() != Some(operation_id.as_str()))
-        );
-
-        assert!(router.edit_jobs.interrupt(job_id));
-        assert!(matches!(
-            router.complete_gemini_operation(
-                job_id,
-                &edit,
-                &mut expected_version,
-                "Finished shaping the bass",
-            ),
-            Err(PlannerError::Interrupted)
-        ));
-        assert!(
-            router.lock_studio().project().edit_operations[0].status
-                != crate::model::EditOperationStatus::Completed,
-            "an interrupted job must remain recoverably partial"
-        );
-
-        router.edit_jobs.remove(job_id);
-        let persisted = crate::model::Project::from_json(&router.lock_studio().project().to_json())
-            .expect("persisted partial operation");
-        let restarted = Router {
-            history: Arc::new(Mutex::new(ProjectHistory::new(persisted.clone()))),
-            studio: Arc::new(Mutex::new(Studio::from_project(persisted))),
-            store: None,
-            planner: Planner::Demo,
-            edit_jobs: Arc::new(EditJobs::new()),
-            audio_renderer: Arc::new(AudioRenderer::default()),
-            spectrum_cache: Arc::new(Mutex::new(())),
-            audio_token: Arc::new("test-audio-token".to_owned()),
-            users: None,
-        };
-        let retried = restarted.handle(&request(
-            "POST",
-            "/api/edits",
-            &format!(
-                "operation_id={operation_id}&start=4&end=8&prompt=shape+the+bass+in+two+steps"
-            ),
-        ));
-        assert_eq!(retried.status, 200);
-        let retried_json: serde_json::Value =
-            serde_json::from_str(&retried.body).expect("retried edit job");
-        assert_eq!(retried_json["status"], "failed_with_changes");
-        assert_eq!(retried_json["operationId"], operation_id);
-        assert_eq!(retried_json["appliedSteps"], 1);
-        assert_eq!(retried_json["projectVersion"], expected_version);
-        let recovered = restarted.handle(&request(
-            "GET",
-            &format!("/api/edit-operations/{operation_id}"),
-            "",
-        ));
-        assert_eq!(recovered.status, 200);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&recovered.body)
-                .expect("recovered partial operation")["status"],
-            "failed_with_changes"
-        );
-    }
-
-    #[test]
-    fn gemini_completion_is_independent_of_edit_log_compaction() {
-        let router = Router::demo();
-        let mut populated = Studio::new();
-        let regional_plan = || EditPlan {
-            action: crate::prompt::Action::Gain {
-                amount: 1.0,
-                target: Some(crate::model::TrackRole::Bass),
-            },
-            summary: "Retained regional state".to_owned(),
-        };
-        for _ in 1..crate::model::EDIT_LOG_LIMIT {
-            populated
-                .apply_plan(4.0, 8.0, "retain regional state", regional_plan())
-                .expect("regional edit");
-        }
-        populated
-            .apply_plan_for_operation(
-                4.0,
-                8.0,
-                "retain prior operation identity",
-                "previous-operation".to_owned(),
-                regional_plan(),
-            )
-            .expect("prior operation");
-        let project = populated.project().clone();
-        *router.lock_studio() = Studio::from_project(project.clone());
-
-        let (job_id, operation_id, _) = router.edit_jobs.create(750, None).expect("edit job");
-        let edit = EditRequest {
-            operation_id: operation_id.clone(),
-            prompt: "change the bass patch".to_owned(),
-            start: 4.0,
-            end: 8.0,
-            project: project.clone(),
-            batch_parameter_tools: false,
-            slim_prompt: false,
-            dynamic_tools: false,
-        };
-        let plan = EditPlan {
-            action: crate::prompt::Action::Configure {
-                track_id: 2,
-                target: crate::model::TrackRole::Bass,
-                tool: "instrument",
-                tool_id: 201,
-                clip_id: None,
-                parameter: "preset",
-                value: "Factory/Leads/Classic Lead 1".to_owned(),
-            },
-            summary: "Changed the bass patch".to_owned(),
-        };
-        let mut session = Studio::from_project(project);
-        session
-            .apply_plan(4.0, 8.0, &edit.prompt, plan.clone())
-            .expect("nonregional Gemini edit");
-        let mut expected_version = edit.project.version;
-        let mut published_update = false;
-        router
-            .commit_gemini_update(
-                job_id,
-                &edit,
-                &mut expected_version,
-                &mut published_update,
-                GeminiEdit {
-                    plan,
-                    project: session.project().clone(),
-                },
-            )
-            .expect("compacted Gemini update");
-        router
-            .complete_gemini_operation(
-                job_id,
-                &edit,
-                &mut expected_version,
-                "Changed the bass patch",
-            )
-            .expect("independent completion record");
-
-        let studio = router.lock_studio();
-        assert_eq!(studio.project().edits.len(), crate::model::EDIT_LOG_LIMIT);
-        assert_eq!(
-            studio
-                .project()
-                .edits
-                .last()
-                .and_then(|edit| edit.operation_id.as_deref()),
-            Some("previous-operation")
-        );
-        let completed = studio
-            .project()
-            .edit_operations
-            .iter()
-            .find(|operation| operation.operation_id == operation_id)
-            .expect("Gemini operation record");
-        assert_eq!(
-            completed.status,
-            crate::model::EditOperationStatus::Completed
-        );
-        assert_eq!(completed.message, "Changed the bass patch");
-        assert!(studio.project().edit_operations.iter().any(|operation| {
-            operation.operation_id == "previous-operation"
-                && operation.status == crate::model::EditOperationStatus::Completed
-        }));
     }
 
     #[test]
@@ -3649,94 +2757,6 @@ mod tests {
             422
         );
         assert_eq!(router.handle(&request("GET", "/api/logs", "")).status, 405);
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn successful_api_mutations_persist_the_sound_graph() {
-        let (router, path) = persisted_demo();
-        let response = router.handle(&request(
-            "POST",
-            "/api/sound-tools",
-            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Factory%2FLeads%2FClassic+Lead+1",
-        ));
-        assert_eq!(response.status, 200);
-        let response = router.handle(&request(
-            "POST",
-            "/api/sound-tools",
-            "track_id=2&tool=modulator&tool_id=250&parameter=target&value=instrument.resonance",
-        ));
-        assert_eq!(response.status, 200);
-        let saved = ProjectStore::open(path.clone()).expect("saved project").1;
-        assert_eq!(
-            saved.project().tracks[1].instrument.preset,
-            "Factory/Leads/Classic Lead 1"
-        );
-        assert_eq!(
-            saved.project().tracks[1].modulators[0].target,
-            "instrument.resonance"
-        );
-        std::fs::remove_file(path).expect("remove test graph");
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn deleting_an_automated_channel_persists_without_its_envelope() {
-        let (router, path) = persisted_demo();
-        let bass_id = router.lock_studio().project().tracks[1].id;
-        {
-            let mut studio = router.lock_studio();
-            let mut candidate = studio.clone();
-            candidate
-                .apply_plan(
-                    0.0,
-                    4.0,
-                    "automate bass volume",
-                    crate::prompt::EditPlan {
-                        summary: "Automated bass volume".to_owned(),
-                        action: crate::prompt::Action::Automation {
-                            track_id: bass_id,
-                            parameter: "track.volume".to_owned(),
-                            curve: "linear",
-                            points: vec![
-                                crate::prompt::AutomationPoint {
-                                    time: 0.0,
-                                    value: 0.2,
-                                },
-                                crate::prompt::AutomationPoint {
-                                    time: 1.0,
-                                    value: 1.2,
-                                },
-                            ],
-                            target: crate::model::TrackRole::Bass,
-                        },
-                    },
-                )
-                .expect("valid automation");
-            assert!(router.commit(&mut studio, candidate).is_ok());
-        }
-
-        let deleted = router.handle(&request(
-            "POST",
-            "/api/channels",
-            &format!("action=delete&track_id={bass_id}"),
-        ));
-        assert_eq!(deleted.status, 200, "{}", deleted.body);
-        let saved = ProjectStore::open(path.clone()).expect("saved project").1;
-        assert!(
-            saved
-                .project()
-                .tracks
-                .iter()
-                .all(|track| track.id != bass_id)
-        );
-        assert!(
-            !saved
-                .project()
-                .to_json()
-                .contains("\"type\":\"automation\"")
-        );
-        std::fs::remove_file(path).expect("remove test graph");
     }
 
     #[test]
@@ -3769,10 +2789,6 @@ mod tests {
         let saved = ProjectStore::open(path.clone()).expect("saved project").1;
         assert_eq!(saved.project().edits.len(), 1);
         assert_eq!(saved.project().edits[0].prompt, "increase volume");
-        assert_eq!(
-            saved.project().edits[0].operation_id.as_deref(),
-            Some(operation_id.as_str())
-        );
         std::fs::remove_file(path).expect("remove test graph");
     }
 
@@ -3780,7 +2796,7 @@ mod tests {
     fn repeated_operation_id_reuses_the_active_edit_job() {
         let gate = Arc::new(PlannerGate::new());
         let mut router = Router::demo();
-        router.planner = Planner::GatedDemo(gate.clone());
+        router.ai = Ai::GatedDeterministic(gate.clone());
         let body = "operation_id=client-operation&start=4&end=8&prompt=increase+volume";
         let accepted = router.handle(&request("POST", "/api/edits", body));
         gate.wait_until_started();
@@ -3802,103 +2818,7 @@ mod tests {
             serde_json::from_str(&router.handle(&request("GET", "/api/project", "")).body)
                 .expect("project JSON");
         assert_eq!(project["edits"].as_array().expect("project edits").len(), 1);
-        assert_eq!(project["edits"][0]["operationId"], "client-operation");
-    }
-
-    #[test]
-    fn async_edit_rejects_a_result_when_the_project_changed_while_planning() {
-        let gate = Arc::new(PlannerGate::new());
-        let mut router = Router::demo();
-        router.planner = Planner::GatedDemo(gate.clone());
-        let accepted = router.handle(&request(
-            "POST",
-            "/api/edits",
-            "start=4&end=8&prompt=increase+volume",
-        ));
-        gate.wait_until_started();
-
-        let mutation = router.handle(&request("POST", "/api/mix", "track_id=1&volume=0.5"));
-        assert_eq!(mutation.status, 200);
-        let newer_project = router.handle(&request("GET", "/api/project", "")).body;
-        gate.release();
-
-        let failed = wait_for_edit(&router, &accepted);
-        assert_eq!(failed["status"], "failed");
-        assert_eq!(failed["errorStatus"], 409);
-        assert_eq!(
-            failed["error"],
-            "the project changed; submit the edit again"
-        );
-        assert_eq!(
-            router.handle(&request("GET", "/api/project", "")).body,
-            newer_project
-        );
-        assert!(!newer_project.contains("increase volume"));
-    }
-
-    #[test]
-    fn validates_api_requests_and_methods() {
-        let router = Router::demo();
-        assert_eq!(
-            router
-                .handle(&request("POST", "/api/edits", "start=1&end=2"))
-                .status,
-            422
-        );
-        assert_eq!(
-            router
-                .handle(&request(
-                    "POST",
-                    "/api/edits",
-                    "operation_id=not%20valid&start=4&end=8&prompt=increase+volume",
-                ))
-                .status,
-            422
-        );
-        let before = router.handle(&request("GET", "/api/project", "")).body;
-        let accepted = router.handle(&request(
-            "POST",
-            "/api/edits",
-            "start=4&end=8&prompt=make+the+lead+louder",
-        ));
-        let failed = wait_for_edit(&router, &accepted);
-        assert_eq!(failed["status"], "failed");
-        assert_eq!(failed["errorStatus"], 422);
-        assert_eq!(failed["error"], "track not found");
-        assert_eq!(
-            router.handle(&request("GET", "/api/project", "")).body,
-            before
-        );
-        assert_eq!(
-            router
-                .handle(&request(
-                    "POST",
-                    "/api/mix",
-                    "track_id=1&volume=bad&muted=true",
-                ))
-                .status,
-            422
-        );
-        assert_eq!(
-            router.handle(&request("GET", "/api/project", "")).body,
-            before
-        );
-        assert_eq!(
-            router
-                .handle(&request(
-                    "POST",
-                    "/api/mix",
-                    "track_id=1&volume=0.5&muted=maybe",
-                ))
-                .status,
-            422
-        );
-        assert_eq!(
-            router.handle(&request("GET", "/api/project", "")).body,
-            before
-        );
-        assert_eq!(router.handle(&request("GET", "/missing", "")).status, 404);
-        assert_eq!(router.handle(&request("GET", "/api/undo", "")).status, 405);
+        assert!(project["edits"][0]["operationId"].is_null());
     }
 
     #[test]
@@ -4067,81 +2987,7 @@ mod tests {
     }
 
     #[test]
-    fn streams_synchronized_pcm_stems_for_every_track() {
-        let router = Router::demo();
-        let mut project = router.lock_studio().project().clone();
-        project.duration = 0.25;
-        *router.lock_studio() = Studio::from_project(project.clone());
-        let mut response = Vec::new();
-        router
-            .write_track_stems_with_cancel(
-                &request(
-                    "GET",
-                    &format!("/api/track-stems/test-audio-token/{}/0", project.version),
-                    "",
-                ),
-                &mut response,
-                || false,
-                None,
-            )
-            .expect("track stem response");
-
-        let body_start = find_bytes(&response, b"\r\n\r\n").expect("HTTP response head") + 4;
-        let head = std::str::from_utf8(&response[..body_start]).expect("stem response head");
-        let body = &response[body_start..];
-        assert!(head.starts_with(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.daw-ai.track-stems\r\n"
-        ));
-        assert_eq!(&body[..8], TRACK_STEMS_MAGIC);
-        assert_eq!(
-            u32::from_le_bytes(body[8..12].try_into().unwrap()),
-            audio_analysis::SAMPLE_RATE
-        );
-        assert_eq!(
-            u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize,
-            project.tracks.len()
-        );
-        let sample_count = u64::from_le_bytes(body[16..24].try_into().unwrap()) as usize;
-        assert_eq!(
-            sample_count,
-            audio_analysis::playback_sample_count(0.0, 0.25)
-        );
-        let mut offset = 28;
-        for track in &project.tracks {
-            assert_eq!(
-                u64::from_le_bytes(body[offset..offset + 8].try_into().unwrap()),
-                track.id
-            );
-            offset += 8;
-        }
-        let frames = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-        assert_eq!(frames, sample_count);
-        for track in &project.tracks {
-            let pcm = &body[offset..offset + frames * 4];
-            assert!(
-                pcm.chunks_exact(2)
-                    .any(|sample| i16::from_le_bytes(sample.try_into().unwrap()) != 0),
-                "track {} stem was silent",
-                track.id
-            );
-            offset += frames * 4;
-        }
-        assert_eq!(offset, body.len());
-        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
-    }
-
-    #[test]
-    fn track_stem_paths_accept_an_optional_startup_window() {
-        assert_eq!(
-            track_stems_stream("/api/track-stems/token/42/1500"),
-            Some(("token", 42, 1500, None))
-        );
-        assert_eq!(
-            track_stems_stream("/api/track-stems/token/42/1500/4000"),
-            Some(("token", 42, 1500, Some(4000)))
-        );
-        assert!(track_stems_stream("/api/track-stems/token/42/1500/4000/extra").is_none());
+    fn track_spectrum_paths_accept_an_optional_startup_window() {
         assert_eq!(
             track_spectrum_stream("/api/track-spectrum/token/42/1500/2000"),
             Some(("token", 42, 1500, Some(2000)))
@@ -4598,141 +3444,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cross_origin_mutations_without_changing_state() {
-        let router = Router::demo();
-        let mut hostile = request("POST", "/api/edits", "start=4&end=8&prompt=increase+volume");
-        hostile
-            .headers
-            .insert("origin".to_owned(), "http://127.0.0.1:18867".to_owned());
-        hostile
-            .headers
-            .insert("sec-fetch-site".to_owned(), "cross-site".to_owned());
-
-        assert_eq!(router.handle(&hostile).status, 403);
-        let project = router.handle(&request("GET", "/api/project", ""));
-        assert!(!project.body.contains("increase volume"));
-
-        hostile.path = "/api/duration".to_owned();
-        hostile.body = "duration=10".to_owned();
-        assert_eq!(router.handle(&hostile).status, 403);
-        let project = router.handle(&request("GET", "/api/project", ""));
-        let project: serde_json::Value = serde_json::from_str(&project.body).expect("project JSON");
-        assert_eq!(project["duration"], 32.0);
-
-        hostile.path = "/api/sound-tools".to_owned();
-        hostile.body =
-            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Factory%2FLeads%2FClassic+Lead+1".to_owned();
-        assert_eq!(router.handle(&hostile).status, 403);
-        let project = router.handle(&request("GET", "/api/project", ""));
-        let project: serde_json::Value = serde_json::from_str(&project.body).expect("project JSON");
-        assert_eq!(
-            project["tracks"][1]["instrument"]["preset"],
-            "Factory/Basses/Wide Bassline"
-        );
-
-        hostile
-            .headers
-            .insert("x-forwarded-host".to_owned(), "studio.example".to_owned());
-        hostile
-            .headers
-            .insert("origin".to_owned(), "https://attacker.example".to_owned());
-        hostile
-            .headers
-            .insert("sec-fetch-site".to_owned(), "same-origin".to_owned());
-        assert_eq!(router.handle(&hostile).status, 403);
-
-        hostile
-            .headers
-            .insert("origin".to_owned(), "https://studio.example".to_owned());
-        assert_eq!(router.handle(&hostile).status, 200);
-        let project = router.handle(&request("GET", "/api/project", ""));
-        assert!(
-            project
-                .body
-                .contains("\"preset\":\"Factory/Leads/Classic Lead 1\"")
-        );
-    }
-
-    #[test]
-    fn supports_reverse_proxy_hosts_without_configuration() {
-        let router = Router::demo();
-        let mut forwarded = request(
-            "POST",
-            "/api/sound-tools",
-            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Factory%2FLeads%2FClassic+Lead+1",
-        );
-        forwarded.headers.insert(
-            "x-forwarded-host".to_owned(),
-            "studio.example:443, proxy.internal".to_owned(),
-        );
-        forwarded
-            .headers
-            .insert("origin".to_owned(), "https://studio.example".to_owned());
-        forwarded
-            .headers
-            .insert("sec-fetch-site".to_owned(), "same-origin".to_owned());
-        assert_eq!(router.handle(&forwarded).status, 200);
-    }
-
-    #[test]
-    fn supports_public_hosts_without_configuration() {
-        let router = Router::demo();
-        let mut public = request(
-            "POST",
-            "/api/sound-tools",
-            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Factory%2FLeads%2FClassic+Lead+1",
-        );
-        public
-            .headers
-            .insert("host".to_owned(), "studio.example".to_owned());
-        public
-            .headers
-            .insert("origin".to_owned(), "https://studio.example".to_owned());
-        public
-            .headers
-            .insert("sec-fetch-site".to_owned(), "same-origin".to_owned());
-
-        assert_eq!(router.handle(&public).status, 200);
-        public
-            .headers
-            .insert("origin".to_owned(), "https://attacker.example".to_owned());
-        assert_eq!(router.handle(&public).status, 403);
-    }
-
-    #[test]
-    fn serves_the_project_for_any_valid_hostname() {
-        let router = Router::demo();
-        let mut public = request("GET", "/api/project", "");
-        public
-            .headers
-            .insert("host".to_owned(), "music.private.example:8443".to_owned());
-
-        let response = router.handle(&public);
-        assert_eq!(response.status, 200);
-        assert!(response.body.contains("Neon First Light"));
-
-        public.method = "POST".to_owned();
-        public.path = "/api/sound-tools".to_owned();
-        public.body =
-            "track_id=2&tool=instrument&tool_id=201&parameter=preset&value=Factory%2FLeads%2FClassic+Lead+1".to_owned();
-        public.headers.insert(
-            "origin".to_owned(),
-            "http://music.private.example:8443".to_owned(),
-        );
-        public
-            .headers
-            .insert("sec-fetch-site".to_owned(), "same-origin".to_owned());
-        assert_eq!(router.handle(&public).status, 200);
-
-        let project = router.handle(&request("GET", "/api/project", ""));
-        assert!(
-            project
-                .body
-                .contains("\"preset\":\"Factory/Leads/Classic Lead 1\"")
-        );
-    }
-
-    #[test]
     fn rejects_malformed_host_authorities() {
         let router = Router::demo();
         let mut invalid = request("GET", "/api/project", "");
@@ -4763,132 +3474,6 @@ mod tests {
         let rendered = String::from_utf8(bytes).expect("UTF-8 response");
         assert!(rendered.contains("Content-Length: 11"));
         assert!(rendered.contains("X-Content-Type-Options: nosniff"));
-    }
-
-    #[test]
-    fn cookie_scoped_users_have_independent_projects() {
-        let id = TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("daw-ai-users-test-{}-{id}", std::process::id()));
-        let base = Router::demo();
-        assert_eq!(
-            base.handle(&request(
-                "POST",
-                "/api/mix",
-                "track_id=2&volume=0.31&muted=false",
-            ))
-            .status,
-            200
-        );
-        let registry = Arc::new(UserRegistry {
-            root: root.clone(),
-            planner: Planner::Demo,
-            users: Mutex::new(HashMap::new()),
-        });
-        let base = Router {
-            users: Some(registry),
-            ..base
-        };
-        let (first, first_id) = base
-            .scoped(&request("GET", "/api/project", ""))
-            .expect("first user");
-        let (second, second_id) = base
-            .scoped(&request("GET", "/api/project", ""))
-            .expect("second user");
-        assert_ne!(first_id, second_id);
-        assert!((first.lock_studio().project().tracks[1].volume - 0.31).abs() > f32::EPSILON);
-        assert_ne!(first.gemini_session_root(), second.gemini_session_root());
-        let first_session = first.gemini_session_root().join("first-session");
-        let second_session = second.gemini_session_root().join("second-session");
-        fs::create_dir_all(&first_session).expect("first session directory");
-        fs::create_dir_all(&second_session).expect("second session directory");
-        replace_text_file(
-            &first_session.join("session.json"),
-            r#"{"id":"first-private-session","updatedAt":1}"#,
-        )
-        .expect("first private session");
-        replace_text_file(
-            &second_session.join("session.json"),
-            r#"{"id":"second-private-session","updatedAt":2}"#,
-        )
-        .expect("second private session");
-        let first_sessions = first.handle(&request("GET", "/api/gemini-sessions", ""));
-        assert!(first_sessions.body.contains("first-private-session"));
-        assert!(!first_sessions.body.contains("second-private-session"));
-        assert_eq!(
-            first
-                .handle(&request(
-                    "POST",
-                    "/api/mix",
-                    "track_id=2&volume=0.25&muted=false",
-                ))
-                .status,
-            200
-        );
-        assert!((first.lock_studio().project().tracks[1].volume - 0.25).abs() < f32::EPSILON);
-        assert!((second.lock_studio().project().tracks[1].volume - 0.25).abs() > f32::EPSILON);
-        std::fs::remove_dir_all(root).expect("remove user test projects");
-    }
-
-    #[test]
-    fn history_navigation_preserves_forward_snapshots() {
-        let router = Router::demo();
-        assert_eq!(
-            router
-                .handle(&request(
-                    "POST",
-                    "/api/mix",
-                    "track_id=2&volume=0.4&muted=false",
-                ))
-                .status,
-            200
-        );
-        assert_eq!(
-            router
-                .handle(&request(
-                    "POST",
-                    "/api/mix",
-                    "track_id=2&volume=1.1&muted=false",
-                ))
-                .status,
-            200
-        );
-        let history: serde_json::Value =
-            serde_json::from_str(&router.handle(&request("GET", "/api/history", "")).body)
-                .expect("history response");
-        let latest_version = router.lock_studio().project().version;
-        assert_eq!(history["entries"][1]["source"], "Manual");
-        assert_eq!(history["entries"][1]["summary"], "Manual project change");
-        let restored: serde_json::Value = serde_json::from_str(
-            &router
-                .handle(&request("POST", "/api/history", "index=0"))
-                .body,
-        )
-        .expect("restored project");
-        assert_eq!(restored["version"], latest_version + 1);
-        let forward: serde_json::Value = serde_json::from_str(
-            &router
-                .handle(&request("POST", "/api/history", "index=2"))
-                .body,
-        )
-        .expect("forward project");
-        assert_eq!(forward["version"], latest_version + 2);
-        assert!((router.lock_studio().project().tracks[1].volume - 1.1).abs() < f32::EPSILON);
-        let reloaded: serde_json::Value =
-            serde_json::from_str(&router.handle(&request("GET", "/api/project", "")).body)
-                .expect("reloaded project");
-        assert_eq!(reloaded["canUndo"], true);
-        assert_eq!(router.handle(&request("POST", "/api/undo", "")).status, 200);
-        assert_eq!(router.handle(&request("POST", "/api/undo", "")).status, 200);
-        assert_eq!(router.lock_studio().project().edits.len(), 0);
-        assert_eq!(
-            router
-                .history
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .current,
-            0
-        );
     }
 
     #[test]
@@ -4986,7 +3571,7 @@ mod tests {
         let base = Router {
             users: Some(Arc::new(UserRegistry {
                 root: root.clone(),
-                planner: Planner::Demo,
+                ai: Ai::Deterministic(Duration::ZERO),
                 users: Mutex::new(HashMap::new()),
             })),
             ..Router::demo()
@@ -5020,80 +3605,6 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
         assert_eq!(scope_error_response(&error).status, 507);
         fs::remove_dir_all(root).expect("remove user limit root");
-    }
-
-    #[test]
-    fn project_history_survives_a_server_restart() {
-        let (router, project_path) = persisted_demo();
-        assert_eq!(
-            router
-                .handle(&request(
-                    "POST",
-                    "/api/mix",
-                    "track_id=2&volume=0.4&muted=false",
-                ))
-                .status,
-            200
-        );
-        assert_eq!(
-            router
-                .handle(&request(
-                    "POST",
-                    "/api/mix",
-                    "track_id=2&volume=1.1&muted=false",
-                ))
-                .status,
-            200
-        );
-        assert_eq!(
-            router
-                .handle(&request("POST", "/api/history", "index=0"))
-                .status,
-            200
-        );
-
-        let reopened = ProjectStore::open(project_path.clone())
-            .expect("reopened project")
-            .1;
-        let history = load_project_history(&project_path, reopened.project())
-            .expect("reopened project history");
-        assert_eq!(history.current, 0);
-        assert_eq!(history.snapshots.len(), 3);
-        assert!((history.snapshots[2].tracks[1].volume - 1.1).abs() < f32::EPSILON);
-        assert!(
-            std::fs::read_to_string(&project_path)
-                .expect("project document")
-                .contains("\"history\"")
-        );
-        std::fs::remove_file(project_path).expect("remove project test file");
-    }
-
-    #[test]
-    fn reset_clears_project_history() {
-        let (router, project_path) = persisted_demo();
-        assert_eq!(
-            router
-                .handle(&request(
-                    "POST",
-                    "/api/mix",
-                    "track_id=2&volume=0.4&muted=false",
-                ))
-                .status,
-            200
-        );
-        assert_eq!(
-            router.handle(&request("POST", "/api/reset", "")).status,
-            200
-        );
-
-        let reopened = ProjectStore::open(project_path.clone())
-            .expect("reopened reset project")
-            .1;
-        let history = load_project_history(&project_path, reopened.project())
-            .expect("reopened reset history");
-        assert_eq!(history.current, 0);
-        assert_eq!(history.snapshots.len(), 1);
-        std::fs::remove_file(project_path).expect("remove project test file");
     }
 
     #[test]
