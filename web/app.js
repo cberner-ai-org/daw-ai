@@ -103,11 +103,9 @@
       this.seekTimer = null;
       this.spectrumLoadGeneration = 0;
       this.spectrumAbortController = null;
-      this.spectrumTracks = new Map();
       this.spectrumWindows = [];
       this.spectrumLoading = false;
       this.spectrumRetryAfter = 0;
-      this.spectrumPreparationPromise = Promise.resolve(false);
       this.spectrumPreparationRetryTimer = null;
       this.spectrumPreparationRetryAttempts = 0;
       this.analyzerTracks = [];
@@ -340,19 +338,18 @@
       }
     }
 
-    async loadTrackSpectrum(project, start, windowMilliseconds = null) {
+    async loadTrackSpectrum(project, start) {
       if (!this.streamToken || !project?.tracks.length) return null;
       const generation = (this.spectrumLoadGeneration += 1);
       this.spectrumAbortController?.abort();
       this.spectrumAbortController = new AbortController();
       this.spectrumLoading = true;
-      if (!this.hasSpectrumAt(start)) {
+      if (!this.hasSpectrumAt(this.playhead)) {
         this.stopAnalyzers();
       }
       try {
         const response = await fetch(
-          `/api/track-spectrum/${encodeURIComponent(this.streamToken)}/${project.version}/${Math.round(start * 1000)}` +
-            (windowMilliseconds === null ? "" : `/${windowMilliseconds}`),
+          `/api/track-spectrum/${encodeURIComponent(this.streamToken)}/${project.version}/${Math.round(start * 1000)}`,
           { cache: "no-store", signal: this.spectrumAbortController.signal },
         );
         if (response.status === 409) return false;
@@ -360,7 +357,6 @@
         const decoded = this.decodeSpectrum(await response.arrayBuffer());
         if (generation !== this.spectrumLoadGeneration || project.version !== this.project?.version) return false;
         const tracks = decoded.tracks;
-        this.spectrumTracks = tracks;
         this.spectrumWindows = this.spectrumWindows.filter((window) => window.start !== start);
         this.spectrumWindows.push({ start: decoded.start, duration: decoded.duration, tracks });
         elements.trackRows.dataset.spectrumCoverage = `${decoded.start}:${decoded.start + decoded.duration}`;
@@ -398,7 +394,6 @@
       window.clearTimeout(this.spectrumPreparationRetryTimer);
       this.spectrumPreparationRetryTimer = null;
       this.spectrumPreparationRetryAttempts = 0;
-      this.spectrumTracks = new Map();
       this.spectrumWindows = [];
       this.spectrumLoading = false;
       this.stopAnalyzers();
@@ -597,20 +592,17 @@
     window.clearTimeout(audio.spectrumPreparationRetryTimer);
     audio.spectrumPreparationRetryTimer = null;
     if (!project || !audio.streamToken) {
-      audio.spectrumPreparationPromise = Promise.resolve(false);
-      return audio.spectrumPreparationPromise;
+      return Promise.resolve(false);
     }
     if (audio.hasSpectrumAt(coverageTime)) {
       audio.spectrumPreparationRetryAttempts = 0;
-      audio.spectrumPreparationPromise = Promise.resolve(true);
-      return audio.spectrumPreparationPromise;
+      return Promise.resolve(true);
     }
     if (state.promptPending) {
-      audio.spectrumPreparationPromise = Promise.resolve(false);
-      return audio.spectrumPreparationPromise;
+      return Promise.resolve(false);
     }
     const version = project.version;
-    audio.spectrumPreparationPromise = audio.prepareSpectrum(project, coverageTime)
+    return audio.prepareSpectrum(project, coverageTime)
       .then((prepared) => {
         if (prepared === false || state.project?.version !== version) return false;
         const ready = audio.hasSpectrumAt(coverageTime);
@@ -636,7 +628,6 @@
         }
         return false;
       });
-    return audio.spectrumPreparationPromise;
   }
 
   function adoptProject(project) {

@@ -462,6 +462,96 @@ async function run() {
       "long projects must prepare their opening spectrum window without blocking transport",
     );
     await cdp.send("Target.closeTarget", { targetId: longProjectPage.targetId });
+    const delayedPrefetchPage = await openPageWithScript(cdp, appUrl, `(() => {
+      const originalFetch = window.fetch;
+      window.__spectrumTrackIds = [];
+      window.__spectrumRequestCount = 0;
+      window.__futureSpectrumPending = false;
+      const spectrumResponse = (startMilliseconds) => {
+        const frameSamples = 1470;
+        const sampleRate = 44100;
+        const frameCount = 90;
+        const trackCount = window.__spectrumTrackIds.length;
+        const buffer = new ArrayBuffer(32 + trackCount * 8 + frameCount * trackCount * 8);
+        const bytes = new Uint8Array(buffer);
+        const view = new DataView(buffer);
+        bytes.set([...'DAWSPEC1'].map((character) => character.charCodeAt(0)));
+        view.setUint32(8, trackCount, true);
+        view.setUint32(12, frameCount, true);
+        view.setBigUint64(16, BigInt(startMilliseconds), true);
+        view.setUint32(24, frameSamples, true);
+        view.setUint32(28, sampleRate, true);
+        window.__spectrumTrackIds.forEach(
+          (trackId, index) => view.setBigUint64(32 + index * 8, BigInt(trackId), true),
+        );
+        bytes.fill(192, 32 + trackCount * 8);
+        return new Response(buffer, {
+          status: 200,
+          headers: { 'Content-Type': 'application/vnd.daw-ai.track-spectrum' },
+        });
+      };
+      window.fetch = async function fetch(resource, options) {
+        if (resource === '/api/project') {
+          const response = await originalFetch(resource, options);
+          const project = await response.json();
+          window.__spectrumTrackIds = project.tracks.map((track) => track.id);
+          return new Response(JSON.stringify(project), {
+            status: response.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (typeof resource === 'string' && resource.startsWith('/api/track-spectrum/')) {
+          const startMilliseconds = Number(resource.split('/')[5]);
+          window.__spectrumRequestCount += 1;
+          if (window.__spectrumRequestCount === 1) return spectrumResponse(startMilliseconds);
+          window.__futureSpectrumPending = true;
+          return new Promise((resolve) => {
+            window.__releaseFutureSpectrum = () => {
+              window.__futureSpectrumPending = false;
+              resolve(spectrumResponse(startMilliseconds));
+            };
+          });
+        }
+        return originalFetch(resource, options);
+      };
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        delayedPrefetchPage.sessionId,
+        `!document.querySelector('#play-button').disabled && window.__spectrumRequestCount === 1`,
+      ),
+      "opening spectrum before delayed prefetch",
+    );
+    await evaluate(cdp, delayedPrefetchPage.sessionId, "document.querySelector('#play-button').click()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        delayedPrefetchPage.sessionId,
+        `document.documentElement.dataset.audioState === 'playing' && window.__futureSpectrumPending`,
+      ),
+      "delayed future spectrum prefetch",
+      30_000,
+    );
+    const delayedPrefetchBaseline = await evaluate(
+      cdp,
+      delayedPrefetchPage.sessionId,
+      "Number(document.querySelector('#track-rows').dataset.spectrumFrame || 0)",
+    );
+    await evaluate(cdp, delayedPrefetchPage.sessionId, "new Promise((resolve) => setTimeout(resolve, 500))");
+    assert.equal(
+      await evaluate(cdp, delayedPrefetchPage.sessionId, `(() => {
+        const frame = Number(document.querySelector('#track-rows').dataset.spectrumFrame || 0);
+        const activeBar = [...document.querySelectorAll('.track-spectrum i')].some(
+          (bar) => Number.parseFloat(bar.style.getPropertyValue('--spectrum-level')) > 0.1,
+        );
+        return frame >= ${delayedPrefetchBaseline + 10} && activeBar;
+      })()`),
+      true,
+      "current analyzer animation must continue while a future window is rendering",
+    );
+    await evaluate(cdp, delayedPrefetchPage.sessionId, "window.__releaseFutureSpectrum()");
+    await cdp.send("Target.closeTarget", { targetId: delayedPrefetchPage.targetId });
     const appSession = await openPage(cdp, appUrl);
     const consoleErrors = [];
     cdp.on("Runtime.consoleAPICalled", (message) => {
