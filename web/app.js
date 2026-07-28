@@ -165,6 +165,7 @@
       this.seekTimer = null;
       if (!this.project || !this.streamToken || this.playbackState !== "idle") return Promise.resolve();
       if (this.playhead >= this.project.duration - 0.01) this.playhead = 0;
+      this.cancelSpectrumLoad();
       this.playbackState = "starting";
       this.playbackGeneration += 1;
       this.retryAttempts = 0;
