@@ -152,7 +152,7 @@
     }
 
     toggle() {
-      if (this.isActive) {
+      if (this.playbackState !== "idle") {
         this.stop(true);
         return Promise.resolve();
       }
