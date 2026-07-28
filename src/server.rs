@@ -912,6 +912,8 @@ impl Router {
             )
             .write(output);
         }
+        let request_cancelled =
+            || is_cancelled() || self.lock_studio().project().version != version;
         let start_sample = audio_analysis::playback_start_sample_milliseconds(start_milliseconds);
         let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
         if start_sample >= project_end_sample {
@@ -942,7 +944,7 @@ impl Router {
         }
         let mut cursor = start_sample;
         while cursor < end_sample {
-            if is_cancelled() {
+            if request_cancelled() {
                 return Ok(());
             }
             let chunk_end = (cursor + SPECTRUM_RENDER_CHUNK_SAMPLES).min(end_sample);
@@ -952,7 +954,7 @@ impl Router {
                 &project,
                 render_start,
                 render_end,
-                &is_cancelled,
+                &request_cancelled,
             ) {
                 Ok(stems) => stems,
                 Err(AudioRenderError::Render(error)) => {
@@ -4244,6 +4246,62 @@ mod tests {
         );
         assert!(matches!(foreground.join(), Ok(Ok(()))));
         assert!(matches!(background.join(), Ok(Ok(()))));
+    }
+
+    #[test]
+    fn queued_spectrum_render_stops_when_its_project_version_is_stale() {
+        let router = Router::demo();
+        router
+            .audio_renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rendering = true;
+        let version = router.lock_studio().project().version;
+        let request = request(
+            "GET",
+            &format!("/api/track-spectrum/test-audio-token/{version}/0/1000"),
+            "",
+        );
+        let worker_router = router.clone();
+        let worker = thread::spawn(move || {
+            let mut response = Vec::new();
+            let result = worker_router.write_track_spectrum_with_cancel(
+                &request,
+                &mut response,
+                || false,
+                None,
+            );
+            (result, response)
+        });
+
+        let state = router
+            .audio_renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            router
+                .audio_renderer
+                .completed
+                .wait_while(state, |state| state.background_waiters == 0)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut project = router.lock_studio().project().clone();
+        project.version += 1;
+        *router.lock_studio() = Studio::from_project(project);
+        let mut state = router
+            .audio_renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rendering = false;
+        drop(state);
+        router.audio_renderer.completed.notify_all();
+
+        let (result, response) = worker.join().expect("spectrum worker");
+        assert!(result.is_ok());
+        assert!(response.is_empty());
     }
 
     #[test]
