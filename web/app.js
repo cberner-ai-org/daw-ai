@@ -100,17 +100,21 @@
       this.retryTimer = null;
       this.retryAttempts = 0;
       this.seekTimer = null;
-      this.stemLoadGeneration = 0;
-      this.stemAbortController = null;
-      this.analysisContext = null;
-      this.stemBuffers = new Map();
-      this.stemStart = 0;
-      this.stemLoading = false;
-      this.analyzerSources = [];
+      this.spectrumLoadGeneration = 0;
+      this.spectrumAbortController = null;
+      this.spectrumTracks = new Map();
+      this.spectrumWindows = [];
+      this.spectrumLoading = false;
+      this.spectrumLoadingStart = null;
+      this.spectrumRetryAfter = 0;
+      this.initialSpectrumPromise = Promise.resolve();
+      this.analyzerTracks = [];
       this.analyzerFrame = null;
+      this.analyzerGeneration = 0;
       this.media.addEventListener("ended", () => {
         if (this.isActive) this.stop(false);
       });
+      this.media.addEventListener("playing", () => this.handlePlaybackStarted());
       this.media.addEventListener("error", () => {
         if (this.isActive) {
           const mediaError = this.media.error;
@@ -166,7 +170,6 @@
       this.playbackGeneration += 1;
       this.retryAttempts = 0;
       const generation = this.playbackGeneration;
-      void this.resumeAnalysisContext();
       updateTransport();
       return this.startStream(generation);
     }
@@ -190,29 +193,26 @@
         this.retryPlayback(error, generation, streamAttempt);
         return Promise.resolve();
       }
+      window.clearInterval(this.timer);
+      this.timer = window.setInterval(() => this.tick(), 16);
+      this.tick();
       return Promise.resolve(playback)
-        .then(() => {
-          if (
-            generation !== this.playbackGeneration ||
-            streamAttempt !== this.streamAttempt ||
-            !this.isActive
-          ) {
-            return;
-          }
-          this.playbackState = "playing";
-          if (this.hasStemAudioAt(this.playhead)) {
-            this.startAnalyzers();
-          } else {
-            void this.loadTrackStems(this.project, this.playhead);
-          }
-          window.clearInterval(this.timer);
-          this.timer = window.setInterval(() => this.tick(), 50);
-          this.tick();
-          updateTransport();
-        })
         .catch((error) => {
           this.retryPlayback(error, generation, streamAttempt);
         });
+    }
+
+    handlePlaybackStarted() {
+      if (this.playbackState !== "starting") return;
+      this.playbackState = "playing";
+      this.updatePosition();
+          if (this.hasSpectrumAt(this.playhead)) {
+            this.startAnalyzers();
+          } else if (!this.spectrumLoading) {
+        void this.loadTrackSpectrum(this.project, this.playhead, 1000);
+      }
+      this.tick();
+      updateTransport();
     }
 
     stop(preservePosition) {
@@ -243,6 +243,9 @@
       this.playhead = clamp(time, 0, this.project?.duration ?? 0);
       renderPlayhead();
       updateTransport();
+      if (!wasActive && !this.hasSpectrumAt(this.playhead) && this.project) {
+        void this.loadTrackSpectrum(this.project, this.playhead, 1000);
+      }
       if (wasActive) {
         this.seekTimer = window.setTimeout(() => {
           this.seekTimer = null;
@@ -303,149 +306,169 @@
     }
 
     tick() {
-      if (!this.isPlaying) return;
+      if (!this.isActive) return;
       this.updatePosition();
+      if (this.playbackState === "starting" && this.media.currentTime > 0) {
+        this.handlePlaybackStarted();
+        return;
+      }
+      updateTransport();
+      renderPlayhead();
+      if (!this.isPlaying) return;
       if (this.retryAttempts > 0 && this.media.currentTime >= 2) this.retryAttempts = 0;
       if (this.playhead >= this.project.duration) {
         this.stop(false);
         return;
       }
-      const stemDuration = this.stemBuffers.values().next().value?.duration ?? 0;
-      const stemEnd = this.stemStart + stemDuration;
-      if (
-        !this.stemLoading &&
-        (!this.hasStemAudioAt(this.playhead) ||
-          (stemEnd < this.project.duration - 0.01 && this.playhead > stemEnd - 2))
-      ) {
-        void this.loadTrackStems(this.project, this.playhead);
+      const spectrumWindow = this.spectrumWindowAt(this.playhead);
+      const spectrumDuration = spectrumWindow?.duration ?? 0;
+      const spectrumEnd = (spectrumWindow?.start ?? this.playhead) + spectrumDuration;
+      if (Date.now() >= this.spectrumRetryAfter) {
+        if (
+          !spectrumWindow &&
+          (!this.spectrumLoading || Math.abs((this.spectrumLoadingStart ?? -1000) - this.playhead) > 1)
+        ) {
+          void this.loadTrackSpectrum(this.project, this.playhead);
+        } else if (!this.spectrumLoading &&
+          spectrumWindow &&
+          spectrumEnd < this.project.duration - 0.01 &&
+          this.playhead > spectrumEnd - Math.min(2.5, spectrumDuration * 0.8)
+        ) {
+          void this.loadTrackSpectrum(this.project, spectrumEnd);
+        }
       }
-      updateTransport();
-      renderPlayhead();
     }
 
-    ensureAnalysisContext() {
-      if (!this.analysisContext) {
-        const Context = window.AudioContext || window.webkitAudioContext;
-        if (Context) this.analysisContext = new Context();
-      }
-      return this.analysisContext;
-    }
-
-    async resumeAnalysisContext() {
-      const context = this.ensureAnalysisContext();
-      if (context?.state === "suspended") await context.resume();
-    }
-
-    async loadTrackStems(project, start) {
-      const generation = (this.stemLoadGeneration += 1);
-      this.stemAbortController?.abort();
-      this.stemAbortController = new AbortController();
-      this.stemLoading = true;
-      if (!this.hasStemAudioAt(start)) {
-        this.stemBuffers = new Map();
+    async loadTrackSpectrum(project, start, windowMilliseconds = null) {
+      if (!this.streamToken || !project?.tracks.length) return null;
+      const generation = (this.spectrumLoadGeneration += 1);
+      this.spectrumAbortController?.abort();
+      this.spectrumAbortController = new AbortController();
+      this.spectrumLoading = true;
+      this.spectrumLoadingStart = start;
+      if (!this.hasSpectrumAt(start)) {
         this.stopAnalyzers();
       }
-      if (!this.streamToken || !project?.tracks.length) return;
       try {
         const response = await fetch(
-          `/api/track-stems/${encodeURIComponent(this.streamToken)}/${project.version}/${Math.round(start * 1000)}`,
-          { cache: "no-store", signal: this.stemAbortController.signal },
+          `/api/track-spectrum/${encodeURIComponent(this.streamToken)}/${project.version}/${Math.round(start * 1000)}` +
+            (windowMilliseconds === null ? "" : `/${windowMilliseconds}`),
+          { cache: "no-store", signal: this.spectrumAbortController.signal },
         );
-        if (!response.ok) throw new Error(`Track stem render failed with HTTP ${response.status}.`);
-        const buffers = this.decodeTrackStems(await response.arrayBuffer());
-        if (generation !== this.stemLoadGeneration || project.version !== this.project?.version) return;
-        this.stemBuffers = buffers;
-        this.stemStart = start;
+        if (response.status === 409) return false;
+        if (!response.ok) throw new Error(`Track spectrum render failed with HTTP ${response.status}.`);
+        const decoded = this.decodeSpectrum(await response.arrayBuffer());
+        if (generation !== this.spectrumLoadGeneration || project.version !== this.project?.version) return;
+        const tracks = decoded.tracks;
+        this.spectrumTracks = tracks;
+        this.spectrumWindows = this.spectrumWindows.filter((window) => window.start !== start);
+        this.spectrumWindows.push({ start: decoded.start, duration: decoded.duration, tracks });
+        elements.trackRows.dataset.spectrumCoverage = `${decoded.start}:${decoded.start + decoded.duration}`;
+        this.spectrumWindows.sort((left, right) => left.start - right.start);
+        this.spectrumRetryAfter = 0;
         if (this.isPlaying) this.startAnalyzers();
+        if (windowMilliseconds !== null && this.isPlaying) {
+          void this.loadTrackSpectrum(project, this.playhead);
+        }
+        return { start: decoded.start, duration: decoded.duration };
       } catch (error) {
-        if (error?.name !== "AbortError") reportClientIssue("warning", error, "loading track analyzers");
+        if (error?.name !== "AbortError" && project.version === this.project?.version) {
+          this.spectrumRetryAfter = Date.now() + 1000;
+          reportClientIssue("warning", error, "loading track analyzers");
+        }
+        return null;
       } finally {
-        if (generation === this.stemLoadGeneration) this.stemLoading = false;
+        if (generation === this.spectrumLoadGeneration) {
+          this.spectrumLoading = false;
+          this.spectrumLoadingStart = null;
+        }
       }
     }
 
-    invalidateTrackStems() {
-      this.stemLoadGeneration += 1;
-      this.stemAbortController?.abort();
-      this.stemBuffers = new Map();
-      this.stemLoading = false;
+    async prepareSpectrum(project) {
+      let start = 0;
+      while (start < project.duration - 0.01) {
+        let loaded = null;
+        for (let attempt = 0; attempt < 3 && loaded === null; attempt += 1) {
+          loaded = await this.loadTrackSpectrum(
+            project,
+            start,
+            Math.ceil((project.duration - start) * 1000),
+          );
+          if (loaded === false || state.project?.version !== project.version) return;
+          if (loaded === null) {
+            await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+          }
+        }
+        if (loaded === null || loaded.start + loaded.duration <= start + 0.001) {
+          throw new Error("The complete spectrum timeline could not be prepared.");
+        }
+        start = Math.min(project.duration, loaded.start + loaded.duration);
+      }
+    }
+
+    invalidateSpectrum() {
+      this.spectrumLoadGeneration += 1;
+      this.spectrumAbortController?.abort();
+      this.spectrumTracks = new Map();
+      this.spectrumWindows = [];
+      this.spectrumLoading = false;
+      this.spectrumLoadingStart = null;
       this.stopAnalyzers();
     }
 
-    hasStemAudioAt(time) {
-      const duration = this.stemBuffers.values().next().value?.duration ?? 0;
-      return this.stemBuffers.size > 0 && time >= this.stemStart && time < this.stemStart + duration;
+    hasSpectrumAt(time) {
+      return this.spectrumWindowAt(time) !== null;
     }
 
-    decodeTrackStems(arrayBuffer) {
+    spectrumWindowAt(time) {
+      return this.spectrumWindows
+        .filter((window) => time >= window.start && time < window.start + window.duration)
+        .at(-1) ?? null;
+    }
+
+    decodeSpectrum(arrayBuffer) {
       const bytes = new Uint8Array(arrayBuffer);
       const view = new DataView(arrayBuffer);
-      const magic = String.fromCharCode(...bytes.subarray(0, 8));
-      if (magic !== "DAWSTEM1" || bytes.length < 28) throw new Error("The backend returned invalid track stems.");
-      const sampleRate = view.getUint32(8, true);
-      const trackCount = view.getUint32(12, true);
-      const sampleCount = Number(view.getBigUint64(16, true));
-      const chunkSize = view.getUint32(24, true);
-      if (!sampleRate || !trackCount || !sampleCount || !chunkSize || trackCount > 128) {
-        throw new Error("The backend returned invalid track stem dimensions.");
+      if (String.fromCharCode(...bytes.subarray(0, 8)) !== "DAWSPEC1" || bytes.length < 32) {
+        throw new Error("The backend returned invalid track spectrum data.");
       }
-      let offset = 28;
+      const trackCount = view.getUint32(8, true);
+      const frameCount = view.getUint32(12, true);
+      const start = Number(view.getBigUint64(16, true)) / 1000;
+      const frameSamples = view.getUint32(24, true);
+      const sampleRate = view.getUint32(28, true);
+      if (!trackCount || !frameCount || !frameSamples || !sampleRate || trackCount > 128) {
+        throw new Error("The backend returned invalid track spectrum dimensions.");
+      }
+      let offset = 32;
       const trackIds = [];
       for (let index = 0; index < trackCount; index += 1) {
-        if (offset + 8 > bytes.length) throw new Error("The track stem header was truncated.");
+        if (offset + 8 > bytes.length) throw new Error("The track spectrum header was truncated.");
         trackIds.push(Number(view.getBigUint64(offset, true)));
         offset += 8;
       }
-      const channels = trackIds.map(() => [new Float32Array(sampleCount), new Float32Array(sampleCount)]);
-      let frameOffset = 0;
-      while (frameOffset < sampleCount) {
-        if (offset + 4 > bytes.length) throw new Error("The track stem data was truncated.");
-        const frames = view.getUint32(offset, true);
-        offset += 4;
-        if (!frames || frames > chunkSize || frameOffset + frames > sampleCount) {
-          throw new Error("The backend returned an invalid track stem chunk.");
-        }
-        for (const [left, right] of channels) {
-          const byteCount = frames * 4;
-          if (offset + byteCount > bytes.length) throw new Error("The track stem samples were truncated.");
-          for (let frame = 0; frame < frames; frame += 1) {
-            left[frameOffset + frame] = view.getInt16(offset, true) / 32768;
-            right[frameOffset + frame] = view.getInt16(offset + 2, true) / 32768;
-            offset += 4;
-          }
-        }
-        frameOffset += frames;
+      if (bytes.length !== offset + frameCount * trackCount * 8) {
+        throw new Error("The track spectrum frame data was truncated.");
       }
-      if (offset !== bytes.length) throw new Error("The track stem response had trailing data.");
-      const context = this.ensureAnalysisContext();
-      if (!context) return new Map();
-      return new Map(
-        trackIds.map((trackId, index) => {
-          const buffer = context.createBuffer(2, sampleCount, sampleRate);
-          buffer.copyToChannel(channels[index][0], 0);
-          buffer.copyToChannel(channels[index][1], 1);
-          return [trackId, buffer];
-        }),
-      );
+      const tracks = new Map(trackIds.map((trackId) => [trackId, { levels: [] }]));
+      for (let frame = 0; frame < frameCount; frame += 1) {
+        for (const trackId of trackIds) {
+          tracks.get(trackId).levels.push(bytes.slice(offset, offset + 8));
+          offset += 8;
+        }
+      }
+      const frameDuration = frameSamples / sampleRate;
+      for (const track of tracks.values()) track.frameDuration = frameDuration;
+      return { start, duration: frameCount * frameDuration, tracks };
     }
 
     startAnalyzers() {
       this.stopAnalyzers();
-      const context = this.ensureAnalysisContext();
-      if (!context || !this.isPlaying || !this.stemBuffers.size) return;
-      const offset = clamp(this.playhead - this.stemStart, 0, this.project.duration);
-      for (const [trackId, buffer] of this.stemBuffers) {
-        if (offset >= buffer.duration) continue;
-        const source = context.createBufferSource();
-        const analyzer = context.createAnalyser();
-        const silence = context.createGain();
-        source.buffer = buffer;
-        analyzer.fftSize = 1024;
-        analyzer.smoothingTimeConstant = 0.72;
-        silence.gain.value = 0;
-        source.connect(analyzer).connect(silence).connect(context.destination);
-        source.start(0, offset);
-        this.analyzerSources.push({ source, analyzer, trackId });
+      const window = this.spectrumWindowAt(this.playhead);
+      if (!this.isPlaying || !window) return;
+      for (const trackId of window.tracks.keys()) {
+        this.analyzerTracks.push(trackId);
       }
       this.drawAnalyzers();
     }
@@ -453,10 +476,8 @@
     stopAnalyzers() {
       window.cancelAnimationFrame(this.analyzerFrame);
       this.analyzerFrame = null;
-      for (const { source } of this.analyzerSources) {
-        try { source.stop(); } catch (_) { /* The source may already have ended. */ }
-      }
-      this.analyzerSources = [];
+      this.analyzerGeneration += 1;
+      this.analyzerTracks = [];
       elements.trackRows.querySelectorAll(".track-spectrum i").forEach((bar) => {
         bar.style.setProperty("--spectrum-level", 0);
       });
@@ -464,23 +485,26 @@
 
     drawAnalyzers() {
       if (!this.isPlaying) return;
-      for (const { analyzer, trackId } of this.analyzerSources) {
-        const bins = new Uint8Array(analyzer.frequencyBinCount);
-        analyzer.getByteFrequencyData(bins);
+      const projectTime = this.audioStart + this.media.currentTime;
+      const spectrumWindow = this.spectrumWindowAt(projectTime);
+      for (const trackId of this.analyzerTracks) {
+        const track = spectrumWindow?.tracks.get(trackId);
+        const frame = track
+          ? track.levels[
+              Math.min(
+                track.levels.length - 1,
+                Math.max(0, Math.floor((projectTime - spectrumWindow.start) / track.frameDuration)),
+              )
+            ]
+          : null;
         const bars = elements.trackRows.querySelectorAll(`[data-spectrum-track="${trackId}"] i`);
-        const minimum = 40;
-        const maximum = this.analysisContext.sampleRate / 2;
         bars.forEach((bar, index) => {
-          const lowHz = minimum * Math.pow(maximum / minimum, index / bars.length);
-          const highHz = minimum * Math.pow(maximum / minimum, (index + 1) / bars.length);
-          const lowBin = Math.max(1, Math.floor((lowHz / maximum) * bins.length));
-          const highBin = Math.max(lowBin + 1, Math.ceil((highHz / maximum) * bins.length));
-          let sum = 0;
-          for (let bin = lowBin; bin < Math.min(highBin, bins.length); bin += 1) sum += bins[bin] ** 2;
-          const level = Math.sqrt(sum / Math.max(1, highBin - lowBin)) / 255;
-          bar.style.setProperty("--spectrum-level", level.toFixed(4));
+          bar.style.setProperty("--spectrum-level", ((frame?.[index] ?? 0) / 255).toFixed(4));
         });
       }
+      const frame = Number(elements.trackRows.dataset.spectrumFrame ?? 0) + 1;
+      elements.trackRows.dataset.spectrumFrame = String(frame);
+      elements.trackRows.dataset.spectrumLagMs = "0";
       this.analyzerFrame = window.requestAnimationFrame(() => this.drawAnalyzers());
     }
   }
@@ -609,7 +633,20 @@
     state.selectionEnd = clamp(state.selectionEnd, state.selectionStart + 0.25, project.duration);
     renderRuler();
     renderTracks();
-    audio.invalidateTrackStems();
+    audio.invalidateSpectrum();
+    if (!state.promptPending && audio.streamToken) {
+      elements.playButton.disabled = true;
+      audio.initialSpectrumPromise = audio.prepareSpectrum(project);
+      void audio.initialSpectrumPromise
+        .then(() => {
+          if (state.project?.version === project.version) elements.playButton.disabled = false;
+        })
+        .catch((error) => {
+          if (state.project?.version === project.version) {
+            showError(error, "preparing track spectrum", "Could not prepare playback analysis: ");
+          }
+        });
+    }
     renderSelection();
     renderPlayhead();
     renderDebug();
@@ -1478,6 +1515,9 @@
       hideEditProgress();
       elements.composeButton.disabled = false;
       elements.composeButton.querySelector("span").textContent = "Make change";
+      if (state.project && !audio.hasSpectrumAt(audio.playhead)) {
+        void audio.loadTrackSpectrum(state.project, audio.playhead, 1000);
+      }
       if (playbackStateCaptured && restorePlayback && !audio.isActive) await audio.start();
     }
   }
@@ -1902,7 +1942,16 @@
       showError(error, "initializing audio", "Could not initialize audio: ");
     }
     await loadProject();
-    elements.playButton.disabled = !(audio.streamToken && state.project);
+    try {
+      await audio.initialSpectrumPromise;
+    } catch (_error) {
+      // prepareSpectrum reports current-version failures and leaves Play disabled.
+    }
+    elements.playButton.disabled = !(
+      audio.streamToken &&
+      state.project &&
+      audio.hasSpectrumAt(Math.max(0, state.project.duration - 0.05))
+    );
     await loadGeminiSessions();
     if (pending && state.project) await runPendingEdit(pending, false);
   }
