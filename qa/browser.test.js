@@ -372,10 +372,68 @@ async function run() {
         cdp,
         startupPage.sessionId,
         "!document.querySelector('#play-button').disabled && document.querySelectorAll('.track-row').length === 3",
-        ),
+      ),
       "playback readiness after initial project load",
+      60_000,
     );
     await cdp.send("Target.closeTarget", { targetId: startupPage.targetId });
+    const longProjectPage = await openPageWithScript(cdp, appUrl, `(() => {
+      const originalFetch = window.fetch;
+      window.__spectrumStarts = [];
+      window.fetch = async function fetch(resource, options) {
+        if (resource === '/api/project') {
+          const response = await originalFetch(resource, options);
+          const project = await response.json();
+          project.duration = 65;
+          return new Response(JSON.stringify(project), {
+            status: response.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (typeof resource === 'string' && resource.startsWith('/api/track-spectrum/')) {
+          const parts = resource.split('/');
+          const startMilliseconds = Number(parts[5]);
+          const requestedMilliseconds = Number(parts[6]);
+          const durationMilliseconds = Math.min(64000, requestedMilliseconds);
+          const project = await originalFetch('/api/project').then((response) => response.json());
+          const frameSamples = 1470;
+          const sampleRate = 44100;
+          const frameCount = Math.ceil(durationMilliseconds / 1000 * sampleRate / frameSamples);
+          const trackCount = project.tracks.length;
+          const buffer = new ArrayBuffer(32 + trackCount * 8 + frameCount * trackCount * 8);
+          const bytes = new Uint8Array(buffer);
+          const view = new DataView(buffer);
+          bytes.set([...'DAWSPEC1'].map((character) => character.charCodeAt(0)));
+          view.setUint32(8, trackCount, true);
+          view.setUint32(12, frameCount, true);
+          view.setBigUint64(16, BigInt(startMilliseconds), true);
+          view.setUint32(24, frameSamples, true);
+          view.setUint32(28, sampleRate, true);
+          project.tracks.forEach((track, index) => view.setBigUint64(32 + index * 8, BigInt(track.id), true));
+          window.__spectrumStarts.push(startMilliseconds);
+          return new Response(buffer, {
+            status: 200,
+            headers: { 'Content-Type': 'application/vnd.daw-ai.track-spectrum' },
+          });
+        }
+        return originalFetch(resource, options);
+      };
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        longProjectPage.sessionId,
+        `!document.querySelector('#play-button').disabled && window.__spectrumStarts.length === 2`,
+      ),
+      "playback readiness for a project longer than one spectrum window",
+      10_000,
+    );
+    assert.deepEqual(
+      await evaluate(cdp, longProjectPage.sessionId, "window.__spectrumStarts"),
+      [0, 64000],
+      "long projects must prepare consecutive spectrum windows",
+    );
+    await cdp.send("Target.closeTarget", { targetId: longProjectPage.targetId });
     const appSession = await openPage(cdp, appUrl);
     const consoleErrors = [];
     cdp.on("Runtime.consoleAPICalled", (message) => {
@@ -388,6 +446,18 @@ async function run() {
     await waitFor(
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.track-row').length === 3"),
       "initial arrangement",
+    );
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `performance.getEntriesByType('resource').some(
+            (entry) => entry.name.includes('/api/track-spectrum/')
+          )`,
+        ),
+      "complete analyzer timeline before playback",
+      60_000,
     );
     const timelineMidi = await evaluate(cdp, appSession, `(async () => {
         const project = await fetch('/api/project').then((response) => response.json());
@@ -763,6 +833,11 @@ async function run() {
       ),
       "restored timeline duration",
     );
+    await waitFor(
+      async () => evaluate(cdp, appSession, "!document.querySelector('#play-button').disabled"),
+      "spectrum readiness after duration restore",
+      60_000,
+    );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
       async () => evaluate(cdp, appSession, `(() => {
@@ -1050,10 +1125,22 @@ async function run() {
       document.querySelector('#prompt-input').value = '';
     })()`);
 
+    await waitFor(
+      async () => evaluate(cdp, appSession, "!document.querySelector('#play-button').disabled"),
+      "spectrum readiness before prompted-edit playback",
+      60_000,
+    );
+
     await evaluate(cdp, appSession, `(() => {
       const originalPlay = HTMLMediaElement.prototype.play;
       window.__transportMedia = null;
       window.__transportPlayCalls = [];
+      window.__playbackFrames = [];
+      const samplePlaybackFrame = (timestamp) => {
+        window.__playbackFrames.push(timestamp);
+        if (window.__playbackFrames.length < 180) requestAnimationFrame(samplePlaybackFrame);
+      };
+      requestAnimationFrame(samplePlaybackFrame);
       HTMLMediaElement.prototype.play = function play(...args) {
         if (window.__transportMedia === null) window.__transportMedia = this;
         window.__transportPlayCalls.push({
@@ -1113,8 +1200,145 @@ async function run() {
             (bar) => Number.parseFloat(bar.style.getPropertyValue('--spectrum-level')) > 0.01
           )`,
         ),
-      "track FFT response to backend stem audio",
+      "track response to backend spectrum timeline",
       30_000,
+    );
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__playbackFrames.length >= 60"),
+      "playback frame timing sample",
+    );
+    const playbackVisualTiming = await evaluate(cdp, appSession, `(() => ({
+      maximumFrameGap: Math.max(...window.__playbackFrames.slice(1).map(
+        (timestamp, index) => timestamp - window.__playbackFrames[index]
+      )),
+      maximumSpectrumLevel: Math.max(...[...document.querySelectorAll('.track-spectrum i')].map(
+        (bar) => Number.parseFloat(bar.style.getPropertyValue('--spectrum-level')) || 0
+      )),
+    }))()`);
+    assert.ok(
+      playbackVisualTiming.maximumFrameGap < 100,
+      `playback visuals must not block the UI thread (${playbackVisualTiming.maximumFrameGap} ms gap)`,
+    );
+    assert.ok(
+      playbackVisualTiming.maximumSpectrumLevel > 0.1,
+      `spectrum magnitude must remain legible (${playbackVisualTiming.maximumSpectrumLevel})`,
+    );
+    await evaluate(cdp, appSession, "new Promise((resolve) => setTimeout(resolve, 1500))");
+    for (const handoffTime of [15, 30]) {
+      const handoffRequestBaseline = await evaluate(cdp, appSession, "performance.now()");
+      await evaluate(cdp, appSession, `(() => {
+        window.__handoffFrames = [];
+        window.__handoffSpectrumStart = Number(document.querySelector('#track-rows').dataset.spectrumFrame || 0);
+        const sample = (timestamp) => {
+          window.__handoffFrames.push(timestamp);
+          if (window.__handoffFrames.length < 60) requestAnimationFrame(sample);
+        };
+        requestAnimationFrame(sample);
+        const lane = document.querySelector('.track-lane');
+        lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true }));
+        for (let index = 0; index < ${handoffTime * 4}; index += 1) {
+          lane.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'ArrowRight', bubbles: true, cancelable: true,
+          }));
+        }
+      })()`);
+      await waitFor(
+        async () => evaluate(
+          cdp,
+          appSession,
+          `document.documentElement.dataset.audioState === 'playing' &&
+            document.querySelector('#current-time').textContent.startsWith('${Math.floor(handoffTime / 60)}:${String(handoffTime % 60).padStart(2, "0")}') &&
+            window.__handoffFrames.length >= 60 &&
+            Number(document.querySelector('#track-rows').dataset.spectrumFrame || 0) >=
+              window.__handoffSpectrumStart + 4`,
+        ),
+        `continuous analyzer spectrum handoff at ${handoffTime} seconds`,
+        30_000,
+      ).catch(async (error) => {
+        const diagnostics = await evaluate(cdp, appSession, `({
+          audioState: document.documentElement.dataset.audioState,
+          mediaTime: window.__transportMedia.currentTime,
+          displayedTime: document.querySelector('#current-time').textContent,
+          spectrumFrame: document.querySelector('#track-rows').dataset.spectrumFrame,
+          spectrumStart: window.__handoffSpectrumStart,
+          spectrumCoverage: document.querySelector('#track-rows').dataset.spectrumCoverage,
+          animationFrames: window.__handoffFrames.length,
+          issues: document.querySelector('#debug-report').value,
+        })`);
+        throw new Error(`${error.message}: ${JSON.stringify(diagnostics)}`);
+      });
+      const handoff = await evaluate(cdp, appSession, `({
+        spectrumFrames: Number(document.querySelector('#track-rows').dataset.spectrumFrame || 0) -
+          window.__handoffSpectrumStart,
+        maximumFrameGap: Math.max(...window.__handoffFrames.slice(1).map(
+          (timestamp, index) => timestamp - window.__handoffFrames[index]
+        )),
+      })`);
+      assert.ok(handoff.spectrumFrames >= 4, `analyzer must keep updating through handoff (${handoff.spectrumFrames})`);
+      assert.ok(handoff.maximumFrameGap < 100, `handoff must not block UI (${handoff.maximumFrameGap} ms)`);
+      const newSpectrumRequests = await evaluate(
+          cdp,
+          appSession,
+          `performance.getEntriesByType('resource').filter(
+            (entry) => entry.name.includes('/api/track-spectrum/') &&
+              entry.startTime >= ${handoffRequestBaseline}
+          ).map((entry) => entry.name)`,
+        );
+      assert.equal(
+        newSpectrumRequests.length,
+        0,
+        `timeline traversal must not request another spectrum render (${JSON.stringify(newSpectrumRequests)})`,
+      );
+      assert.ok(
+        await evaluate(
+          cdp,
+          appSession,
+          "Number(document.querySelector('#track-rows').dataset.spectrumLagMs) <= 75",
+        ),
+        "displayed spectrum frames must stay synchronized to the audible media clock",
+      );
+    }
+    await evaluate(cdp, appSession, "new Promise((resolve) => setTimeout(resolve, 1500))");
+    const rewindCacheBaseline = await evaluate(cdp, appSession, `({
+      requestBaseline: performance.now(),
+      spectrumFrames: Number(document.querySelector('#track-rows').dataset.spectrumFrame || 0),
+    })`);
+    await evaluate(cdp, appSession, "document.querySelector('#rewind-button').click()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.documentElement.dataset.audioState === 'playing' &&
+          Number(document.querySelector('#current-time').textContent.slice(2)) < 2 &&
+          Number(document.querySelector('#track-rows').dataset.spectrumFrame || 0) >=
+            ${rewindCacheBaseline.spectrumFrames + 4}`,
+      ),
+      "cached analyzer playback after active rewind",
+      10_000,
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        `performance.getEntriesByType('resource').filter(
+          (entry) => entry.name.includes('/api/track-spectrum/') &&
+            entry.startTime >= ${rewindCacheBaseline.requestBaseline}
+        ).length`,
+      ),
+      0,
+      "rewind must reuse the cached opening spectrum without another render",
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        appSession,
+        `performance.getEntriesByType('resource').some(
+          (entry) => entry.name.includes('/api/track-spectrum/') &&
+            entry.name.endsWith('/${Math.ceil(durationBaseline.duration * 1000)}')
+        )`,
+      ),
+      true,
+      "playback must cache one complete spectrum timeline",
     );
     const promptSingleFlight = await evaluate(cdp, appSession, `(async () => {
       const originalFetch = window.fetch;
@@ -1985,12 +2209,13 @@ async function run() {
       const engine = source.slice(source.indexOf('class AudioEngine'), source.indexOf('const audio = new AudioEngine'));
       return {
         apiNoStore: source.includes('cache: "no-store"'),
-        audioContext: source.includes('AudioContext'),
+        backendSpectrumTimeline: engine.includes('/api/track-spectrum/') && engine.includes('this.media.currentTime'),
+        frontendWorkers: engine.includes('new Worker('),
         offlineContext: source.includes('OfflineAudioContext'),
         oscillator: source.includes('createOscillator'),
         backendEndpoint: source.includes('/api/audio-stream/'),
-        trackStemEndpoint: source.includes('/api/track-stems/'),
-        frequencyAnalyzer: engine.includes('createAnalyser') && engine.includes('getByteFrequencyData'),
+        trackSpectrumEndpoint: source.includes('/api/track-spectrum/'),
+        timestampedSpectrum: engine.includes('frameDuration') && engine.includes('projectTime'),
         mediaClock: engine.includes('media.currentTime'),
         performanceClock: engine.includes('performance.now'),
         prefetch: engine.includes('beginPrefetch'),
@@ -2002,12 +2227,13 @@ async function run() {
       clientAudioBoundary,
       {
         apiNoStore: true,
-        audioContext: true,
+        backendSpectrumTimeline: true,
+        frontendWorkers: false,
         offlineContext: false,
         oscillator: false,
         backendEndpoint: true,
-        trackStemEndpoint: true,
-        frequencyAnalyzer: true,
+        trackSpectrumEndpoint: true,
+        timestampedSpectrum: true,
         mediaClock: true,
         performanceClock: false,
         prefetch: false,
@@ -2037,7 +2263,22 @@ async function run() {
       ),
       "transport fixture synchronization",
     );
+    await waitFor(
+      async () => evaluate(cdp, appSession, "!document.querySelector('#play-button').disabled"),
+      "spectrum readiness after transport fixture synchronization",
+      60_000,
+    );
     await evaluate(cdp, appSession, "document.querySelector('#rewind-button').click()");
+    await evaluate(cdp, appSession, `(() => {
+      window.__playingEventSync = null;
+      window.__transportMedia.addEventListener('playing', () => {
+        window.__playingEventSync = {
+          mediaTime: window.__transportMedia.currentTime,
+          displayedTime: document.querySelector('#current-time').textContent,
+          state: document.documentElement.dataset.audioState,
+        };
+      }, { once: true });
+    })()`);
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
     await waitFor(
       async () => evaluate(
@@ -2047,6 +2288,13 @@ async function run() {
       ),
       "backend audio transport start",
       30_000,
+    );
+    const playingEventSync = await evaluate(cdp, appSession, "window.__playingEventSync");
+    assert.equal(playingEventSync.state, "playing", "the transport must start on the media playing event");
+    assert.match(playingEventSync.displayedTime, /^0:00\./);
+    assert.ok(
+      Math.abs(Number(playingEventSync.displayedTime.slice(2)) - playingEventSync.mediaTime) < 0.1,
+      "the displayed playhead must use the media clock when audible playback starts",
     );
     const backendPlaybackTime = await evaluate(
       cdp,

@@ -590,7 +590,6 @@ main {
   height: max(1px, calc(var(--spectrum-level, 0) * 18px));
   border-radius: 1px;
   background: var(--track-color);
-  transition: height 120ms linear;
 }
 
 .track-meta strong,

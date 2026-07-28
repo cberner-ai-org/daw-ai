@@ -7,7 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +42,12 @@ const PLAYBACK_CHUNK_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 2;
 const AUDIO_STREAM_LOOKAHEAD_SAMPLES: usize = PLAYBACK_CHUNK_SAMPLES * 2;
 const TRACK_STEM_WINDOW_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 12;
 const TRACK_STEMS_MAGIC: &[u8; 8] = b"DAWSTEM1";
+const TRACK_SPECTRUM_MAGIC: &[u8; 8] = b"DAWSPEC1";
+const SPECTRUM_FFT_SAMPLES: usize = 1024;
+const SPECTRUM_FRAME_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize / 30;
+const SPECTRUM_BANDS: usize = 8;
+const MAX_TRACK_SPECTRUM_WINDOW_MS: u64 = 64_000;
+const SPECTRUM_RENDER_CHUNK_SAMPLES: usize = SPECTRUM_FRAME_SAMPLES * 60;
 const GEMINI_POLL_INTERVAL_MS: u64 = 1_000;
 const DEMO_POLL_INTERVAL_MS: u64 = 25;
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -144,6 +150,15 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
             if request.path.starts_with("/api/track-stems/") {
                 let cancellation_stream = stream.try_clone()?;
                 return scoped.write_track_stems_with_cancel(
+                    &request,
+                    stream,
+                    || stream_disconnected(&cancellation_stream),
+                    new_user_cookie.as_deref(),
+                );
+            }
+            if request.path.starts_with("/api/track-spectrum/") {
+                let cancellation_stream = stream.try_clone()?;
+                return scoped.write_track_spectrum_with_cancel(
                     &request,
                     stream,
                     || stream_disconnected(&cancellation_stream),
@@ -312,6 +327,7 @@ fn request_needs_user_scope(request: &Request) -> bool {
         || request.path.starts_with("/api/edit-operations/")
         || (request.path.starts_with("/api/audio-stream/") && request.user_id().is_some())
         || (request.path.starts_with("/api/track-stems/") && request.user_id().is_some())
+        || (request.path.starts_with("/api/track-spectrum/") && request.user_id().is_some())
 }
 
 fn expire_and_bound_user_cache(users: &mut HashMap<String, CachedUser>) {
@@ -750,7 +766,9 @@ impl Router {
                 .with_header("Allow", "GET")
                 .write(output);
         }
-        let Some((token, version, start_milliseconds)) = track_stems_stream(&request.path) else {
+        let Some((token, version, start_milliseconds, window_milliseconds)) =
+            track_stems_stream(&request.path)
+        else {
             return Response::json(404, error_json("track stems not found")).write(output);
         };
         if token != self.audio_token.as_str() || !request.is_trusted_request(public_host) {
@@ -772,7 +790,12 @@ impl Router {
             return Response::json(422, error_json("track stem start is outside the project"))
                 .write(output);
         }
-        let end_sample = (start_sample + TRACK_STEM_WINDOW_SAMPLES).min(project_end_sample);
+        let window_samples =
+            window_milliseconds.map_or(TRACK_STEM_WINDOW_SAMPLES, |milliseconds| {
+                audio_analysis::playback_start_sample_milliseconds(milliseconds.clamp(1, 12_000))
+                    .clamp(1, TRACK_STEM_WINDOW_SAMPLES)
+            });
+        let end_sample = (start_sample + window_samples).min(project_end_sample);
         let sample_count = end_sample - start_sample;
         let track_count = project.tracks.len();
         let chunk_count = sample_count.div_ceil(PLAYBACK_CHUNK_SAMPLES);
@@ -826,6 +849,112 @@ impl Router {
             cursor = end;
         }
         Ok(())
+    }
+
+    fn write_track_spectrum_with_cancel(
+        &self,
+        request: &Request,
+        output: &mut impl Write,
+        is_cancelled: impl Fn() -> bool,
+        set_cookie: Option<&str>,
+    ) -> io::Result<()> {
+        let Some(public_host) = request.public_host() else {
+            return Response::json(400, error_json("invalid host")).write(output);
+        };
+        let Some((token, version, start_milliseconds, window_milliseconds)) =
+            track_spectrum_stream(&request.path)
+        else {
+            return Response::json(404, error_json("track spectrum not found")).write(output);
+        };
+        if request.method != "GET" {
+            return Response::json(405, error_json("method not allowed"))
+                .with_header("Allow", "GET")
+                .write(output);
+        }
+        if token != self.audio_token.as_str() || !request.is_trusted_request(public_host) {
+            return Response::json(403, error_json("cross-origin audio request rejected"))
+                .write(output);
+        }
+        let project = self.lock_studio().project().clone();
+        if version != project.version {
+            return Response::json(
+                409,
+                error_json("project changed before spectrum was rendered"),
+            )
+            .write(output);
+        }
+        let start_sample = audio_analysis::playback_start_sample_milliseconds(start_milliseconds);
+        let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
+        if start_sample >= project_end_sample {
+            return Response::json(
+                422,
+                error_json("track spectrum start is outside the project"),
+            )
+            .write(output);
+        }
+        let window_samples = audio_analysis::playback_start_sample_milliseconds(
+            window_milliseconds
+                .unwrap_or(MAX_TRACK_SPECTRUM_WINDOW_MS)
+                .clamp(1, MAX_TRACK_SPECTRUM_WINDOW_MS),
+        );
+        let end_sample = (start_sample + window_samples).min(project_end_sample);
+        let frame_count = (end_sample - start_sample).div_ceil(SPECTRUM_FRAME_SAMPLES);
+        let mut body = Vec::with_capacity(
+            32 + project.tracks.len() * 8 + frame_count * project.tracks.len() * SPECTRUM_BANDS,
+        );
+        body.extend_from_slice(TRACK_SPECTRUM_MAGIC);
+        body.extend_from_slice(&(project.tracks.len() as u32).to_le_bytes());
+        body.extend_from_slice(&(frame_count as u32).to_le_bytes());
+        body.extend_from_slice(&start_milliseconds.to_le_bytes());
+        body.extend_from_slice(&(SPECTRUM_FRAME_SAMPLES as u32).to_le_bytes());
+        body.extend_from_slice(&audio_analysis::SAMPLE_RATE.to_le_bytes());
+        for track in &project.tracks {
+            body.extend_from_slice(&track.id.to_le_bytes());
+        }
+        let mut cursor = start_sample;
+        while cursor < end_sample {
+            if is_cancelled() {
+                return Ok(());
+            }
+            let chunk_end = (cursor + SPECTRUM_RENDER_CHUNK_SAMPLES).min(end_sample);
+            let render_start = cursor.saturating_sub(SPECTRUM_FFT_SAMPLES / 2);
+            let render_end = (chunk_end + SPECTRUM_FFT_SAMPLES / 2).min(project_end_sample);
+            let stems = match self.audio_renderer.stream_stems_sample_range(
+                &project,
+                render_start,
+                render_end,
+                &is_cancelled,
+            ) {
+                Ok(stems) => stems,
+                Err(AudioRenderError::Render(error)) => {
+                    eprintln!("error: could not render track spectrum: {error}");
+                    return Err(io::Error::other("could not render track spectrum"));
+                }
+                Err(AudioRenderError::Cancelled) => return Ok(()),
+            };
+            let chunk_frames = (chunk_end - cursor).div_ceil(SPECTRUM_FRAME_SAMPLES);
+            for frame in 0..chunk_frames {
+                let center = cursor - render_start + frame * SPECTRUM_FRAME_SAMPLES;
+                for (expected, (track_id, region)) in project.tracks.iter().zip(&stems) {
+                    if expected.id != *track_id {
+                        return Err(io::Error::other(
+                            "track spectrum order changed during render",
+                        ));
+                    }
+                    body.extend_from_slice(&spectrum_levels(&region.samples, center));
+                }
+            }
+            cursor = chunk_end;
+        }
+        write_response_head(
+            output,
+            200,
+            "application/vnd.daw-ai.track-spectrum",
+            body.len(),
+            &[("Cache-Control", "no-store")],
+            set_cookie,
+        )?;
+        output.write_all(&body)
     }
 
     fn write_export(
@@ -2356,15 +2485,122 @@ fn playback_audio_stream(path: &str) -> Option<(&str, u64, u64)> {
     Some((token, version, start_milliseconds))
 }
 
-fn track_stems_stream(path: &str) -> Option<(&str, u64, u64)> {
+fn track_stems_stream(path: &str) -> Option<(&str, u64, u64, Option<u64>)> {
     let mut parts = path.strip_prefix("/api/track-stems/")?.split('/');
     let token = parts.next()?;
     let version = parts.next()?.parse::<u64>().ok()?;
     let start_milliseconds = parts.next()?.parse::<u64>().ok()?;
+    let window_milliseconds = parts.next().map(str::parse::<u64>).transpose().ok()?;
     if token.is_empty() || parts.next().is_some() {
         return None;
     }
-    Some((token, version, start_milliseconds))
+    Some((token, version, start_milliseconds, window_milliseconds))
+}
+
+fn track_spectrum_stream(path: &str) -> Option<(&str, u64, u64, Option<u64>)> {
+    let mut parts = path.strip_prefix("/api/track-spectrum/")?.split('/');
+    let token = parts.next()?;
+    let version = parts.next()?.parse::<u64>().ok()?;
+    let start_milliseconds = parts.next()?.parse::<u64>().ok()?;
+    let window_milliseconds = parts.next().map(str::parse::<u64>).transpose().ok()?;
+    if token.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some((token, version, start_milliseconds, window_milliseconds))
+}
+
+struct SpectrumFftTables {
+    bit_reversed: Vec<usize>,
+    window: Vec<f64>,
+    cosine: Vec<f64>,
+    sine: Vec<f64>,
+}
+
+fn spectrum_levels(samples: &[f32], center_frame: usize) -> [u8; SPECTRUM_BANDS] {
+    static TABLES: OnceLock<SpectrumFftTables> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        let bit_reversed = (0..SPECTRUM_FFT_SAMPLES)
+            .map(|index: usize| index.reverse_bits() >> (usize::BITS - 10))
+            .collect();
+        let window = (0..SPECTRUM_FFT_SAMPLES)
+            .map(|index| {
+                0.5 - 0.5
+                    * (2.0 * std::f64::consts::PI * index as f64
+                        / (SPECTRUM_FFT_SAMPLES - 1) as f64)
+                        .cos()
+            })
+            .collect();
+        let cosine = (0..SPECTRUM_FFT_SAMPLES / 2)
+            .map(|index| {
+                (-2.0 * std::f64::consts::PI * index as f64 / SPECTRUM_FFT_SAMPLES as f64).cos()
+            })
+            .collect();
+        let sine = (0..SPECTRUM_FFT_SAMPLES / 2)
+            .map(|index| {
+                (-2.0 * std::f64::consts::PI * index as f64 / SPECTRUM_FFT_SAMPLES as f64).sin()
+            })
+            .collect();
+        SpectrumFftTables {
+            bit_reversed,
+            window,
+            cosine,
+            sine,
+        }
+    });
+    let channel_fft = |channel: usize| {
+        let mut real = vec![0.0f64; SPECTRUM_FFT_SAMPLES];
+        let mut imaginary = vec![0.0f64; SPECTRUM_FFT_SAMPLES];
+        let start = center_frame as isize - (SPECTRUM_FFT_SAMPLES / 2) as isize;
+        for index in 0..SPECTRUM_FFT_SAMPLES {
+            let sample = start + index as isize;
+            if sample >= 0 {
+                let source = sample as usize * 2 + channel;
+                if source < samples.len() {
+                    real[tables.bit_reversed[index]] =
+                        samples[source] as f64 * tables.window[index];
+                }
+            }
+        }
+        let mut length = 2;
+        while length <= SPECTRUM_FFT_SAMPLES {
+            let table_step = SPECTRUM_FFT_SAMPLES / length;
+            for offset in (0..SPECTRUM_FFT_SAMPLES).step_by(length) {
+                for index in 0..length / 2 {
+                    let cosine = tables.cosine[index * table_step];
+                    let sine = tables.sine[index * table_step];
+                    let even = offset + index;
+                    let odd = even + length / 2;
+                    let odd_real = real[odd] * cosine - imaginary[odd] * sine;
+                    let odd_imaginary = real[odd] * sine + imaginary[odd] * cosine;
+                    real[odd] = real[even] - odd_real;
+                    imaginary[odd] = imaginary[even] - odd_imaginary;
+                    real[even] += odd_real;
+                    imaginary[even] += odd_imaginary;
+                }
+            }
+            length *= 2;
+        }
+        (0..SPECTRUM_FFT_SAMPLES / 2)
+            .map(|index| real[index].hypot(imaginary[index]) / (SPECTRUM_FFT_SAMPLES / 2) as f64)
+            .collect::<Vec<_>>()
+    };
+    let left = channel_fft(0);
+    let right = channel_fft(1);
+    let minimum = 40.0f64;
+    let maximum = audio_analysis::SAMPLE_RATE as f64 / 2.0;
+    std::array::from_fn(|band| {
+        let low_hz = minimum * (maximum / minimum).powf(band as f64 / SPECTRUM_BANDS as f64);
+        let high_hz = minimum * (maximum / minimum).powf((band + 1) as f64 / SPECTRUM_BANDS as f64);
+        let low_bin = ((low_hz / maximum * left.len() as f64).floor() as usize).max(1);
+        let high_bin = ((high_hz / maximum * left.len() as f64).ceil() as usize)
+            .max(low_bin + 1)
+            .min(left.len());
+        let sum = (low_bin..high_bin)
+            .map(|bin| (left[bin].powi(2) + right[bin].powi(2)) / 2.0)
+            .sum::<f64>();
+        let magnitude = (sum / (high_bin - low_bin) as f64).sqrt().max(1e-5);
+        (((20.0 * magnitude.log10() + 100.0) / 70.0).clamp(0.0, 1.0) * 255.0).round() as u8
+    })
 }
 
 fn edit_operation_id(path: &str) -> Option<&str> {
@@ -3752,6 +3988,44 @@ mod tests {
         }
         assert_eq!(offset, body.len());
         assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
+    }
+
+    #[test]
+    fn track_stem_paths_accept_an_optional_startup_window() {
+        assert_eq!(
+            track_stems_stream("/api/track-stems/token/42/1500"),
+            Some(("token", 42, 1500, None))
+        );
+        assert_eq!(
+            track_stems_stream("/api/track-stems/token/42/1500/4000"),
+            Some(("token", 42, 1500, Some(4000)))
+        );
+        assert!(track_stems_stream("/api/track-stems/token/42/1500/4000/extra").is_none());
+        assert_eq!(
+            track_spectrum_stream("/api/track-spectrum/token/42/1500/2000"),
+            Some(("token", 42, 1500, Some(2000)))
+        );
+        assert!(track_spectrum_stream("/api/track-spectrum/token/42/1500/nope").is_none());
+    }
+
+    #[test]
+    fn backend_spectrum_reports_audible_tone_energy() {
+        let frames = 2048;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for frame in 0..frames {
+            let sample = (2.0 * std::f32::consts::PI * 440.0 * frame as f32
+                / audio_analysis::SAMPLE_RATE as f32)
+                .sin()
+                * 0.25;
+            samples.extend_from_slice(&[sample, sample]);
+        }
+        assert!(
+            spectrum_levels(&samples, 1024)
+                .into_iter()
+                .max()
+                .unwrap_or(0)
+                > 128
+        );
     }
 
     #[test]
