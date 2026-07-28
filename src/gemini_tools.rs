@@ -2401,13 +2401,14 @@ fn normalize_effect_parameter_value(
     {
         return Ok(choice.to_string());
     }
-    if let Ok(number) = value.parse::<f32>()
-        && semantics
+    if let Ok(number) = value.parse::<f32>() {
+        if semantics
             .choices
             .iter()
             .any(|(choice, _)| (*choice - number).abs() < 0.000_001)
-    {
-        return Ok(number.to_string());
+        {
+            return Ok(number.to_string());
+        }
     }
     let choices = semantics
         .choices
