@@ -8,17 +8,9 @@ pre:
   node --check qa/browser.test.js
 
 test: pre
-  #!/usr/bin/env bash
-  set -eu
   cargo build
-  cargo test --all-targets --all-features &
-  rust_pid=$!
-  node qa/browser.test.js &
-  browser_pid=$!
-  status=0
-  wait "$rust_pid" || status=$?
-  wait "$browser_pid" || status=$?
-  exit "$status"
+  cargo test --all-targets --all-features
+  node qa/browser.test.js
 
 qa-browser-setup:
   node qa/browser.test.js --check-browser
