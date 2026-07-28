@@ -79,7 +79,7 @@
   const SLIM_PROMPT_STORAGE_KEY = "daw-ai.slim-prompt.v1";
   const DYNAMIC_TOOLS_STORAGE_KEY = "daw-ai.dynamic-tools.v1";
   const AUDIO_RETRY_DELAYS_MS = [250, 500, 1000];
-  const SPECTRUM_RETRY_DELAYS_MS = [1000, 3000, 10_000];
+  const SPECTRUM_WINDOW_SECONDS = 64;
   const AUDIO_SEEK_DEBOUNCE_MS = 200;
   const TOAST_DISMISS_MS = 4200;
   const ERROR_TOAST_DISMISS_MS = 60_000;
@@ -106,8 +106,6 @@
       this.spectrumWindows = [];
       this.spectrumLoading = false;
       this.spectrumRetryAfter = 0;
-      this.spectrumPreparationRetryTimer = null;
-      this.spectrumPreparationRetryAttempts = 0;
       this.analyzerTracks = [];
       this.analyzerFrame = null;
       this.analyzerGeneration = 0;
@@ -165,8 +163,6 @@
       window.clearTimeout(this.seekTimer);
       this.seekTimer = null;
       if (!this.project || !this.streamToken || this.playbackState !== "idle") return Promise.resolve();
-      window.clearTimeout(this.spectrumPreparationRetryTimer);
-      this.spectrumPreparationRetryTimer = null;
       this.cancelSpectrumLoad();
       if (this.playhead >= this.project.duration - 0.01) this.playhead = 0;
       this.playbackState = "starting";
@@ -209,10 +205,12 @@
       if (this.playbackState !== "starting") return;
       this.playbackState = "playing";
       this.updatePosition();
-      if (this.hasSpectrumAt(this.playhead)) {
+      const hasStartingSpectrum = this.hasSpectrumAt(this.audioStart);
+      if (hasStartingSpectrum) {
         this.startAnalyzers();
-      } else if (!this.spectrumLoading) {
-        void this.loadTrackSpectrum(this.project, this.playhead);
+      } else {
+        this.cancelSpectrumLoad();
+        void this.loadTrackSpectrum(this.project, this.spectrumRequestStart(this.audioStart));
       }
       this.tick();
       updateTransport();
@@ -244,6 +242,7 @@
       const wasActive = this.isActive;
       if (wasActive) this.stop(true);
       this.playhead = clamp(time, 0, this.project?.duration ?? 0);
+      this.audioStart = this.playhead;
       renderPlayhead();
       updateTransport();
       if (wasActive) {
@@ -328,7 +327,7 @@
           !spectrumWindow &&
           !this.spectrumLoading
         ) {
-          void this.loadTrackSpectrum(this.project, this.playhead);
+          void this.loadTrackSpectrum(this.project, this.spectrumRequestStart(this.playhead));
         } else if (!this.spectrumLoading &&
           spectrumWindow &&
           spectrumEnd < this.project.duration - 0.01 &&
@@ -359,7 +358,12 @@
         if (generation !== this.spectrumLoadGeneration || project.version !== this.project?.version) return false;
         const tracks = decoded.tracks;
         this.spectrumWindows = this.spectrumWindows.filter((window) => window.start !== start);
-        this.spectrumWindows.push({ start: decoded.start, duration: decoded.duration, tracks });
+        this.spectrumWindows.push({
+          version: project.version,
+          start: decoded.start,
+          duration: decoded.duration,
+          tracks,
+        });
         elements.trackRows.dataset.spectrumCoverage = `${decoded.start}:${decoded.start + decoded.duration}`;
         this.spectrumWindows.sort((left, right) => left.start - right.start);
         this.spectrumRetryAfter = 0;
@@ -386,23 +390,9 @@
       this.spectrumLoading = false;
     }
 
-    async prepareSpectrum(project, start) {
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        const loaded = await this.loadTrackSpectrum(project, start);
-        if (loaded === false || state.project?.version !== project.version) return false;
-        if (loaded !== null) return true;
-        if (this.isActive) return false;
-        await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
-      }
-      throw new Error("The spectrum window could not be prepared.");
-    }
-
     invalidateSpectrum() {
       this.spectrumLoadGeneration += 1;
       this.spectrumAbortController?.abort();
-      window.clearTimeout(this.spectrumPreparationRetryTimer);
-      this.spectrumPreparationRetryTimer = null;
-      this.spectrumPreparationRetryAttempts = 0;
       this.spectrumWindows = [];
       this.spectrumLoading = false;
       this.stopAnalyzers();
@@ -414,8 +404,16 @@
 
     spectrumWindowAt(time) {
       return this.spectrumWindows
-        .filter((window) => time >= window.start && time < window.start + window.duration)
+        .filter((window) =>
+          window.version === this.project?.version &&
+          time >= window.start &&
+          time < window.start + window.duration
+        )
         .at(-1) ?? null;
+    }
+
+    spectrumRequestStart(time) {
+      return Math.floor(Math.max(0, time) / SPECTRUM_WINDOW_SECONDS) * SPECTRUM_WINDOW_SECONDS;
     }
 
     decodeSpectrum(arrayBuffer) {
@@ -596,47 +594,8 @@
 
   function reconcilePlaybackReadiness() {
     const project = state.project;
-    const coverageTime = 0;
     elements.playButton.disabled = !project || !audio.streamToken;
-    window.clearTimeout(audio.spectrumPreparationRetryTimer);
-    audio.spectrumPreparationRetryTimer = null;
-    if (!project || !audio.streamToken) {
-      return Promise.resolve(false);
-    }
-    if (audio.hasSpectrumAt(coverageTime)) {
-      audio.spectrumPreparationRetryAttempts = 0;
-      return Promise.resolve(true);
-    }
-    if (state.promptPending) {
-      return Promise.resolve(false);
-    }
-    const version = project.version;
-    return audio.prepareSpectrum(project, coverageTime)
-      .then((prepared) => {
-        if (prepared === false || state.project?.version !== version) return false;
-        const ready = audio.hasSpectrumAt(coverageTime);
-        if (!ready) throw new Error("The spectrum window could not be prepared.");
-        audio.spectrumPreparationRetryAttempts = 0;
-        return true;
-      })
-      .catch((error) => {
-        if (state.project?.version === version) {
-          reportClientIssue("warning", error, "preparing track spectrum");
-          if (!audio.isActive) {
-            const attempt = audio.spectrumPreparationRetryAttempts;
-            const delay =
-              SPECTRUM_RETRY_DELAYS_MS[Math.min(attempt, SPECTRUM_RETRY_DELAYS_MS.length - 1)];
-            audio.spectrumPreparationRetryAttempts += 1;
-            audio.spectrumPreparationRetryTimer = window.setTimeout(() => {
-              audio.spectrumPreparationRetryTimer = null;
-              if (state.project?.version === version && !audio.isActive) {
-                void reconcilePlaybackReadiness();
-              }
-            }, delay);
-          }
-        }
-        return false;
-      });
+    return Promise.resolve(!elements.playButton.disabled);
   }
 
   function adoptProject(project) {
