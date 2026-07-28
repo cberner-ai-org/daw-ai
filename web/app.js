@@ -219,7 +219,6 @@
       if (preservePosition && this.playbackState !== "idle") this.updatePosition();
       this.playbackGeneration += 1;
       this.playbackState = "idle";
-      this.cancelSpectrumLoad();
       window.clearInterval(this.timer);
       this.timer = null;
       window.clearTimeout(this.retryTimer);
@@ -240,7 +239,10 @@
 
     seek(time) {
       const wasActive = this.isActive;
-      if (wasActive) this.stop(true);
+      if (wasActive) {
+        this.cancelSpectrumLoad();
+        this.stop(true);
+      }
       this.playhead = clamp(time, 0, this.project?.duration ?? 0);
       this.audioStart = this.playhead;
       renderPlayhead();
