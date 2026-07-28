@@ -1413,6 +1413,20 @@ async function run() {
       `spectrum magnitude must remain legible (${playbackVisualTiming.maximumSpectrumLevel})`,
     );
     await evaluate(cdp, appSession, "new Promise((resolve) => setTimeout(resolve, 1500))");
+    await evaluate(cdp, appSession, `(() => {
+      if (document.documentElement.dataset.audioState === 'idle') {
+        document.querySelector('#play-button').click();
+      }
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        "document.documentElement.dataset.audioState === 'playing'",
+      ),
+      "active playback after cold spectrum preparation",
+      30_000,
+    );
     for (const handoffTime of [15, 28]) {
       const handoffRequestBaseline = await evaluate(cdp, appSession, "performance.now()");
       await evaluate(cdp, appSession, `(() => {

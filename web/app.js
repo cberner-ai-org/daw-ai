@@ -110,7 +110,7 @@
       this.analyzerFrame = null;
       this.analyzerGeneration = 0;
       this.media.addEventListener("ended", () => {
-        if (this.isActive) this.stop(false);
+        if (this.isPlaying && this.media.ended) this.stop(false);
       });
       this.media.addEventListener("playing", () => this.handlePlaybackStarted());
       this.media.addEventListener("error", () => {

@@ -465,6 +465,16 @@ struct AudioRenderer {
     completed: Condvar,
 }
 
+struct AudioWaiter<'a> {
+    renderer: &'a AudioRenderer,
+    priority: AudioRenderPriority,
+    active: bool,
+}
+
+struct AudioRenderPermit<'a> {
+    renderer: &'a AudioRenderer,
+}
+
 #[derive(Debug)]
 enum AudioRenderError {
     Render(String),
@@ -477,7 +487,95 @@ enum AudioRenderPriority {
     Background,
 }
 
+impl AudioRenderState {
+    fn add_waiter(&mut self, priority: AudioRenderPriority) {
+        match priority {
+            AudioRenderPriority::Foreground => self.foreground_waiters += 1,
+            AudioRenderPriority::Background => self.background_waiters += 1,
+        }
+    }
+
+    fn remove_waiter(&mut self, priority: AudioRenderPriority) {
+        match priority {
+            AudioRenderPriority::Foreground => self.foreground_waiters -= 1,
+            AudioRenderPriority::Background => self.background_waiters -= 1,
+        }
+    }
+}
+
+impl Drop for AudioWaiter<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self
+            .renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.remove_waiter(self.priority);
+        self.renderer.completed.notify_all();
+    }
+}
+
+impl Drop for AudioRenderPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rendering = false;
+        self.renderer.completed.notify_all();
+    }
+}
+
 impl AudioRenderer {
+    // Queue state transitions happen under `state`; caller callbacks and rendering never do.
+    fn acquire(
+        &self,
+        priority: AudioRenderPriority,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Result<AudioRenderPermit<'_>, AudioRenderError> {
+        if is_cancelled() {
+            return Err(AudioRenderError::Cancelled);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.add_waiter(priority);
+        let mut waiter = AudioWaiter {
+            renderer: self,
+            priority,
+            active: true,
+        };
+        self.completed.notify_all();
+        loop {
+            drop(state);
+            if is_cancelled() {
+                return Err(AudioRenderError::Cancelled);
+            }
+            state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.rendering
+                && (priority == AudioRenderPriority::Foreground || state.foreground_waiters == 0)
+            {
+                state.rendering = true;
+                state.remove_waiter(priority);
+                waiter.active = false;
+                drop(state);
+                return Ok(AudioRenderPermit { renderer: self });
+            }
+            state = self
+                .completed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
     fn stream_sample_range(
         &self,
         project: &crate::model::Project,
@@ -521,61 +619,12 @@ impl AudioRenderer {
         priority: AudioRenderPriority,
         render: impl FnOnce(&crate::model::Project, usize, usize) -> Result<T, String>,
     ) -> Result<T, AudioRenderError> {
-        if is_cancelled() {
-            return Err(AudioRenderError::Cancelled);
-        }
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match priority {
-            AudioRenderPriority::Foreground => state.foreground_waiters += 1,
-            AudioRenderPriority::Background => state.background_waiters += 1,
-        }
-        self.completed.notify_all();
-        loop {
-            if is_cancelled() {
-                match priority {
-                    AudioRenderPriority::Foreground => state.foreground_waiters -= 1,
-                    AudioRenderPriority::Background => state.background_waiters -= 1,
-                }
-                self.completed.notify_all();
-                return Err(AudioRenderError::Cancelled);
-            }
-            if !state.rendering
-                && (priority == AudioRenderPriority::Foreground || state.foreground_waiters == 0)
-            {
-                state.rendering = true;
-                match priority {
-                    AudioRenderPriority::Foreground => state.foreground_waiters -= 1,
-                    AudioRenderPriority::Background => state.background_waiters -= 1,
-                }
-                break;
-            }
-            state = self
-                .completed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        drop(state);
+        let _permit = self.acquire(priority, is_cancelled)?;
 
         if is_cancelled() {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.rendering = false;
-            self.completed.notify_all();
             return Err(AudioRenderError::Cancelled);
         }
-        let rendered = render(project, start_sample, end_sample);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.rendering = false;
-        self.completed.notify_all();
-        rendered.map_err(AudioRenderError::Render)
+        render(project, start_sample, end_sample).map_err(AudioRenderError::Render)
     }
 }
 
@@ -4167,6 +4216,72 @@ mod tests {
             second.join().expect("cancelled stream thread"),
             Err(AudioRenderError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn panicking_render_releases_the_render_queue() {
+        let renderer = AudioRenderer::default();
+        let project = Project::demo();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = renderer.stream_region_with(
+                &project,
+                0,
+                1,
+                &|| false,
+                AudioRenderPriority::Foreground,
+                |_, _, _| -> Result<(), String> { panic!("simulated renderer panic") },
+            );
+        }));
+        assert!(panic.is_err());
+
+        assert!(matches!(
+            renderer.stream_region_with(
+                &project,
+                0,
+                1,
+                &|| false,
+                AudioRenderPriority::Foreground,
+                |_, _, _| Ok(())
+            ),
+            Ok(())
+        ));
+    }
+
+    #[test]
+    fn panicking_cancellation_check_releases_a_queued_waiter() {
+        let renderer = AudioRenderer::default();
+        let project = Project::demo();
+        renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rendering = true;
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let first_check = AtomicBool::new(true);
+            let _ = renderer.stream_region_with(
+                &project,
+                0,
+                1,
+                &|| {
+                    if first_check.swap(false, Ordering::SeqCst) {
+                        false
+                    } else {
+                        panic!("simulated cancellation panic")
+                    }
+                },
+                AudioRenderPriority::Background,
+                |_, _, _| Ok(()),
+            );
+        }));
+        assert!(panic.is_err());
+
+        let state = renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.background_waiters, 0);
     }
 
     #[test]
