@@ -270,7 +270,7 @@ fn parse_effect(
     let id = unique_id(effect, "id", ids, "effect")?;
     expect_type(effect, "effect")?;
     let name = limited_string(effect, "name", 1, 64)?;
-    if !is_effect_name(&name) {
+    if !crate::surge::is_headless_safe_effect(&name) {
         return Err(invalid(format!("unsupported effect: {name}")));
     }
     let parameters = object(field(effect, "parameters")?, "effect parameters")?;
@@ -1175,10 +1175,6 @@ fn effect_name(value: &str, allow_all: bool) -> Result<&'static str, ProjectFile
     }
 }
 
-fn is_effect_name(value: &str) -> bool {
-    crate::surge::effect_type_index(value).is_some()
-}
-
 fn expect_type(value: &Object, expected: &str) -> Result<(), ProjectFileError> {
     if string(value, "type")? == expected {
         Ok(())
@@ -1735,5 +1731,18 @@ mod tests {
             1,
         );
         assert!(parse_project(&source).is_err());
+    }
+
+    #[test]
+    fn rejects_headless_unsafe_effects_when_loading() {
+        for name in ["Audio Input", "Spring Reverb", "Tape", "Vocoder"] {
+            let source = project_with_eq().to_json().replacen(
+                "\"name\":\"EQ\"",
+                &format!("\"name\":\"{name}\""),
+                1,
+            );
+            let error = parse_project(&source).expect_err("headless unsafe effect");
+            assert!(error.to_string().contains("unsupported effect"));
+        }
     }
 }
