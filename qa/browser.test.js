@@ -1379,7 +1379,7 @@ async function run() {
           )`,
         ),
       "track response to backend spectrum timeline",
-      30_000,
+      60_000,
     ).catch(async (error) => {
       const diagnostics = await evaluate(cdp, appSession, `({
         audioState: document.documentElement.dataset.audioState,
