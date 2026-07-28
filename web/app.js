@@ -635,7 +635,6 @@
     renderRuler();
     renderTracks();
     audio.invalidateSpectrum();
-    void audio.loadTrackSpectrum(project, audio.spectrumRequestStart(audio.playhead));
     reconcilePlaybackReadiness();
     renderSelection();
     renderPlayhead();

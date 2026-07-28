@@ -394,12 +394,12 @@ async function run() {
         playbackPriorityPage.sessionId,
         `!document.querySelector('#play-button').disabled`,
       ),
-      "playback readiness during spectrum prefetch",
+      "playback readiness before spectrum rendering",
     );
     assert.equal(
       await evaluate(cdp, playbackPriorityPage.sessionId, "window.__playbackDrivenSpectrumPending"),
-      true,
-      "the opening spectrum must begin warming when the project is adopted",
+      false,
+      "adopting a project must not start a cold spectrum render",
     );
     await evaluate(cdp, playbackPriorityPage.sessionId, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -409,7 +409,7 @@ async function run() {
         `document.documentElement.dataset.audioState === 'playing' &&
           window.__playbackDrivenSpectrumPending`,
       ),
-      "playback while the opening spectrum is still warming",
+      "playback-driven opening spectrum render",
       30_000,
     );
     await cdp.send("Target.closeTarget", { targetId: playbackPriorityPage.targetId });
@@ -431,9 +431,9 @@ async function run() {
       async () => evaluate(
         cdp,
         degradedSpectrumPage.sessionId,
-        `!document.querySelector('#play-button').disabled && window.__failedSpectrumRequests >= 1`,
+        `!document.querySelector('#play-button').disabled && window.__failedSpectrumRequests === 0`,
       ),
-      "transport readiness while spectrum warming is degraded",
+      "transport readiness without a cold spectrum warmup",
     );
     await evaluate(cdp, degradedSpectrumPage.sessionId, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -497,9 +497,9 @@ async function run() {
       async () => evaluate(
         cdp,
         longProjectPage.sessionId,
-        `!document.querySelector('#play-button').disabled && window.__spectrumStarts.length === 1`,
+        `!document.querySelector('#play-button').disabled && window.__spectrumStarts.length === 0`,
       ),
-      "opening spectrum warmup for a project longer than one window",
+      "long-project readiness without a cold spectrum warmup",
       10_000,
     );
     await evaluate(cdp, longProjectPage.sessionId, "document.querySelector('#play-button').click()");
@@ -555,9 +555,9 @@ async function run() {
         cdp,
         stalePrefetchPage.sessionId,
         `!document.querySelector('#play-button').disabled &&
-          JSON.stringify(window.__staleSpectrumStarts) === '[0]'`,
+          window.__staleSpectrumStarts.length === 0`,
       ),
-      "opening spectrum request before a distant seek",
+      "readiness before a distant seek without a spectrum render",
     );
     await evaluate(cdp, stalePrefetchPage.sessionId, `(() => {
       const lane = document.querySelector('.track-lane');
@@ -573,9 +573,9 @@ async function run() {
       async () => evaluate(
         cdp,
         stalePrefetchPage.sessionId,
-        "window.__staleSpectrumStarts.at(-1) === 64000",
+        "JSON.stringify(window.__staleSpectrumStarts) === '[64000]'",
       ),
-      "replacement spectrum request for distant playback",
+      "first spectrum request for distant playback",
     ).catch(async (error) => {
       const diagnostics = await evaluate(cdp, stalePrefetchPage.sessionId, `({
         audioState: document.documentElement.dataset.audioState,
@@ -643,9 +643,9 @@ async function run() {
       async () => evaluate(
         cdp,
         delayedPrefetchPage.sessionId,
-        `!document.querySelector('#play-button').disabled && window.__spectrumRequestCount === 1`,
+        `!document.querySelector('#play-button').disabled && window.__spectrumRequestCount === 0`,
       ),
-      "playback readiness after opening spectrum prefetch",
+      "playback readiness without an opening spectrum render",
     );
     await evaluate(cdp, delayedPrefetchPage.sessionId, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -689,14 +689,14 @@ async function run() {
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.track-row').length === 3"),
       "initial arrangement",
     );
-    await waitFor(
-      async () => evaluate(
+    assert.equal(
+      await evaluate(
         cdp,
         appSession,
-        "document.querySelector('#track-rows').dataset.spectrumCoverage !== undefined",
+        "document.querySelector('#track-rows').dataset.spectrumCoverage",
       ),
-      "opening analyzer window warmup",
-      60_000,
+      undefined,
+      "initial project adoption must not start a cold analyzer render",
     );
     const timelineMidi = await evaluate(cdp, appSession, `(async () => {
         const project = await fetch('/api/project').then((response) => response.json());
@@ -1513,6 +1513,18 @@ async function run() {
       30_000,
     );
     for (const handoffTime of [15, 28]) {
+      if (await evaluate(cdp, appSession, "document.documentElement.dataset.audioState === 'idle'")) {
+        await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
+        await waitFor(
+          async () => evaluate(
+            cdp,
+            appSession,
+            "document.documentElement.dataset.audioState === 'playing'",
+          ),
+          "playback restart before analyzer handoff",
+          30_000,
+        );
+      }
       const handoffRequestBaseline = await evaluate(cdp, appSession, "performance.now()");
       await evaluate(cdp, appSession, `(() => {
         window.__handoffFrames = [];
