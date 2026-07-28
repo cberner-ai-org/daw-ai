@@ -380,10 +380,17 @@ async function run() {
     const playbackPriorityPage = await openPageWithScript(cdp, appUrl, `(() => {
       const originalFetch = window.fetch;
       window.__playbackDrivenSpectrumPending = false;
+      window.__playbackDrivenSpectrumAborts = 0;
       window.fetch = function fetch(resource, options) {
         if (typeof resource === 'string' && resource.startsWith('/api/track-spectrum/')) {
           window.__playbackDrivenSpectrumPending = true;
-          return new Promise(() => {});
+          return new Promise((resolve, reject) => {
+            options?.signal?.addEventListener('abort', () => {
+              window.__playbackDrivenSpectrumPending = false;
+              window.__playbackDrivenSpectrumAborts += 1;
+              reject(new DOMException('Spectrum request replaced', 'AbortError'));
+            }, { once: true });
+          });
         }
         return originalFetch(resource, options);
       };
@@ -411,6 +418,18 @@ async function run() {
       ),
       "playback-driven opening spectrum render",
       30_000,
+    );
+    await evaluate(cdp, playbackPriorityPage.sessionId, `(() => {
+      document.querySelector('#play-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        playbackPriorityPage.sessionId,
+        "window.__playbackDrivenSpectrumAborts === 1",
+      ),
+      "stale spectrum cancellation before replay",
     );
     await cdp.send("Target.closeTarget", { targetId: playbackPriorityPage.targetId });
     const degradedSpectrumPage = await openPageWithScript(cdp, appUrl, `(() => {

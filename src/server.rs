@@ -981,12 +981,15 @@ impl Router {
         let end_sample = (start_sample + window_samples).min(project_end_sample);
         let frame_count = (end_sample - start_sample).div_ceil(SPECTRUM_FRAME_SAMPLES);
         let cache_path = self.spectrum_cache_path(start_milliseconds, window_samples as u64);
-        let cache_guard = self
-            .spectrum_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(path) = &cache_path {
-            if let Ok(cached) = fs::read(path) {
+            let cached = {
+                let _cache_guard = self
+                    .spectrum_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                fs::read(path)
+            };
+            if let Ok(cached) = cached {
                 let expected_length = 8usize
                     .saturating_add(32)
                     .saturating_add(project.tracks.len().saturating_mul(8))
@@ -999,7 +1002,6 @@ impl Router {
                     && cached[..8] == version.to_le_bytes()
                     && cached[8..16] == *TRACK_SPECTRUM_MAGIC
                 {
-                    drop(cache_guard);
                     write_response_head(
                         output,
                         200,
@@ -1060,6 +1062,10 @@ impl Router {
             cursor = chunk_end;
         }
         if let Some(path) = &cache_path {
+            let _cache_guard = self
+                .spectrum_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut cached = Vec::with_capacity(8 + body.len());
             cached.extend_from_slice(&version.to_le_bytes());
             cached.extend_from_slice(&body);
@@ -1067,7 +1073,6 @@ impl Router {
                 eprintln!("warning: could not persist track spectrum cache: {error}");
             }
         }
-        drop(cache_guard);
         write_response_head(
             output,
             200,
@@ -4208,6 +4213,32 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .rendering = true;
+        let cold_router = router.clone();
+        let cold_path = format!(
+            "/api/track-spectrum/test-audio-token/{}/100",
+            project.version
+        );
+        let cold = thread::spawn(move || {
+            let mut response = Vec::new();
+            cold_router.write_track_spectrum_with_cancel(
+                &request("GET", &cold_path, ""),
+                &mut response,
+                || false,
+                None,
+            )
+        });
+        let state = router
+            .audio_renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            router
+                .audio_renderer
+                .completed
+                .wait_while(state, |state| state.background_waiters == 0)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         let mut second = Vec::new();
         router
             .write_track_spectrum_with_cancel(
@@ -4219,7 +4250,27 @@ mod tests {
             .expect("cached spectrum response");
         assert_eq!(first, second);
 
+        let mut state = router
+            .audio_renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rendering = false;
+        drop(state);
+        router.audio_renderer.completed.notify_all();
+        cold.join()
+            .expect("cold spectrum worker")
+            .expect("unrelated cold spectrum response");
+
         fs::remove_file(cache_path).expect("remove spectrum cache");
+        let cold_cache_path = router
+            .spectrum_cache_path(
+                100,
+                audio_analysis::playback_start_sample_milliseconds(MAX_TRACK_SPECTRUM_WINDOW_MS)
+                    as u64,
+            )
+            .expect("cold spectrum cache path");
+        fs::remove_file(cold_cache_path).expect("remove cold spectrum cache");
         fs::remove_file(project_path).expect("remove project fixture");
     }
 
