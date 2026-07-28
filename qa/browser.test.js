@@ -1313,12 +1313,14 @@ async function run() {
       const originalPlay = HTMLMediaElement.prototype.play;
       window.__transportMedia = null;
       window.__transportPlayCalls = [];
-      window.__playbackFrames = [];
-      const samplePlaybackFrame = (timestamp) => {
-        window.__playbackFrames.push(timestamp);
-        if (window.__playbackFrames.length < 180) requestAnimationFrame(samplePlaybackFrame);
+      window.__startPlaybackFrameSample = () => {
+        window.__playbackFrames = [];
+        const samplePlaybackFrame = (timestamp) => {
+          window.__playbackFrames.push(timestamp);
+          if (window.__playbackFrames.length < 180) requestAnimationFrame(samplePlaybackFrame);
+        };
+        requestAnimationFrame(samplePlaybackFrame);
       };
-      requestAnimationFrame(samplePlaybackFrame);
       HTMLMediaElement.prototype.play = function play(...args) {
         if (window.__transportMedia === null) window.__transportMedia = this;
         window.__transportPlayCalls.push({
@@ -1374,11 +1376,9 @@ async function run() {
         evaluate(
           cdp,
           appSession,
-          `[...document.querySelectorAll('.track-spectrum i')].some(
-            (bar) => Number.parseFloat(bar.style.getPropertyValue('--spectrum-level')) > 0.01
-          )`,
+          "document.querySelector('#track-rows').dataset.spectrumCoverage !== undefined",
         ),
-      "track response to backend spectrum timeline",
+      "backend spectrum timeline",
       60_000,
     ).catch(async (error) => {
       const diagnostics = await evaluate(cdp, appSession, `({
@@ -1392,6 +1392,32 @@ async function run() {
       })`);
       throw new Error(`${error.message}: ${JSON.stringify(diagnostics)}`);
     });
+    await evaluate(cdp, appSession, `(() => {
+      if (document.documentElement.dataset.audioState === 'idle') {
+        document.querySelector('#play-button').click();
+      }
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        "document.documentElement.dataset.audioState === 'playing'",
+      ),
+      "active playback with loaded spectrum",
+      30_000,
+    );
+    await evaluate(cdp, appSession, "window.__startPlaybackFrameSample()");
+    await waitFor(
+      async () =>
+        evaluate(
+          cdp,
+          appSession,
+          `[...document.querySelectorAll('.track-spectrum i')].some(
+            (bar) => Number.parseFloat(bar.style.getPropertyValue('--spectrum-level')) > 0.01
+          )`,
+        ),
+      "track response to backend spectrum timeline",
+    );
     await waitFor(
       async () => evaluate(cdp, appSession, "window.__playbackFrames.length >= 60"),
       "playback frame timing sample",
