@@ -408,14 +408,19 @@ async function run() {
       async () => evaluate(
         cdp,
         playbackPriorityPage.sessionId,
-        `!document.querySelector('#play-button').disabled`,
+        `!document.querySelector('#play-button').disabled &&
+          window.__playbackDrivenSpectrumPending`,
       ),
-      "playback readiness before spectrum rendering",
+      "proactive spectrum rendering after project load",
     );
     assert.equal(
-      await evaluate(cdp, playbackPriorityPage.sessionId, "window.__playbackDrivenSpectrumPending"),
-      false,
-      "adopting a project must not start a cold spectrum render",
+      await evaluate(
+        cdp,
+        playbackPriorityPage.sessionId,
+        "document.querySelectorAll('.track-spectrum.is-loading[aria-busy=\"true\"]').length",
+      ),
+      3,
+      "cold analyzers must display their loading state",
     );
     await evaluate(cdp, playbackPriorityPage.sessionId, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -423,9 +428,10 @@ async function run() {
         cdp,
         playbackPriorityPage.sessionId,
         `document.documentElement.dataset.audioState === 'playing' &&
-          window.__playbackDrivenSpectrumPending`,
+          window.__playbackDrivenSpectrumPending &&
+          window.__playbackDrivenSpectrumAborts === 1`,
       ),
-      "playback-driven opening spectrum render",
+      "playback replacement of proactive spectrum render",
       30_000,
     );
     await evaluate(cdp, playbackPriorityPage.sessionId, `(() => {
@@ -436,7 +442,7 @@ async function run() {
       async () => evaluate(
         cdp,
         playbackPriorityPage.sessionId,
-        "window.__playbackDrivenSpectrumAborts === 1",
+        "window.__playbackDrivenSpectrumAborts === 2",
       ),
       "stale spectrum cancellation before replay",
     );
@@ -459,9 +465,22 @@ async function run() {
       async () => evaluate(
         cdp,
         degradedSpectrumPage.sessionId,
-        `!document.querySelector('#play-button').disabled && window.__failedSpectrumRequests === 0`,
+        `!document.querySelector('#play-button').disabled &&
+          window.__failedSpectrumRequests >= 1 &&
+          document.querySelectorAll(
+            '.track-spectrum[data-state="unavailable"][aria-busy="false"]:not(.is-loading)'
+          ).length === 3`,
       ),
-      "transport readiness without a cold spectrum warmup",
+      "transport readiness with a failed proactive spectrum warmup",
+    );
+    assert.equal(
+      await evaluate(
+        cdp,
+        degradedSpectrumPage.sessionId,
+        "document.querySelectorAll('.track-spectrum.is-loading[aria-busy=\"true\"]').length",
+      ),
+      0,
+      "settled failed warmup must not leave analyzers visibly busy",
     );
     await evaluate(cdp, degradedSpectrumPage.sessionId, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -525,9 +544,9 @@ async function run() {
       async () => evaluate(
         cdp,
         longProjectPage.sessionId,
-        `!document.querySelector('#play-button').disabled && window.__spectrumStarts.length === 0`,
+        `!document.querySelector('#play-button').disabled && window.__spectrumStarts.length === 1`,
       ),
-      "long-project readiness without a cold spectrum warmup",
+      "long-project proactive opening spectrum warmup",
       10_000,
     );
     await evaluate(cdp, longProjectPage.sessionId, "document.querySelector('#play-button').click()");
@@ -537,7 +556,7 @@ async function run() {
         longProjectPage.sessionId,
         `document.documentElement.dataset.audioState === 'playing' && window.__spectrumStarts.length === 1`,
       ),
-      "opening spectrum window after long-project playback starts",
+      "cached opening spectrum after long-project playback starts",
       30_000,
     );
     assert.deepEqual(
@@ -583,9 +602,9 @@ async function run() {
         cdp,
         stalePrefetchPage.sessionId,
         `!document.querySelector('#play-button').disabled &&
-          window.__staleSpectrumStarts.length === 0`,
+          JSON.stringify(window.__staleSpectrumStarts) === '[0]'`,
       ),
-      "readiness before a distant seek without a spectrum render",
+      "readiness after proactive opening spectrum render",
     );
     await evaluate(cdp, stalePrefetchPage.sessionId, `(() => {
       const lane = document.querySelector('.track-lane');
@@ -601,7 +620,7 @@ async function run() {
       async () => evaluate(
         cdp,
         stalePrefetchPage.sessionId,
-        "JSON.stringify(window.__staleSpectrumStarts) === '[64000]'",
+        "JSON.stringify(window.__staleSpectrumStarts) === '[0,64000]'",
       ),
       "first spectrum request for distant playback",
     ).catch(async (error) => {
@@ -677,9 +696,9 @@ async function run() {
       async () => evaluate(
         cdp,
         delayedPrefetchPage.sessionId,
-        `!document.querySelector('#play-button').disabled && window.__spectrumRequestCount === 0`,
+        `!document.querySelector('#play-button').disabled && window.__spectrumRequestCount === 1`,
       ),
-      "playback readiness without an opening spectrum render",
+      "playback readiness with proactive opening spectrum render",
     );
     await evaluate(cdp, delayedPrefetchPage.sessionId, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -735,14 +754,14 @@ async function run() {
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.track-row').length === 3"),
       "initial arrangement",
     );
-    assert.equal(
-      await evaluate(
+    await waitFor(
+      async () => evaluate(
         cdp,
         appSession,
-        "document.querySelector('#track-rows').dataset.spectrumCoverage",
+        `document.querySelector('.track-spectrum[data-state="loading"]') !== null ||
+          document.querySelector('#track-rows').dataset.spectrumCoverage !== undefined`,
       ),
-      undefined,
-      "initial project adoption must not start a cold analyzer render",
+      "initial project proactive analyzer request",
     );
     const timelineMidi = await evaluate(cdp, appSession, `(async () => {
         const project = await fetch('/api/project').then((response) => response.json());
@@ -779,7 +798,7 @@ async function run() {
             label: "Drop",
             prompt: "Turn this section into a classic dubstep drop. It builds in speed and intensity for the first 80%, then the drop, and then the outro into the rest of the track",
           },
-          { label: "warm", prompt: "Make the chords warm and spacious, and this section relaxing" },
+          { label: "Warm", prompt: "Make the chords warm and spacious, and this section relaxing" },
         ],
       },
       "history and prompt suggestions",
@@ -858,8 +877,13 @@ async function run() {
         source: `(() => {
           const originalFetch = window.fetch;
           window.__reloadPollCount = 0;
+          window.__reloadSpectrumRequests = 0;
           window.__releaseReloadJob = false;
           window.fetch = function fetch(resource, options) {
+            if (typeof resource === 'string' && resource.startsWith('/api/track-spectrum/')) {
+              window.__reloadSpectrumRequests += 1;
+              return originalFetch(resource, options);
+            }
             if (resource !== '/api/edits/reload-job') return originalFetch(resource, options);
             window.__reloadPollCount += 1;
             const job = window.__releaseReloadJob
@@ -908,6 +932,11 @@ async function run() {
       ),
       "pending edit recovery after page reload",
     );
+    assert.equal(
+      await evaluate(cdp, appSession, "window.__reloadSpectrumRequests"),
+      0,
+      "page load must defer proactive spectrum rendering while an AI edit is active",
+    );
     await evaluate(cdp, appSession, "window.__releaseReloadJob = true");
     await waitFor(
       async () => evaluate(
@@ -919,6 +948,11 @@ async function run() {
           localStorage.getItem('daw-ai.pending-edit.v1') === null`,
       ),
       "resumed edit terminal cleanup",
+    );
+    await waitFor(
+      async () => evaluate(cdp, appSession, "window.__reloadSpectrumRequests >= 1"),
+      "proactive spectrum rendering after resumed edit cleanup",
+      30_000,
     );
     await waitFor(
       async () => evaluate(cdp, appSession, "!document.querySelector('#play-button').disabled"),
@@ -1057,37 +1091,41 @@ async function run() {
       duration: Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')),
       button: document.querySelector('#ai-duration-button')?.textContent.trim(),
     }))()`);
-    assert.equal(durationBaseline.button, "Duration");
+    assert.equal(durationBaseline.button, "Song length");
     await evaluate(cdp, appSession, `(() => {
-      window.prompt = () => null;
       document.querySelector('#ai-duration-button').click();
+      document.querySelector('#duration-cancel').click();
     })()`);
     assert.equal(
       await evaluate(cdp, appSession, "Number(document.querySelector('.track-lane').getAttribute('aria-valuemax'))"),
       durationBaseline.duration,
-      "cancelling the AI Mode duration prompt must preserve the project",
+      "cancelling the song length dialog must preserve the project",
     );
-    await evaluate(cdp, appSession, `(() => {
-      window.prompt = () => '301';
-      document.querySelector('#ai-duration-button').click();
-    })()`);
     assert.deepEqual(
-      await evaluate(cdp, appSession, `(() => ({
-        duration: Number(document.querySelector('.track-lane').getAttribute('aria-valuemax')),
-        toast: document.querySelector('#toast-message').textContent,
-        error: document.querySelector('#toast').classList.contains('is-error'),
-      }))()`),
+      await evaluate(cdp, appSession, `(() => {
+      document.querySelector('#ai-duration-button').click();
+      const input = document.querySelector('#duration-input');
+      input.value = 'not a number';
+      const result = {
+        type: input.type, min: input.min, max: input.max, step: input.step,
+        inputMode: input.inputMode, nonNumericValue: input.value,
+      };
+      input.value = '32.5';
+      result.fractionalValid = input.checkValidity();
+      document.querySelector('#duration-cancel').click();
+      return result;
+    })()`),
       {
-        duration: durationBaseline.duration,
-        toast: "Enter a duration between 1 second and 5 minutes",
-        error: true,
+        type: "number", min: "1", max: "300", step: "any",
+        inputMode: "decimal", nonNumericValue: "", fractionalValid: true,
       },
-      "invalid duration input must be rejected in the browser",
+      "song length must use a bounded numeric input",
     );
     const resizedDuration = durationBaseline.duration === 300 ? 299 : durationBaseline.duration + 1;
     await evaluate(cdp, appSession, `(() => {
-      window.prompt = () => '${resizedDuration}';
       document.querySelector('#ai-duration-button').click();
+      document.querySelector('#duration-input').value = '${resizedDuration}';
+      document.querySelector('#duration-form').requestSubmit();
     })()`);
     await waitFor(
       async () => evaluate(
@@ -1102,8 +1140,9 @@ async function run() {
       `/ ${Math.floor(resizedDuration / 60)}:${String(resizedDuration % 60).padStart(2, "0")}`,
     );
     await evaluate(cdp, appSession, `(() => {
-      window.prompt = () => '${durationBaseline.duration}';
       document.querySelector('#ai-duration-button').click();
+      document.querySelector('#duration-input').value = '${durationBaseline.duration}';
+      document.querySelector('#duration-form').requestSubmit();
     })()`);
     await waitFor(
       async () => evaluate(
@@ -1138,8 +1177,9 @@ async function run() {
     );
     await evaluate(cdp, appSession, `(() => {
       document.querySelector('#play-button').click();
-      window.prompt = () => '1';
       document.querySelector('#ai-duration-button').click();
+      document.querySelector('#duration-input').value = '1';
+      document.querySelector('#duration-form').requestSubmit();
     })()`);
     await waitFor(
       async () => evaluate(
@@ -1420,8 +1460,15 @@ async function run() {
       window.__transportPlayCalls = [];
       window.__startPlaybackFrameSample = () => {
         window.__playbackFrames = [];
+        window.__playbackSpectrumPeak = 0;
         const samplePlaybackFrame = (timestamp) => {
           window.__playbackFrames.push(timestamp);
+          window.__playbackSpectrumPeak = Math.max(
+            window.__playbackSpectrumPeak,
+            ...[...document.querySelectorAll('.track-spectrum i')].map(
+              (bar) => Number.parseFloat(bar.style.getPropertyValue('--spectrum-level')) || 0
+            ),
+          );
           if (window.__playbackFrames.length < 180) requestAnimationFrame(samplePlaybackFrame);
         };
         requestAnimationFrame(samplePlaybackFrame);
@@ -1531,9 +1578,7 @@ async function run() {
       maximumFrameGap: Math.max(...window.__playbackFrames.slice(1).map(
         (timestamp, index) => timestamp - window.__playbackFrames[index]
       )),
-      maximumSpectrumLevel: Math.max(...[...document.querySelectorAll('.track-spectrum i')].map(
-        (bar) => Number.parseFloat(bar.style.getPropertyValue('--spectrum-level')) || 0
-      )),
+      maximumSpectrumLevel: window.__playbackSpectrumPeak,
     }))()`);
     assert.ok(
       playbackVisualTiming.maximumFrameGap < 100,
@@ -2115,8 +2160,9 @@ async function run() {
       "accepted edit polling before a manual mutation",
     );
     await evaluate(cdp, appSession, `(() => {
-      window.prompt = () => '${conflictDuration}';
       document.querySelector('#ai-duration-button').click();
+      document.querySelector('#duration-input').value = '${conflictDuration}';
+      document.querySelector('#duration-form').requestSubmit();
     })()`);
     await waitFor(
       async () => evaluate(
@@ -2596,6 +2642,10 @@ async function run() {
         backendEndpoint: source.includes('/api/audio-stream/'),
         trackSpectrumEndpoint: source.includes('/api/track-spectrum/'),
         timestampedSpectrum: engine.includes('frameDuration') && engine.includes('projectTime'),
+        idleWarmupOnly: engine.slice(
+          engine.indexOf('warmOpeningSpectrum()'),
+          engine.indexOf('\\n    updateAnalyzerState('),
+        ).includes('this.isActive'),
         mediaClock: engine.includes('media.currentTime'),
         performanceClock: engine.includes('performance.now'),
         prefetch: engine.includes('beginPrefetch'),
@@ -2614,6 +2664,7 @@ async function run() {
         backendEndpoint: true,
         trackSpectrumEndpoint: true,
         timestampedSpectrum: true,
+        idleWarmupOnly: true,
         mediaClock: true,
         performanceClock: false,
         prefetch: false,
@@ -2630,8 +2681,9 @@ async function run() {
     );
     await evaluate(cdp, appSession, `(async () => {
       const project = await fetch('/api/project').then((response) => response.json());
-      window.prompt = () => String(project.duration);
       document.querySelector('#ai-duration-button').click();
+      document.querySelector('#duration-input').value = String(project.duration);
+      document.querySelector('#duration-form').requestSubmit();
     })()`);
     await waitFor(
       async () => evaluate(

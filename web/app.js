@@ -30,6 +30,10 @@
     undoButton: document.querySelector("#undo-button"),
     aiDurationButton: document.querySelector("#ai-duration-button"),
     resetButton: document.querySelector("#reset-button"),
+    durationDialog: document.querySelector("#duration-dialog"),
+    durationForm: document.querySelector("#duration-form"),
+    durationInput: document.querySelector("#duration-input"),
+    durationCancel: document.querySelector("#duration-cancel"),
     savedState: document.querySelector("#saved-state"),
     historyCount: document.querySelector("#history-count"),
     aiModeButton: document.querySelector("#ai-mode-button"),
@@ -323,6 +327,7 @@
         return;
       }
       const spectrumWindow = this.spectrumWindowAt(this.playhead);
+      if (spectrumWindow && this.analyzerFrame === null) this.startAnalyzers();
       const spectrumDuration = spectrumWindow?.duration ?? 0;
       const spectrumEnd = (spectrumWindow?.start ?? this.playhead) + spectrumDuration;
       if (Date.now() >= this.spectrumRetryAfter) {
@@ -351,6 +356,7 @@
       this.spectrumAbortController = new AbortController();
       this.spectrumLoading = true;
       this.spectrumLoadingStart = start;
+      this.updateAnalyzerState();
       if (!this.hasSpectrumAt(this.playhead)) {
         this.stopAnalyzers();
       }
@@ -373,6 +379,7 @@
         });
         elements.trackRows.dataset.spectrumCoverage = `${decoded.start}:${decoded.start + decoded.duration}`;
         this.spectrumWindows.sort((left, right) => left.start - right.start);
+        this.updateAnalyzerState();
         this.spectrumRetryAfter = 0;
         if (this.isPlaying) this.startAnalyzers();
         return { start: decoded.start, duration: decoded.duration };
@@ -386,6 +393,7 @@
         if (generation === this.spectrumLoadGeneration) {
           this.spectrumLoading = false;
           this.spectrumLoadingStart = null;
+          this.updateAnalyzerState();
         }
       }
     }
@@ -397,6 +405,7 @@
       this.spectrumAbortController = null;
       this.spectrumLoading = false;
       this.spectrumLoadingStart = null;
+      this.updateAnalyzerState();
     }
 
     invalidateSpectrum() {
@@ -405,7 +414,33 @@
       this.spectrumWindows = [];
       this.spectrumLoading = false;
       this.spectrumLoadingStart = null;
+      delete elements.trackRows.dataset.spectrumCoverage;
       this.stopAnalyzers();
+      this.updateAnalyzerState();
+    }
+
+    warmOpeningSpectrum() {
+      if (
+        state.promptPending ||
+        this.isActive ||
+        !this.project ||
+        !this.streamToken ||
+        this.hasSpectrumAt(0)
+      ) return;
+      void this.loadTrackSpectrum(this.project, 0);
+    }
+
+    updateAnalyzerState(time = this.playhead) {
+      const ready = this.hasSpectrumAt(time);
+      const loading = !ready &&
+        this.spectrumLoading &&
+        this.spectrumLoadingStart === this.spectrumRequestStart(time);
+      const analyzerState = ready ? "ready" : loading ? "loading" : "unavailable";
+      elements.trackRows.querySelectorAll(".track-spectrum").forEach((analyzer) => {
+        analyzer.classList.toggle("is-loading", loading);
+        analyzer.setAttribute("aria-busy", String(loading));
+        analyzer.dataset.state = analyzerState;
+      });
     }
 
     hasSpectrumAt(time) {
@@ -465,6 +500,7 @@
     startAnalyzers() {
       this.stopAnalyzers();
       const window = this.spectrumWindowAt(this.playhead);
+      this.updateAnalyzerState();
       if (!this.isPlaying || !window) return;
       for (const trackId of window.tracks.keys()) {
         this.analyzerTracks.push(trackId);
@@ -483,9 +519,14 @@
     }
 
     drawAnalyzers() {
+      this.analyzerFrame = null;
       if (!this.isPlaying) return;
       const projectTime = this.audioStart + this.media.currentTime;
       const spectrumWindow = this.spectrumWindowAt(projectTime);
+      this.updateAnalyzerState(projectTime);
+      if (spectrumWindow && this.analyzerTracks.length === 0) {
+        this.analyzerTracks = [...spectrumWindow.tracks.keys()];
+      }
       for (const trackId of this.analyzerTracks) {
         const track = spectrumWindow?.tracks.get(trackId);
         const frame = track
@@ -650,15 +691,19 @@
     }
   }
 
-  async function editDuration() {
+  function editDuration() {
     if (!state.project) return;
-    const entered = window.prompt("Song duration in seconds (1-300)", String(state.project.duration));
-    if (entered === null) return;
-    const duration = Number(entered);
-    if (!Number.isFinite(duration) || duration < 1 || duration > 300) {
-      showToast("Enter a duration between 1 second and 5 minutes", true);
-      return;
-    }
+    elements.durationInput.value = String(state.project.duration);
+    elements.durationDialog.showModal();
+    elements.durationInput.focus();
+    elements.durationInput.select();
+  }
+
+  async function saveDuration(event) {
+    event.preventDefault();
+    if (!elements.durationForm.reportValidity()) return;
+    const duration = Number(elements.durationInput.value);
+    elements.durationDialog.close();
     await enqueueProjectMutation(() => applyProjectMutation({
       path: "/api/duration",
       values: { duration: String(duration) },
@@ -747,7 +792,7 @@
           <div class="track-label">
             <span class="track-color" aria-hidden="true"></span>
             <span class="track-meta"><strong>${escapeHtml(track.name)}</strong></span>
-            <span class="track-spectrum" data-spectrum-track="${track.id}" aria-label="${escapeHtml(track.name)} spectrum analyzer">${Array.from({ length: 8 }, () => "<i></i>").join("")}</span>
+            <span class="track-spectrum" data-spectrum-track="${track.id}" data-state="unavailable" aria-label="${escapeHtml(track.name)} spectrum analyzer" aria-busy="false">${Array.from({ length: 8 }, () => "<i></i>").join("")}</span>
           </div>
           <div class="track-lane" data-track-id="${track.id}" role="slider" tabindex="0" aria-label="${escapeHtml(track.name)} timeline selection" aria-valuemin="0" aria-valuemax="${duration}" aria-valuenow="${state.selectionStart}" aria-valuetext="Selected ${state.selectionStart.toFixed(1)} to ${state.selectionEnd.toFixed(1)} seconds. Arrow keys move; Shift plus Arrow keys resize.">${clips}${markers}</div>
         </div>`;
@@ -1033,7 +1078,7 @@
       ? state.interruptPending
         ? "Interrupting..."
         : "Interrupt"
-      : "Make change";
+      : "Submit";
   }
 
   function hideEditProgress() {
@@ -1495,9 +1540,10 @@
       state.interruptPending = false;
       hideEditProgress();
       elements.composeButton.disabled = false;
-      elements.composeButton.querySelector("span").textContent = "Make change";
+      elements.composeButton.querySelector("span").textContent = "Submit";
       reconcilePlaybackReadiness();
       if (playbackStateCaptured && restorePlayback && !audio.isActive) await audio.start();
+      audio.warmOpeningSpectrum();
     }
   }
 
@@ -1545,7 +1591,7 @@
       if (handedOff) throw error;
       state.promptPending = false;
       elements.composeButton.disabled = false;
-      elements.composeButton.querySelector("span").textContent = "Make change";
+      elements.composeButton.querySelector("span").textContent = "Submit";
       showError(error, "preparing the prompted edit");
     } finally {
       state.promptSubmissionClaimed = false;
@@ -1816,6 +1862,8 @@
   elements.rewindButton.addEventListener("click", () => audio.seek(0));
   elements.undoButton.addEventListener("click", () => void undo());
   elements.aiDurationButton.addEventListener("click", () => void editDuration());
+  elements.durationForm.addEventListener("submit", (event) => void saveDuration(event));
+  elements.durationCancel.addEventListener("click", () => elements.durationDialog.close());
   elements.resetButton.addEventListener("click", () => void reset());
   elements.selectionModeButton.addEventListener("click", () => setTouchSelectionMode(!state.touchSelectionMode));
   elements.skipLink.addEventListener("click", skipToTimeline);
@@ -1922,7 +1970,11 @@
     }
     await loadProject();
     await loadGeminiSessions();
-    if (pending && state.project) await runPendingEdit(pending, false);
+    if (pending && state.project) {
+      await runPendingEdit(pending, false);
+    } else {
+      audio.warmOpeningSpectrum();
+    }
   }
 
   void initialize();

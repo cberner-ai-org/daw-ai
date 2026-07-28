@@ -26,7 +26,7 @@
 
       <div class="transport" aria-label="Playback controls">
         <button class="icon-button rewind-button" id="rewind-button" type="button" aria-label="Return to start">
-          <span aria-hidden="true">|&lt;</span>
+          <span class="rewind-icon" aria-hidden="true"></span>
         </button>
         <button class="play-button" id="play-button" type="button" aria-label="Play project" disabled>
           <span class="play-icon" aria-hidden="true"></span>
@@ -55,10 +55,10 @@
             <h1 id="project-name">Loading studio...</h1>
           </div>
           <div class="heading-actions">
-            <button class="text-button" id="ai-duration-button" type="button">Duration</button>
-            <a class="text-button" id="export-button" href="/api/export.wav" download="project.wav">Export WAV</a>
-            <button class="text-button" id="undo-button" type="button">Undo</button>
-            <button class="text-button" id="reset-button" type="button">Reset project</button>
+            <button class="text-button" id="ai-duration-button" type="button" title="Change song length">Song length</button>
+            <a class="text-button" id="export-button" href="/api/export.wav" download="project.wav">Export audio</a>
+            <button class="text-button" id="undo-button" type="button" title="Undo the latest change">Undo</button>
+            <button class="text-button" id="reset-button" type="button">Reset</button>
             <span class="saved-state" id="saved-state">Loading</span>
           </div>
         </section>
@@ -105,10 +105,9 @@
             <form id="prompt-form">
               <label class="sr-only" for="prompt-input">Describe your musical change</label>
               <div class="prompt-input-wrap">
-                <textarea id="prompt-input" rows="2" maxlength="300" placeholder="Try: turn this section into a dubstep drop..." required></textarea>
+                <textarea id="prompt-input" rows="2" maxlength="300" placeholder="Describe the change you want to hear..." required></textarea>
                 <button class="compose-button" id="compose-button" type="submit">
-                  <span>Make change</span>
-                  <span class="button-arrow" aria-hidden="true">-&gt;</span>
+                  <span>Submit</span>
                 </button>
               </div>
             </form>
@@ -125,7 +124,7 @@
               <span>Try</span>
               <button type="button" data-prompt="Turn this section into a waltz">Waltz</button>
               <button type="button" data-prompt="Turn this section into a classic dubstep drop. It builds in speed and intensity for the first 80%, then the drop, and then the outro into the rest of the track">Drop</button>
-              <button type="button" data-prompt="Make the chords warm and spacious, and this section relaxing">warm</button>
+              <button type="button" data-prompt="Make the chords warm and spacious, and this section relaxing">Warm</button>
             </div>
           </div>
         </section>
@@ -197,6 +196,20 @@
       </section>
     </main>
   </div>
+
+  <dialog class="duration-dialog" id="duration-dialog" aria-labelledby="duration-dialog-title">
+    <form id="duration-form">
+      <p class="eyebrow">PROJECT SETTINGS</p>
+      <h2 id="duration-dialog-title">Song length</h2>
+      <p class="duration-dialog-copy">Set the total duration between 1 second and 5 minutes.</p>
+      <label for="duration-input">Seconds</label>
+      <input id="duration-input" name="duration" type="number" min="1" max="300" step="any" inputmode="decimal" required>
+      <div class="duration-dialog-actions">
+        <button class="text-button" id="duration-cancel" type="button">Cancel</button>
+        <button class="secondary-button duration-save" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden>
     <span class="toast-message" id="toast-message"></span>
