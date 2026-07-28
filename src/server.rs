@@ -455,6 +455,8 @@ struct EditFailure {
 #[derive(Default)]
 struct AudioRenderState {
     rendering: bool,
+    foreground_waiters: usize,
+    background_waiters: usize,
 }
 
 #[derive(Default)]
@@ -467,6 +469,12 @@ struct AudioRenderer {
 enum AudioRenderError {
     Render(String),
     Cancelled,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AudioRenderPriority {
+    Foreground,
+    Background,
 }
 
 impl AudioRenderer {
@@ -482,6 +490,7 @@ impl AudioRenderer {
             start_sample,
             end_sample,
             is_cancelled,
+            AudioRenderPriority::Foreground,
             audio_analysis::render_project_sample_range,
         )
     }
@@ -498,6 +507,7 @@ impl AudioRenderer {
             start_sample,
             end_sample,
             is_cancelled,
+            AudioRenderPriority::Background,
             audio_analysis::render_project_stems_sample_range,
         )
     }
@@ -508,27 +518,46 @@ impl AudioRenderer {
         start_sample: usize,
         end_sample: usize,
         is_cancelled: &impl Fn() -> bool,
+        priority: AudioRenderPriority,
         render: impl FnOnce(&crate::model::Project, usize, usize) -> Result<T, String>,
     ) -> Result<T, AudioRenderError> {
+        if is_cancelled() {
+            return Err(AudioRenderError::Cancelled);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match priority {
+            AudioRenderPriority::Foreground => state.foreground_waiters += 1,
+            AudioRenderPriority::Background => state.background_waiters += 1,
+        }
+        self.completed.notify_all();
         loop {
             if is_cancelled() {
+                match priority {
+                    AudioRenderPriority::Foreground => state.foreground_waiters -= 1,
+                    AudioRenderPriority::Background => state.background_waiters -= 1,
+                }
+                self.completed.notify_all();
                 return Err(AudioRenderError::Cancelled);
             }
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.rendering {
-                drop(
-                    self.completed
-                        .wait(state)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                );
-            } else {
+            if !state.rendering
+                && (priority == AudioRenderPriority::Foreground || state.foreground_waiters == 0)
+            {
                 state.rendering = true;
+                match priority {
+                    AudioRenderPriority::Foreground => state.foreground_waiters -= 1,
+                    AudioRenderPriority::Background => state.background_waiters -= 1,
+                }
                 break;
             }
+            state = self
+                .completed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        drop(state);
 
         if is_cancelled() {
             let mut state = self
@@ -4120,6 +4149,7 @@ mod tests {
                     }
                     second_cancelled.load(Ordering::SeqCst)
                 },
+                AudioRenderPriority::Background,
                 |_, _, _| -> Result<audio_analysis::AudioRegion, String> {
                     panic!("a cancelled queued stream must not render")
                 },
@@ -4135,6 +4165,85 @@ mod tests {
             second.join().expect("cancelled stream thread"),
             Err(AudioRenderError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn playback_render_precedes_queued_spectrum_work() {
+        let renderer = Arc::new(AudioRenderer::default());
+        renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rendering = true;
+        let project = Project::demo();
+        let (completed, order) = std::sync::mpsc::channel();
+
+        let background_renderer = Arc::clone(&renderer);
+        let background_project = project.clone();
+        let background_completed = completed.clone();
+        let background = thread::spawn(move || {
+            background_renderer.stream_region_with(
+                &background_project,
+                1,
+                2,
+                &|| false,
+                AudioRenderPriority::Background,
+                |_, _, _| {
+                    background_completed
+                        .send("spectrum")
+                        .expect("test receiver");
+                    Ok(())
+                },
+            )
+        });
+        let state = renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            renderer
+                .completed
+                .wait_while(state, |state| state.background_waiters == 0)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+
+        let foreground_renderer = Arc::clone(&renderer);
+        let foreground_completed = completed.clone();
+        let foreground = thread::spawn(move || {
+            foreground_renderer.stream_region_with(
+                &project,
+                1,
+                2,
+                &|| false,
+                AudioRenderPriority::Foreground,
+                |_, _, _| {
+                    foreground_completed
+                        .send("playback")
+                        .expect("test receiver");
+                    Ok(())
+                },
+            )
+        });
+        let mut state = renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state = renderer
+            .completed
+            .wait_while(state, |state| state.foreground_waiters == 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rendering = false;
+        drop(state);
+        renderer.completed.notify_all();
+
+        assert_eq!(
+            order
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first render"),
+            "playback"
+        );
+        assert!(matches!(foreground.join(), Ok(Ok(()))));
+        assert!(matches!(background.join(), Ok(Ok(()))));
     }
 
     #[test]
