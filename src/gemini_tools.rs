@@ -3419,10 +3419,21 @@ mod tests {
 
     #[test]
     fn batch_parameter_mutations_are_atomic_and_reject_duplicates() {
-        let project = project_with_effect("Tape");
+        let project = project_with_effect("Distortion");
         let track = &project.tracks[0];
         let track_id = track.id;
         let effect_id = track.effects[0].id;
+        let parameter = crate::surge::effect_parameter_semantics(
+            &track.instrument,
+            &track.effects,
+            &track.routing.effect_order,
+            track_id,
+            effect_id,
+        )
+        .into_iter()
+        .find(|(_, semantics)| semantics.choices.is_empty())
+        .map(|(parameter, _)| parameter)
+        .expect("continuous effect parameter");
         let session = EditSession::create(&project, "batch controls", 0.0, 1.0).expect("session");
 
         let response: JsonValue = serde_json::from_str(
@@ -3434,7 +3445,7 @@ mod tests {
                     "effectId":effect_id,
                     "changes":[
                         {"parameter":"mix","value":"0.2"},
-                        {"parameter":"Amount","value":"0.7"}
+                        {"parameter":parameter,"value":"0.7"}
                     ]
                 }),
             )
@@ -3449,7 +3460,7 @@ mod tests {
         );
         assert_eq!(response["parameterResults"][0]["parameter"], "mix");
         assert_eq!(response["parameterResults"][0]["display"], "20.00 %");
-        assert_eq!(response["parameterResults"][1]["parameter"], "Amount");
+        assert_eq!(response["parameterResults"][1]["parameter"], parameter);
         assert!(response["parameterResults"][1]["display"].is_string());
         let updated = session.take_update().unwrap().expect("one atomic update");
         let effect = &updated.1.tracks[0].effects[0];
@@ -3457,10 +3468,10 @@ mod tests {
         assert!(
             effect
                 .parameters
-                .get("Amount")
+                .get(&parameter)
                 .is_some_and(|value| (*value - 0.7).abs() < 0.001)
         );
-        assert!(effect.parameter_overrides.contains(&"Amount".to_owned()));
+        assert!(effect.parameter_overrides.contains(&parameter));
         assert!(session.take_update().unwrap().is_none());
 
         let before = current_project(session.path()).unwrap().to_json();
