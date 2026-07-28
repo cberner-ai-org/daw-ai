@@ -105,6 +105,7 @@
       this.spectrumAbortController = null;
       this.spectrumWindows = [];
       this.spectrumLoading = false;
+      this.spectrumLoadingStart = null;
       this.spectrumRetryAfter = 0;
       this.analyzerTracks = [];
       this.analyzerFrame = null;
@@ -207,8 +208,8 @@
       const hasStartingSpectrum = this.hasSpectrumAt(this.audioStart);
       if (hasStartingSpectrum) {
         this.startAnalyzers();
-      } else if (!this.spectrumLoading) {
-        void this.loadTrackSpectrum(this.project, this.spectrumRequestStart(this.audioStart));
+      } else {
+        this.loadTrackSpectrumAt(this.audioStart);
       }
       this.tick();
       updateTransport();
@@ -321,11 +322,8 @@
       const spectrumDuration = spectrumWindow?.duration ?? 0;
       const spectrumEnd = (spectrumWindow?.start ?? this.playhead) + spectrumDuration;
       if (Date.now() >= this.spectrumRetryAfter) {
-        if (
-          !spectrumWindow &&
-          !this.spectrumLoading
-        ) {
-          void this.loadTrackSpectrum(this.project, this.spectrumRequestStart(this.playhead));
+        if (!spectrumWindow) {
+          this.loadTrackSpectrumAt(this.playhead);
         } else if (!this.spectrumLoading &&
           spectrumWindow &&
           spectrumEnd < this.project.duration - 0.01 &&
@@ -336,12 +334,19 @@
       }
     }
 
+    loadTrackSpectrumAt(time) {
+      const start = this.spectrumRequestStart(time);
+      if (this.spectrumLoading && this.spectrumLoadingStart === start) return;
+      void this.loadTrackSpectrum(this.project, start);
+    }
+
     async loadTrackSpectrum(project, start) {
       if (!this.streamToken || !project?.tracks.length) return null;
       const generation = (this.spectrumLoadGeneration += 1);
       this.spectrumAbortController?.abort();
       this.spectrumAbortController = new AbortController();
       this.spectrumLoading = true;
+      this.spectrumLoadingStart = start;
       if (!this.hasSpectrumAt(this.playhead)) {
         this.stopAnalyzers();
       }
@@ -376,6 +381,7 @@
       } finally {
         if (generation === this.spectrumLoadGeneration) {
           this.spectrumLoading = false;
+          this.spectrumLoadingStart = null;
         }
       }
     }
@@ -386,6 +392,7 @@
       this.spectrumAbortController?.abort();
       this.spectrumAbortController = null;
       this.spectrumLoading = false;
+      this.spectrumLoadingStart = null;
     }
 
     invalidateSpectrum() {
@@ -393,6 +400,7 @@
       this.spectrumAbortController?.abort();
       this.spectrumWindows = [];
       this.spectrumLoading = false;
+      this.spectrumLoadingStart = null;
       this.stopAnalyzers();
     }
 
