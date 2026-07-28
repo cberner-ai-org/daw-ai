@@ -2375,8 +2375,18 @@ fn normalize_effect_parameter_value(
         .iter()
         .find(|track| track.id == track_id)
         .ok_or_else(|| format!("track {track_id} does not exist"))?;
-    if matches!(parameter, "mix" | "enabled") {
-        return Ok(value.to_owned());
+    if parameter == "mix" {
+        let number = value
+            .parse::<f32>()
+            .ok()
+            .filter(|number| number.is_finite() && (0.0..=1.0).contains(number))
+            .ok_or_else(|| "effect parameter mix must be a number from 0 to 1".to_owned())?;
+        return Ok(number.to_string());
+    }
+    if parameter == "enabled" {
+        return matches!(value, "true" | "false")
+            .then(|| value.to_owned())
+            .ok_or_else(|| "effect parameter enabled must be true or false".to_owned());
     }
     let semantics = crate::surge::effect_parameter_semantics(
         &track.instrument,
@@ -2392,7 +2402,12 @@ fn normalize_effect_parameter_value(
         ));
     };
     if semantics.choices.is_empty() {
-        return Ok(value.to_owned());
+        let number = value
+            .parse::<f32>()
+            .ok()
+            .filter(|number| number.is_finite() && (0.0..=1.0).contains(number))
+            .ok_or_else(|| format!("effect parameter {parameter} must be a number from 0 to 1"))?;
+        return Ok(number.to_string());
     }
     if let Some((choice, _)) = semantics
         .choices
@@ -2423,8 +2438,8 @@ fn normalize_effect_parameter_value(
 
 fn parameter_error_message(
     error: StudioError,
-    project: &Project,
-    track_id: u64,
+    _project: &Project,
+    _track_id: u64,
     tool: &str,
     tool_id: u64,
     parameter: &str,
@@ -2439,8 +2454,7 @@ fn parameter_error_message(
         StudioError::UnknownSoundTool => format!("{tool} {tool_id} not found"),
         StudioError::InvalidSoundTool => {
             if tool == "effect" {
-                return normalize_effect_parameter_value(project, track_id, tool_id, parameter, "")
-                    .expect_err("an empty effect selection must be rejected");
+                return format!("invalid effect parameter or value: {parameter}");
             }
             format!("invalid {tool} parameter or value: {parameter}")
         }
@@ -3642,6 +3656,45 @@ mod tests {
         .expect_err("invalid display label");
         assert!(error.contains("must be one of:"));
         assert!(error.contains(&choice.1));
+    }
+
+    #[test]
+    fn invalid_effect_values_return_actionable_errors() {
+        let project = project_with_effect("Distortion");
+        let track = &project.tracks[0];
+        let effect = &track.effects[0];
+        let continuous_parameter = crate::surge::effect_parameter_semantics(
+            &track.instrument,
+            &track.effects,
+            &track.routing.effect_order,
+            track.id,
+            effect.id,
+        )
+        .into_iter()
+        .find(|(_, semantics)| semantics.choices.is_empty())
+        .map(|(parameter, _)| parameter)
+        .expect("continuous effect parameter");
+        let session = EditSession::create(&project, "reject invalid effect values", 0.0, 1.0)
+            .expect("session");
+
+        for (parameter, value, expected) in [
+            ("mix", "2", "number from 0 to 1"),
+            ("enabled", "maybe", "true or false"),
+            (&continuous_parameter, "2", "number from 0 to 1"),
+        ] {
+            let error = apply_agent_mutation(
+                session.path(),
+                "update_effect",
+                &serde_json::json!({
+                    "trackId":track.id,
+                    "effectId":effect.id,
+                    "parameter":parameter,
+                    "value":value
+                }),
+            )
+            .expect_err("invalid value");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
     }
 
     #[test]

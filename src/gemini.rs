@@ -387,6 +387,14 @@ fn run_session_with_transport_options(
                         "Tool error: group must be arrangement or sound".to_owned(),
                     ),
                 }
+            } else if index == 0
+                && dynamic_tools
+                && !tools.iter().any(|tool| tool["name"] == call.name)
+            {
+                ToolOutput::text(format!(
+                    "Tool error: {} is not currently available; call {LOAD_TOOL_GROUP_NAME} for the required editing group",
+                    call.name
+                ))
             } else if index == 0 {
                 execute_tool(
                     session,
@@ -1621,6 +1629,60 @@ mod tests {
         assert!(saw_retry_message);
         assert_eq!(result.project.bpm, 140);
         assert_eq!(session.stats().unwrap().0, 2);
+    }
+
+    #[test]
+    fn dynamic_tools_reject_calls_outside_the_loaded_group() {
+        let session =
+            EditSession::create(&Project::demo(), "change tempo", 0.0, 4.0).expect("session");
+        let responses = [
+            serde_json::json!({
+                "id":"stale","status":"requires_action","steps":[{
+                    "type":"function_call","id":"tempo-stale","name":"set_tempo",
+                    "arguments":{"bpm":140}
+                }]
+            }),
+            serde_json::json!({
+                "id":"load","status":"requires_action","steps":[{
+                    "type":"function_call","id":"load-arrangement","name":LOAD_TOOL_GROUP_NAME,
+                    "arguments":{"group":"arrangement"}
+                }]
+            }),
+            serde_json::json!({
+                "id":"tempo","status":"requires_action","steps":[{
+                    "type":"function_call","id":"tempo-loaded","name":"set_tempo",
+                    "arguments":{"bpm":140}
+                }]
+            }),
+            serde_json::json!({"id":"done","status":"completed","steps":[]}),
+        ];
+        let mut response_index = 0;
+        let mut rejected_stale_call = false;
+        let result = run_session_with_transport_options(
+            &session,
+            "change tempo",
+            0.0,
+            4.0,
+            false,
+            false,
+            true,
+            &mut render_audio_request,
+            &mut |edit| Ok(edit.project),
+            &|| false,
+            &mut |sequence, request, _| {
+                if sequence == 2 {
+                    rejected_stale_call = request.to_string().contains("not currently available");
+                }
+                let response = responses[response_index].to_string();
+                response_index += 1;
+                Ok(response)
+            },
+        )
+        .expect("dynamic tool session");
+
+        assert!(rejected_stale_call);
+        assert_eq!(result.project.bpm, 140);
+        assert_eq!(session.stats().unwrap().0, 1);
     }
 
     #[test]

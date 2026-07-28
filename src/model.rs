@@ -2884,7 +2884,8 @@ fn configure_instrument(
 }
 
 pub(crate) fn valid_surge_preset(value: &str) -> bool {
-    SURGE_PRESETS.contains(&value) || crate::surge_presets::find(value).is_some()
+    crate::surge_presets::headless_render_error(value).is_none()
+        && (SURGE_PRESETS.contains(&value) || crate::surge_presets::find(value).is_some())
 }
 
 fn parse_range(value: &str, minimum: f32, maximum: f32) -> Result<f32, StudioError> {
@@ -4365,6 +4366,25 @@ mod tests {
         assert_eq!(
             studio
                 .configure_sound_tool(track_id, "effect", effect_id, None, &parameter, "0.123456",),
+            Err(StudioError::InvalidSoundTool)
+        );
+    }
+
+    #[test]
+    fn headless_unsafe_presets_cannot_be_configured() {
+        let mut studio = Studio::new();
+        let track = &studio.project().tracks[0];
+        let track_id = track.id;
+        let instrument_id = track.instrument.id;
+        assert_eq!(
+            studio.configure_sound_tool(
+                track_id,
+                "instrument",
+                instrument_id,
+                None,
+                "preset",
+                "Factory/Keys/House Organ",
+            ),
             Err(StudioError::InvalidSoundTool)
         );
     }
