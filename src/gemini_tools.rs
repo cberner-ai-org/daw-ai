@@ -9,14 +9,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value as JsonValue};
 
 use crate::audio_analysis::{self, MAX_REGION_SECONDS};
-#[cfg(test)]
-use crate::model::TrackRole;
 use crate::model::{
     MAX_LOOP_PLAYBACK_BEATS, MAX_MIDI_EVENTS_PER_CLIP, MAX_MIDI_NOTE_DURATION_BEATS,
-    MAX_ONCE_PLAYBACK_BEATS, MIN_MIDI_NOTE_BEATS, MidiClipSpec, ModulatorSpec,
+    MAX_ONCE_PLAYBACK_BEATS, MIN_MIDI_NOTE_BEATS, MidiClipSpec, MidiNote, ModulatorSpec,
     PROJECT_SCHEMA_VERSION, Project, Studio, StudioError, TRACK_COLOR_PALETTE, json_string,
 };
-use crate::prompt::{Action, EditPlan, MAX_COMPOUND_ACTIONS, MidiNote};
+use crate::prompt::EditPlan;
 use crate::storage::{ProjectStore, read_bounded_text, replace_text_file};
 
 pub(crate) const READ_TOOL_NAME: &str = "read_sound_graph";
@@ -336,16 +334,13 @@ impl EditSession {
     }
 
     pub(crate) fn finish(&self, plans: Vec<EditPlan>) -> Result<(EditPlan, Project), String> {
-        let mut actions = Vec::new();
         let mut summary = None;
         for plan in plans {
-            actions.push(plan.action);
             summary = Some(plan.summary);
         }
-        if actions.is_empty() {
+        if summary.is_none() {
             return Err("Gemini did not use a registered graph mutation tool".to_owned());
         }
-        let action = bounded_compound(actions);
         let graph = read_bounded_text(
             &self.path.join(GRAPH_FILE),
             MAX_SOUND_GRAPH_BYTES,
@@ -356,7 +351,6 @@ impl EditSession {
             .map_err(|error| format!("Gemini left an invalid sound graph: {error}"))?;
         Ok((
             EditPlan {
-                action,
                 summary: summary.expect("plans were nonempty"),
             },
             project,
@@ -396,10 +390,7 @@ impl EditSession {
                     .and_then(JsonValue::as_str)
                     .map(str::to_owned)
             }) {
-            EditPlan {
-                action: Action::GraphMutation,
-                summary,
-            }
+            EditPlan { summary }
         } else {
             return Err("Gemini edit progress did not contain a graph mutation".to_owned());
         };
@@ -631,7 +622,7 @@ fn mutation_tool_declarations(batch_parameter_tools: bool) -> Vec<JsonValue> {
     let mut tools = vec![
         function(
             "new_track",
-            "Create one neutral Surge XT track with Init and no clips, effects, or modulators. Choose a short descriptive role label and a color from the palette. Returns its stable ID.",
+            "Create one Surge XT track with Init and no clips, effects, or modulators. Choose a short descriptive name and a color from the palette. Returns its stable ID.",
             object_schema(
                 serde_json::json!({
                     "description":{"type":"string","minLength":1,"maxLength":16,"description":"Short role or purpose, such as Snare Build or Bass Drop."},
@@ -908,7 +899,6 @@ fn sound_graph_topology(project: &Project) -> JsonValue {
             "nodeId":track_node,
             "type":"track",
             "name":track.name,
-            "role":track.role.as_str(),
             "volume":track.volume,
             "muted":track.muted
         }));
@@ -1027,7 +1017,7 @@ fn read_sound_node(
             "track" if track.id == id => {
                 return Ok(serde_json::json!({
                     "nodeId":node_id,"type":"track","id":track.id,"name":track.name,
-                    "role":track.role.as_str(),"color":track.color,"volume":track.volume,
+                    "color":track.color,"volume":track.volume,
                     "muted":track.muted,
                     "controls":[
                         {"parameters":["name","color"],"mutationTool":"set_track_identity","colorPalette":TRACK_COLOR_PALETTE},
@@ -2962,33 +2952,6 @@ fn progress_path(session_path: &Path) -> PathBuf {
     session_path.join(PROGRESS_DIRECTORY)
 }
 
-fn bounded_compound(mut actions: Vec<Action>) -> Action {
-    while actions.len() > MAX_COMPOUND_ACTIONS {
-        let mut grouped = Vec::with_capacity(actions.len().div_ceil(MAX_COMPOUND_ACTIONS));
-        let mut remaining = actions.into_iter();
-        loop {
-            let children = remaining
-                .by_ref()
-                .take(MAX_COMPOUND_ACTIONS)
-                .collect::<Vec<_>>();
-            if children.is_empty() {
-                break;
-            }
-            grouped.push(action_group(children));
-        }
-        actions = grouped;
-    }
-    action_group(actions)
-}
-
-fn action_group(mut actions: Vec<Action>) -> Action {
-    if actions.len() == 1 {
-        actions.pop().expect("one action")
-    } else {
-        Action::Compound { actions }
-    }
-}
-
 fn studio_error_message(error: StudioError) -> String {
     match error {
         StudioError::EmptyPrompt => "The edit request is empty.".to_owned(),
@@ -4267,15 +4230,13 @@ mod tests {
         .expect("new track");
         let response: JsonValue = serde_json::from_str(&response).unwrap();
         let track_id = response["id"].as_u64().expect("created track ID");
-        let (plan, project) = session.take_update().unwrap().expect("published update");
-        assert_eq!(plan.action, Action::GraphMutation);
+        let (_plan, project) = session.take_update().unwrap().expect("published update");
         let track = project
             .tracks
             .iter()
             .find(|track| track.id == track_id)
             .expect("created track");
         assert!(track.clips.is_empty());
-        assert_eq!(track.role, TrackRole::Neutral);
         assert_eq!(track.name, "Snare Build");
         assert_eq!(track.color, "#ff91ad");
         assert_eq!(track.volume, 1.0);
@@ -4718,7 +4679,6 @@ mod tests {
             8.0,
             "two edits",
             EditPlan {
-                action: Action::GraphMutation,
                 summary: "Updated drums".to_owned(),
             },
         )

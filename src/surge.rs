@@ -59,7 +59,6 @@ pub(crate) struct InstrumentParameter {
     pub(crate) value: f32,
     pub(crate) preset_value: f32,
     pub(crate) display: String,
-    pub(crate) common: bool,
     pub(crate) boolean: bool,
     pub(crate) discrete: bool,
     pub(crate) bipolar: bool,
@@ -555,14 +554,12 @@ pub(crate) fn instrument_parameters(preset: &str) -> Vec<InstrumentParameter> {
                 let mut id = SurgeId::empty();
                 engine.synth.from_synth_side_id(index, &mut id).then(|| {
                     let name = engine.synth.get_parameter_accessible_name(&mut id);
-                    let common = is_common_parameter(&name);
                     InstrumentParameter {
                         id: index,
                         name,
                         value: engine.synth.get_parameter01(&mut id),
                         preset_value: engine.synth.get_parameter01(&mut id),
                         display: engine.synth.get_parameter_display(&mut id),
-                        common,
                         boolean: engine.synth.parameter_is_boolean(&id),
                         discrete: engine.synth.parameter_is_discrete(&id),
                         bipolar: engine.synth.parameter_is_bipolar(&id),
@@ -608,7 +605,6 @@ pub(crate) fn instrument_parameters_for_instrument(
                 let name = engine.synth.get_parameter_accessible_name(&mut id);
                 InstrumentParameter {
                     id: index,
-                    common: is_common_parameter(&name),
                     name,
                     value: engine.synth.get_parameter01(&mut id),
                     preset_value: preset_values
@@ -871,22 +867,6 @@ fn is_generic_effect_parameter(name: &str) -> bool {
         .is_some_and(|number| number.parse::<u8>().is_ok())
 }
 
-fn is_common_parameter(name: &str) -> bool {
-    [
-        "Amp EG Attack",
-        "Amp EG Decay",
-        "Amp EG Sustain",
-        "Amp EG Release",
-        "Filter 1 Cutoff",
-        "Filter 1 Resonance",
-        "Osc 1 Volume",
-        "Pitch",
-        "Global Volume",
-    ]
-    .iter()
-    .any(|candidate| name.contains(candidate))
-}
-
 pub(crate) const SURGE_EFFECT_TYPES: &[&str] = &[
     "Off",
     "Delay",
@@ -967,7 +947,7 @@ mod tests {
         let instrument = crate::model::Project::demo()
             .tracks
             .into_iter()
-            .find(|track| track.role == crate::model::TrackRole::Bass)
+            .find(|track| track.name == "Soft Current")
             .expect("demo bass")
             .instrument;
         let render = |modulators: &[Modulator]| {
@@ -1180,26 +1160,6 @@ mod tests {
             "factory preset qualification failures:\n{}",
             failures.join("\n")
         );
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn factory_patch_parameters_change_only_when_explicitly_overridden() {
-        let mut instrument = crate::model::Project::demo().tracks[2].instrument.clone();
-        instrument.preset = "Factory/Leads/Violini Solo".to_owned();
-        instrument.cutoff = 0.01;
-        let native = Engine::new(&instrument, &[], &[], &[], 1, 16_000.0)
-            .expect("factory Surge XT patch")
-            .instrument_parameter_value("cutoff")
-            .expect("native cutoff");
-        assert!((native - instrument.cutoff).abs() > 0.01);
-
-        instrument.parameter_overrides.push("cutoff".to_owned());
-        let overridden = Engine::new(&instrument, &[], &[], &[], 1, 16_000.0)
-            .expect("overridden factory Surge XT patch")
-            .instrument_parameter_value("cutoff")
-            .expect("overridden cutoff");
-        assert!((overridden - instrument.cutoff).abs() < 0.001);
     }
 
     #[test]
