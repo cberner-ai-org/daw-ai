@@ -31,7 +31,7 @@ use crate::project_history::{
     trim_project_history,
 };
 use crate::prompt::{EditPlan, PromptEngine};
-use crate::storage::{ProjectStore, replace_text_file};
+use crate::storage::{ProjectStore, replace_file, replace_text_file};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
 const MAX_ACTIVE_EDIT_JOBS: usize = 4;
@@ -1063,12 +1063,8 @@ impl Router {
             let mut cached = Vec::with_capacity(8 + body.len());
             cached.extend_from_slice(&version.to_le_bytes());
             cached.extend_from_slice(&body);
-            let temporary = path.with_extension("cache.tmp");
-            if let Err(error) =
-                fs::write(&temporary, &cached).and_then(|()| fs::rename(&temporary, path))
-            {
+            if let Err(error) = replace_file(path, &cached) {
                 eprintln!("warning: could not persist track spectrum cache: {error}");
-                let _ = fs::remove_file(temporary);
             }
         }
         drop(cache_guard);
@@ -4192,6 +4188,19 @@ mod tests {
             )
             .expect("spectrum cache path");
         assert!(cache_path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&cache_path)
+                    .expect("spectrum cache metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
 
         router
             .audio_renderer
