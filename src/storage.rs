@@ -127,6 +127,10 @@ pub(crate) fn read_bounded_text(
 }
 
 pub(crate) fn replace_text_file(path: &Path, source: &str) -> io::Result<()> {
+    replace_file(path, source.as_bytes())
+}
+
+pub(crate) fn replace_file(path: &Path, source: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
         return Err(io::Error::new(
@@ -146,7 +150,7 @@ pub(crate) fn replace_text_file(path: &Path, source: &str) -> io::Result<()> {
         #[cfg(unix)]
         options.mode(0o600);
         let mut file = options.open(&temporary)?;
-        file.write_all(source.as_bytes())?;
+        file.write_all(source)?;
         file.sync_all()?;
         drop(file);
         replace_destination(&temporary, path)?;

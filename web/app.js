@@ -219,6 +219,7 @@
       if (preservePosition && this.playbackState !== "idle") this.updatePosition();
       this.playbackGeneration += 1;
       this.playbackState = "idle";
+      this.cancelSpectrumLoad();
       window.clearInterval(this.timer);
       this.timer = null;
       window.clearTimeout(this.retryTimer);

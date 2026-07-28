@@ -591,6 +591,7 @@ async function run() {
       window.__spectrumTrackIds = [];
       window.__spectrumRequestCount = 0;
       window.__futureSpectrumPending = false;
+      window.__futureSpectrumAborted = false;
       const spectrumResponse = (startMilliseconds) => {
         const frameSamples = 1470;
         const sampleRate = 44100;
@@ -629,11 +630,16 @@ async function run() {
           window.__spectrumRequestCount += 1;
           if (window.__spectrumRequestCount === 1) return spectrumResponse(startMilliseconds);
           window.__futureSpectrumPending = true;
-          return new Promise((resolve) => {
+          return new Promise((resolve, reject) => {
             window.__releaseFutureSpectrum = () => {
               window.__futureSpectrumPending = false;
               resolve(spectrumResponse(startMilliseconds));
             };
+            options?.signal?.addEventListener('abort', () => {
+              window.__futureSpectrumPending = false;
+              window.__futureSpectrumAborted = true;
+              reject(new DOMException('Spectrum request replaced', 'AbortError'));
+            }, { once: true });
           });
         }
         return originalFetch(resource, options);
@@ -674,7 +680,19 @@ async function run() {
       true,
       "current analyzer animation must continue while a future window is rendering",
     );
-    await evaluate(cdp, delayedPrefetchPage.sessionId, "window.__releaseFutureSpectrum()");
+    await evaluate(cdp, delayedPrefetchPage.sessionId, `(() => {
+      document.querySelector('.track-lane').dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }),
+      );
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        delayedPrefetchPage.sessionId,
+        "window.__futureSpectrumAborted",
+      ),
+      "stale future spectrum cancellation during playback seek",
+    );
     await cdp.send("Target.closeTarget", { targetId: delayedPrefetchPage.targetId });
     const appSession = await openPage(cdp, appUrl);
     const consoleErrors = [];
