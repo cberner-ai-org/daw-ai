@@ -1540,6 +1540,25 @@ async function run() {
       true,
       "playback must cache its opening spectrum window",
     );
+    const seekDebouncePlayCalls = await evaluate(
+      cdp,
+      appSession,
+      "window.__transportPlayCalls.length",
+    );
+    await evaluate(cdp, appSession, `(() => {
+      document.querySelector('#rewind-button').click();
+      document.querySelector('#play-button').click();
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        `document.documentElement.dataset.audioState === 'playing' &&
+          window.__transportPlayCalls.length > ${seekDebouncePlayCalls}`,
+      ),
+      "Play starts immediately during a pending seek debounce",
+      10_000,
+    );
     const promptSingleFlight = await evaluate(cdp, appSession, `(async () => {
       const originalFetch = window.fetch;
       const deferred = [];
