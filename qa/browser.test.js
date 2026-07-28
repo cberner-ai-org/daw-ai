@@ -394,12 +394,12 @@ async function run() {
         playbackPriorityPage.sessionId,
         `!document.querySelector('#play-button').disabled`,
       ),
-      "playback readiness without spectrum prefetch",
+      "playback readiness during spectrum prefetch",
     );
     assert.equal(
       await evaluate(cdp, playbackPriorityPage.sessionId, "window.__playbackDrivenSpectrumPending"),
-      false,
-      "spectrum work must not start before playback",
+      true,
+      "the opening spectrum must begin warming when the project is adopted",
     );
     await evaluate(cdp, playbackPriorityPage.sessionId, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -409,7 +409,7 @@ async function run() {
         `document.documentElement.dataset.audioState === 'playing' &&
           window.__playbackDrivenSpectrumPending`,
       ),
-      "spectrum request after playback starts",
+      "playback while the opening spectrum is still warming",
       30_000,
     );
     await cdp.send("Target.closeTarget", { targetId: playbackPriorityPage.targetId });
@@ -431,9 +431,9 @@ async function run() {
       async () => evaluate(
         cdp,
         degradedSpectrumPage.sessionId,
-        `!document.querySelector('#play-button').disabled && window.__failedSpectrumRequests === 0`,
+        `!document.querySelector('#play-button').disabled && window.__failedSpectrumRequests >= 1`,
       ),
-      "transport readiness before degraded spectrum starts",
+      "transport readiness while spectrum warming is degraded",
     );
     await evaluate(cdp, degradedSpectrumPage.sessionId, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -497,9 +497,9 @@ async function run() {
       async () => evaluate(
         cdp,
         longProjectPage.sessionId,
-        `!document.querySelector('#play-button').disabled && window.__spectrumStarts.length === 0`,
+        `!document.querySelector('#play-button').disabled && window.__spectrumStarts.length === 1`,
       ),
-      "playback readiness for a project longer than one spectrum window",
+      "opening spectrum warmup for a project longer than one window",
       10_000,
     );
     await evaluate(cdp, longProjectPage.sessionId, "document.querySelector('#play-button').click()");
@@ -515,7 +515,7 @@ async function run() {
     assert.deepEqual(
       await evaluate(cdp, longProjectPage.sessionId, "window.__spectrumStarts"),
       [0],
-      "long projects must request only their opening spectrum window after playback starts",
+      "long projects must warm only their opening spectrum window",
     );
     await cdp.send("Target.closeTarget", { targetId: longProjectPage.targetId });
     const delayedPrefetchPage = await openPageWithScript(cdp, appUrl, `(() => {
@@ -575,9 +575,9 @@ async function run() {
       async () => evaluate(
         cdp,
         delayedPrefetchPage.sessionId,
-        `!document.querySelector('#play-button').disabled && window.__spectrumRequestCount === 0`,
+        `!document.querySelector('#play-button').disabled && window.__spectrumRequestCount === 1`,
       ),
-      "playback readiness before delayed spectrum prefetch",
+      "playback readiness after opening spectrum prefetch",
     );
     await evaluate(cdp, delayedPrefetchPage.sessionId, "document.querySelector('#play-button').click()");
     await waitFor(
@@ -621,10 +621,14 @@ async function run() {
       async () => evaluate(cdp, appSession, "document.querySelectorAll('.track-row').length === 3"),
       "initial arrangement",
     );
-    assert.equal(
-      await evaluate(cdp, appSession, "document.querySelector('#track-rows').dataset.spectrumCoverage"),
-      undefined,
-      "the analyzer timeline must remain unloaded until playback",
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        appSession,
+        "document.querySelector('#track-rows').dataset.spectrumCoverage !== undefined",
+      ),
+      "opening analyzer window warmup",
+      60_000,
     );
     const timelineMidi = await evaluate(cdp, appSession, `(async () => {
         const project = await fetch('/api/project').then((response) => response.json());
@@ -1296,19 +1300,6 @@ async function run() {
       window.__restoreFetchAfterRefusedEdit();
       document.querySelector('#prompt-input').value = '';
     })()`);
-    const currentVersionSpectrumRequests = await evaluate(cdp, appSession, `(() => {
-      const version = document.querySelector('#saved-state').textContent.match(/\d+/)?.[0];
-      return performance.getEntriesByType('resource').filter(
-        (entry) => entry.name.includes('/api/track-spectrum/') &&
-          entry.name.includes('/' + version + '/'),
-      ).length;
-    })()`);
-    assert.equal(
-      currentVersionSpectrumRequests,
-      0,
-      "project adoption must not start spectrum work before playback",
-    );
-
     await evaluate(cdp, appSession, `(() => {
       const originalPlay = HTMLMediaElement.prototype.play;
       window.__transportMedia = null;

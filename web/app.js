@@ -163,7 +163,6 @@
       window.clearTimeout(this.seekTimer);
       this.seekTimer = null;
       if (!this.project || !this.streamToken || this.playbackState !== "idle") return Promise.resolve();
-      this.cancelSpectrumLoad();
       if (this.playhead >= this.project.duration - 0.01) this.playhead = 0;
       this.playbackState = "starting";
       this.playbackGeneration += 1;
@@ -208,8 +207,7 @@
       const hasStartingSpectrum = this.hasSpectrumAt(this.audioStart);
       if (hasStartingSpectrum) {
         this.startAnalyzers();
-      } else {
-        this.cancelSpectrumLoad();
+      } else if (!this.spectrumLoading) {
         void this.loadTrackSpectrum(this.project, this.spectrumRequestStart(this.audioStart));
       }
       this.tick();
@@ -350,7 +348,7 @@
       try {
         const response = await fetch(
           `/api/track-spectrum/${encodeURIComponent(this.streamToken)}/${project.version}/${Math.round(start * 1000)}`,
-          { cache: "no-store", signal: this.spectrumAbortController.signal },
+          { cache: "default", signal: this.spectrumAbortController.signal },
         );
         if (response.status === 409) return false;
         if (!response.ok) throw new Error(`Track spectrum render failed with HTTP ${response.status}.`);
@@ -629,6 +627,7 @@
     renderRuler();
     renderTracks();
     audio.invalidateSpectrum();
+    void audio.loadTrackSpectrum(project, audio.spectrumRequestStart(audio.playhead));
     reconcilePlaybackReadiness();
     renderSelection();
     renderPlayhead();

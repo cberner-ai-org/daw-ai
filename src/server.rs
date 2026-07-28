@@ -241,6 +241,7 @@ struct Router {
     planner: Planner,
     edit_jobs: Arc<EditJobs>,
     audio_renderer: Arc<AudioRenderer>,
+    spectrum_cache: Arc<Mutex<()>>,
     audio_token: Arc<String>,
     users: Option<Arc<UserRegistry>>,
     history: Arc<Mutex<ProjectHistory>>,
@@ -979,6 +980,38 @@ impl Router {
         );
         let end_sample = (start_sample + window_samples).min(project_end_sample);
         let frame_count = (end_sample - start_sample).div_ceil(SPECTRUM_FRAME_SAMPLES);
+        let cache_path = self.spectrum_cache_path(start_milliseconds, window_samples as u64);
+        let cache_guard = self
+            .spectrum_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(path) = &cache_path {
+            if let Ok(cached) = fs::read(path) {
+                let expected_length = 8usize
+                    .saturating_add(32)
+                    .saturating_add(project.tracks.len().saturating_mul(8))
+                    .saturating_add(
+                        frame_count
+                            .saturating_mul(project.tracks.len())
+                            .saturating_mul(SPECTRUM_BANDS),
+                    );
+                if cached.len() == expected_length
+                    && cached[..8] == version.to_le_bytes()
+                    && cached[8..16] == *TRACK_SPECTRUM_MAGIC
+                {
+                    drop(cache_guard);
+                    write_response_head(
+                        output,
+                        200,
+                        "application/vnd.daw-ai.track-spectrum",
+                        cached.len() - 8,
+                        &[("Cache-Control", "private, max-age=31536000, immutable")],
+                        set_cookie,
+                    )?;
+                    return output.write_all(&cached[8..]);
+                }
+            }
+        }
         let mut body = Vec::with_capacity(
             32 + project.tracks.len() * 8 + frame_count * project.tracks.len() * SPECTRUM_BANDS,
         );
@@ -1026,12 +1059,25 @@ impl Router {
             }
             cursor = chunk_end;
         }
+        if let Some(path) = &cache_path {
+            let mut cached = Vec::with_capacity(8 + body.len());
+            cached.extend_from_slice(&version.to_le_bytes());
+            cached.extend_from_slice(&body);
+            let temporary = path.with_extension("cache.tmp");
+            if let Err(error) =
+                fs::write(&temporary, &cached).and_then(|()| fs::rename(&temporary, path))
+            {
+                eprintln!("warning: could not persist track spectrum cache: {error}");
+                let _ = fs::remove_file(temporary);
+            }
+        }
+        drop(cache_guard);
         write_response_head(
             output,
             200,
             "application/vnd.daw-ai.track-spectrum",
             body.len(),
-            &[("Cache-Control", "no-store")],
+            &[("Cache-Control", "private, max-age=31536000, immutable")],
             set_cookie,
         )?;
         output.write_all(&body)
@@ -1114,6 +1160,7 @@ impl Router {
             planner,
             edit_jobs: Arc::new(EditJobs::new()),
             audio_renderer: Arc::new(AudioRenderer::default()),
+            spectrum_cache: Arc::new(Mutex::new(())),
             audio_token: Arc::new(new_operation_id(0)),
             users: Some(users),
         })
@@ -1130,6 +1177,7 @@ impl Router {
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
             audio_renderer: Arc::new(AudioRenderer::default()),
+            spectrum_cache: Arc::new(Mutex::new(())),
             audio_token: Arc::new("test-audio-token".to_owned()),
             users: None,
         }
@@ -1219,6 +1267,7 @@ impl Router {
             planner: registry.planner.clone(),
             edit_jobs: Arc::new(EditJobs::new()),
             audio_renderer: Arc::new(AudioRenderer::default()),
+            spectrum_cache: Arc::new(Mutex::new(())),
             audio_token: Arc::new(new_operation_id(0)),
             users: None,
         };
@@ -2373,6 +2422,15 @@ impl Router {
             .path()
     }
 
+    fn spectrum_cache_path(&self, start_milliseconds: u64, window_samples: u64) -> Option<PathBuf> {
+        let project_path = self.store.as_ref()?.path();
+        let parent = project_path.parent()?;
+        let project_name = project_path.file_name()?.to_string_lossy();
+        Some(parent.join(format!(
+            ".{project_name}.track-spectrum-{start_milliseconds}-{window_samples}.cache"
+        )))
+    }
+
     fn gemini_session_root(&self) -> PathBuf {
         if let Some(store) = &self.store {
             return store
@@ -2873,6 +2931,7 @@ mod tests {
                 planner: Planner::Demo,
                 edit_jobs: Arc::new(EditJobs::new()),
                 audio_renderer: Arc::new(AudioRenderer::default()),
+                spectrum_cache: Arc::new(Mutex::new(())),
                 audio_token: Arc::new("test-audio-token".to_owned()),
                 users: None,
             },
@@ -3429,6 +3488,7 @@ mod tests {
             planner: Planner::Demo,
             edit_jobs: Arc::new(EditJobs::new()),
             audio_renderer: Arc::new(AudioRenderer::default()),
+            spectrum_cache: Arc::new(Mutex::new(())),
             audio_token: Arc::new("test-audio-token".to_owned()),
             users: None,
         };
@@ -4106,6 +4166,52 @@ mod tests {
                 .unwrap_or(0)
                 > 128
         );
+    }
+
+    #[test]
+    fn persisted_spectrum_is_served_without_entering_the_renderer() {
+        let (router, project_path) = persisted_demo();
+        let mut project = router.lock_studio().project().clone();
+        project.duration = 0.25;
+        *router.lock_studio() = Studio::from_project(project.clone());
+        let path = format!("/api/track-spectrum/test-audio-token/{}/0", project.version);
+        let mut first = Vec::new();
+        router
+            .write_track_spectrum_with_cancel(
+                &request("GET", &path, ""),
+                &mut first,
+                || false,
+                None,
+            )
+            .expect("cold spectrum response");
+        let cache_path = router
+            .spectrum_cache_path(
+                0,
+                audio_analysis::playback_start_sample_milliseconds(MAX_TRACK_SPECTRUM_WINDOW_MS)
+                    as u64,
+            )
+            .expect("spectrum cache path");
+        assert!(cache_path.is_file());
+
+        router
+            .audio_renderer
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rendering = true;
+        let mut second = Vec::new();
+        router
+            .write_track_spectrum_with_cancel(
+                &request("GET", &path, ""),
+                &mut second,
+                || false,
+                None,
+            )
+            .expect("cached spectrum response");
+        assert_eq!(first, second);
+
+        fs::remove_file(cache_path).expect("remove spectrum cache");
+        fs::remove_file(project_path).expect("remove project fixture");
     }
 
     #[test]
