@@ -377,6 +377,34 @@ async function run() {
       60_000,
     );
     await cdp.send("Target.closeTarget", { targetId: startupPage.targetId });
+    const degradedSpectrumPage = await openPageWithScript(cdp, appUrl, `(() => {
+      const originalFetch = window.fetch;
+      window.__failedSpectrumRequests = 0;
+      window.fetch = function fetch(resource, options) {
+        if (typeof resource === 'string' && resource.startsWith('/api/track-spectrum/')) {
+          window.__failedSpectrumRequests += 1;
+          return Promise.resolve(new Response('{"error":"simulated spectrum failure"}', {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' },
+          }));
+        }
+        return originalFetch(resource, options);
+      };
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        degradedSpectrumPage.sessionId,
+        `!document.querySelector('#play-button').disabled && window.__failedSpectrumRequests >= 1`,
+      ),
+      "transport readiness while spectrum preparation is degraded",
+    );
+    await waitFor(
+      async () => evaluate(cdp, degradedSpectrumPage.sessionId, "window.__failedSpectrumRequests >= 4"),
+      "independent spectrum preparation retry",
+      10_000,
+    );
+    await cdp.send("Target.closeTarget", { targetId: degradedSpectrumPage.targetId });
     const longProjectPage = await openPageWithScript(cdp, appUrl, `(() => {
       const originalFetch = window.fetch;
       window.__spectrumStarts = [];
@@ -393,7 +421,7 @@ async function run() {
         if (typeof resource === 'string' && resource.startsWith('/api/track-spectrum/')) {
           const parts = resource.split('/');
           const startMilliseconds = Number(parts[5]);
-          const requestedMilliseconds = Number(parts[6]);
+          const requestedMilliseconds = parts[6] === undefined ? 64000 : Number(parts[6]);
           const durationMilliseconds = Math.min(64000, requestedMilliseconds);
           const project = await originalFetch('/api/project').then((response) => response.json());
           const frameSamples = 1470;
@@ -423,15 +451,15 @@ async function run() {
       async () => evaluate(
         cdp,
         longProjectPage.sessionId,
-        `!document.querySelector('#play-button').disabled && window.__spectrumStarts.length === 2`,
+        `!document.querySelector('#play-button').disabled && window.__spectrumStarts.length === 1`,
       ),
       "playback readiness for a project longer than one spectrum window",
       10_000,
     );
     assert.deepEqual(
       await evaluate(cdp, longProjectPage.sessionId, "window.__spectrumStarts"),
-      [0, 64000],
-      "long projects must prepare consecutive spectrum windows",
+      [0],
+      "long projects must prepare their opening spectrum window without blocking transport",
     );
     await cdp.send("Target.closeTarget", { targetId: longProjectPage.targetId });
     const appSession = await openPage(cdp, appUrl);
@@ -452,11 +480,13 @@ async function run() {
         evaluate(
           cdp,
           appSession,
-          `performance.getEntriesByType('resource').some(
-            (entry) => entry.name.includes('/api/track-spectrum/')
-          )`,
+          `(() => {
+            const coverage = document.querySelector('#track-rows').dataset.spectrumCoverage
+              ?.split(':').map(Number);
+            return coverage?.length === 2 && coverage[0] === 0 && coverage[1] > 0;
+          })()`,
         ),
-      "complete analyzer timeline before playback",
+      "opening analyzer window",
       60_000,
     );
     const timelineMidi = await evaluate(cdp, appSession, `(async () => {
@@ -634,6 +664,11 @@ async function run() {
           localStorage.getItem('daw-ai.pending-edit.v1') === null`,
       ),
       "resumed edit terminal cleanup",
+    );
+    await waitFor(
+      async () => evaluate(cdp, appSession, "!document.querySelector('#play-button').disabled"),
+      "playback readiness after resumed edit cleanup",
+      60_000,
     );
     await cdp.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: resumeEditScript }, appSession);
     await evaluate(cdp, appSession, "document.querySelector('#prompt-input').value = ''");
@@ -1125,12 +1160,6 @@ async function run() {
       document.querySelector('#prompt-input').value = '';
     })()`);
 
-    await waitFor(
-      async () => evaluate(cdp, appSession, "!document.querySelector('#play-button').disabled"),
-      "spectrum readiness before prompted-edit playback",
-      60_000,
-    );
-
     await evaluate(cdp, appSession, `(() => {
       const originalPlay = HTMLMediaElement.prototype.play;
       window.__transportMedia = null;
@@ -1202,7 +1231,18 @@ async function run() {
         ),
       "track response to backend spectrum timeline",
       30_000,
-    );
+    ).catch(async (error) => {
+      const diagnostics = await evaluate(cdp, appSession, `({
+        audioState: document.documentElement.dataset.audioState,
+        displayedTime: document.querySelector('#current-time').textContent,
+        spectrumCoverage: document.querySelector('#track-rows').dataset.spectrumCoverage,
+        spectrumFrame: document.querySelector('#track-rows').dataset.spectrumFrame,
+        requests: performance.getEntriesByType('resource')
+          .filter((entry) => entry.name.includes('/api/track-spectrum/')).map((entry) => entry.name),
+        issues: document.querySelector('#debug-report').value,
+      })`);
+      throw new Error(`${error.message}: ${JSON.stringify(diagnostics)}`);
+    });
     await waitFor(
       async () => evaluate(cdp, appSession, "window.__playbackFrames.length >= 60"),
       "playback frame timing sample",
@@ -1333,12 +1373,11 @@ async function run() {
         cdp,
         appSession,
         `performance.getEntriesByType('resource').some(
-          (entry) => entry.name.includes('/api/track-spectrum/') &&
-            entry.name.endsWith('/${Math.ceil(durationBaseline.duration * 1000)}')
+          (entry) => entry.name.includes('/api/track-spectrum/') && entry.name.endsWith('/0')
         )`,
       ),
       true,
-      "playback must cache one complete spectrum timeline",
+      "playback must cache its opening spectrum window",
     );
     const promptSingleFlight = await evaluate(cdp, appSession, `(async () => {
       const originalFetch = window.fetch;
