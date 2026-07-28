@@ -1413,6 +1413,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_headless_unsafe_presets_when_loading() {
+        let mut project: JsonValue =
+            serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+        project["tracks"][0]["instrument"]["preset"] =
+            JsonValue::String("Factory/Keys/House Organ".to_owned());
+        let error = parse_project(&project.to_string()).expect_err("headless unsafe preset");
+        assert!(error.to_string().contains("preset is unsupported"));
+    }
+
+    #[test]
     fn round_trip_preserves_published_native_effect_defaults() {
         let mut studio = crate::model::Studio::from_project(Project::demo());
         let effect_id = studio
