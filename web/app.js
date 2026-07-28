@@ -595,7 +595,7 @@
   function reconcilePlaybackReadiness() {
     const project = state.project;
     elements.playButton.disabled = !project || !audio.streamToken;
-    return Promise.resolve(!elements.playButton.disabled);
+    return !elements.playButton.disabled;
   }
 
   function adoptProject(project) {
@@ -629,7 +629,7 @@
     renderRuler();
     renderTracks();
     audio.invalidateSpectrum();
-    void reconcilePlaybackReadiness();
+    reconcilePlaybackReadiness();
     renderSelection();
     renderPlayhead();
     renderDebug();
@@ -1498,7 +1498,7 @@
       hideEditProgress();
       elements.composeButton.disabled = false;
       elements.composeButton.querySelector("span").textContent = "Make change";
-      await reconcilePlaybackReadiness();
+      reconcilePlaybackReadiness();
       if (playbackStateCaptured && restorePlayback && !audio.isActive) await audio.start();
     }
   }
