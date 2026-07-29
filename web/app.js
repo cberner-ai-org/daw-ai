@@ -791,6 +791,7 @@
         return `<div class="track-row" style="--track-color:${track.color}">
           <div class="track-label">
             <span class="track-color" aria-hidden="true"></span>
+            <button class="track-mute" type="button" data-track-mute="${track.id}" aria-label="${track.muted ? "Unmute" : "Mute"} ${escapeHtml(track.name)}" aria-pressed="${track.muted}" title="${track.muted ? "Unmute" : "Mute"} track">M</button>
             <span class="track-meta"><strong>${escapeHtml(track.name)}</strong></span>
             <span class="track-spectrum" data-spectrum-track="${track.id}" data-state="unavailable" aria-label="${escapeHtml(track.name)} spectrum analyzer" aria-busy="false">${Array.from({ length: 8 }, () => "<i></i>").join("")}</span>
           </div>
@@ -832,6 +833,20 @@
       );
     }
     return notes.join("");
+  }
+
+  function toggleTrackMute(event) {
+    const button = event.target.closest("[data-track-mute]");
+    if (!button || !state.project) return;
+    const track = state.project.tracks.find((candidate) => String(candidate.id) === button.dataset.trackMute);
+    if (!track) return;
+    button.disabled = true;
+    void enqueueProjectMutation(() => applyProjectMutation({
+      path: "/api/mix",
+      values: { track_id: String(track.id), muted: String(!track.muted) },
+      context: `${track.muted ? "unmuting" : "muting"} ${track.name}`,
+      renderOnFailure: true,
+    }));
   }
 
   function renderSelection() {
@@ -1857,6 +1872,7 @@
   elements.trackRows.addEventListener("dblclick", selectWholeTrackFromDoubleClick);
   elements.trackRows.addEventListener("contextmenu", keepLongPressForTimeline);
   elements.trackRows.addEventListener("keydown", handleTimelineKey);
+  elements.trackRows.addEventListener("click", toggleTrackMute);
   elements.promptForm.addEventListener("submit", submitPrompt);
   elements.playButton.addEventListener("click", () => void audio.toggle());
   elements.rewindButton.addEventListener("click", () => audio.seek(0));

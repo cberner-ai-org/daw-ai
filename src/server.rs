@@ -296,6 +296,7 @@ fn request_needs_user_scope(request: &Request) -> bool {
             | "/api/history"
             | "/api/edits"
             | "/api/duration"
+            | "/api/mix"
             | "/api/undo"
             | "/api/reset"
             | "/api/audio-access"
@@ -1229,13 +1230,16 @@ impl Router {
             ("GET", "/api/history") => self.history_response(),
             ("POST", "/api/edits") => self.start_edit(&request.body),
             ("POST", "/api/duration") => self.change_duration(&request.body),
+            ("POST", "/api/mix") => self.change_mix(&request.body),
             ("POST", "/api/logs") => Self::client_log(&request.body),
             ("POST", "/api/undo") => self.undo(),
             ("POST", "/api/reset") => self.reset(),
             ("POST", "/api/history") => self.select_history(&request.body),
-            (_, "/api/edits" | "/api/duration" | "/api/logs" | "/api/undo" | "/api/reset") => {
-                Response::json(405, error_json("method not allowed")).with_header("Allow", "POST")
-            }
+            (
+                _,
+                "/api/edits" | "/api/duration" | "/api/mix" | "/api/logs" | "/api/undo"
+                | "/api/reset",
+            ) => Response::json(405, error_json("method not allowed")).with_header("Allow", "POST"),
             (_, "/api/project" | "/api/health" | "/api/gemini-sessions") => {
                 Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
             }
@@ -1799,6 +1803,30 @@ impl Router {
         let mut studio = self.lock_studio();
         let mut candidate = studio.clone();
         match candidate.set_duration(duration) {
+            Ok(()) => match self.commit(&mut studio, candidate) {
+                Ok(()) => self.project_response(&studio),
+                Err(response) => response,
+            },
+            Err(error) => Response::json(422, studio_error(error)),
+        }
+    }
+
+    fn change_mix(&self, body: &str) -> Response {
+        let form = parse_form(body);
+        let Some(track_id) = form
+            .get("track_id")
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Response::json(422, error_json("track ID is required"));
+        };
+        let muted = match form.get("muted").map(String::as_str) {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Response::json(422, error_json("muted must be true or false")),
+        };
+        let mut studio = self.lock_studio();
+        let mut candidate = studio.clone();
+        match candidate.set_mix(track_id, None, Some(muted)) {
             Ok(()) => match self.commit(&mut studio, candidate) {
                 Ok(()) => self.project_response(&studio),
                 Err(response) => response,
@@ -2635,6 +2663,48 @@ mod tests {
         assert_eq!(
             router
                 .handle(&request("POST", "/api/duration", "duration=0.5"))
+                .status,
+            422
+        );
+    }
+
+    #[test]
+    fn changes_track_mute_with_server_side_validation() {
+        let router = Router::demo();
+        let project: serde_json::Value =
+            serde_json::from_str(&router.handle(&request("GET", "/api/project", "")).body)
+                .expect("project response");
+        let track_id = project["tracks"][0]["id"].as_u64().expect("track ID");
+        let mut hostile = request(
+            "POST",
+            "/api/mix",
+            &format!("track_id={track_id}&muted=true"),
+        );
+        hostile
+            .headers
+            .insert("origin".to_owned(), "http://attacker.invalid".to_owned());
+        assert_eq!(router.handle(&hostile).status, 403);
+        let changed = router.handle(&request(
+            "POST",
+            "/api/mix",
+            &format!("track_id={track_id}&muted=true"),
+        ));
+        assert_eq!(changed.status, 200);
+        let changed: serde_json::Value = serde_json::from_str(&changed.body).expect("mix response");
+        assert_eq!(changed["tracks"][0]["muted"], true);
+        assert_eq!(
+            router
+                .handle(&request("POST", "/api/mix", "track_id=0&muted=true"))
+                .status,
+            422
+        );
+        assert_eq!(
+            router
+                .handle(&request(
+                    "POST",
+                    "/api/mix",
+                    &format!("track_id={track_id}&muted=yes")
+                ))
                 .status,
             422
         );
