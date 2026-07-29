@@ -23,6 +23,8 @@ multiple users working on their own projects concurrently is supported.
 with their mouse and enter a prompt for the AI describing the change to be made. This might be something
 as simple as "increase volume" or as complex as "insert a sick drop here". The AI then makes those changes.
 
+The UI shows a track for each instrument, and the MIDI notes that are key-zoned to that instrument
+
 There is also a small spectrum analyzer on the left of the timeline for each track, which animates during playback.
 
 After submitting a change request, the submit button becomes an interrupt button.
@@ -50,7 +52,7 @@ The MIDI clips are built into DAW AI, but everything else: Instrument, Effects, 
 those implementations in Surge XT. DAW AI adds only a minimal layer on top to expose them to Gemini, persist settings...etc.
 
 #### MIDI Clip
-Contains notes, including their timing, duration, pitch, and velocity.
+Contains notes, including their timing, duration, pitch, and velocity. Each note is tagged with the instrument key that it is routed to.
 
 #### Instrument:
 Produces sound from MIDI events.
@@ -71,20 +73,22 @@ My also be tempo sync'ed, or configured to trigger off a MIDI note event
 
 
 #### Routing
+
+The MIDI clips uses key zones, where each event is tagged with the instrument that it goes to.
+
+One or more MIDI clips may be used in the arrangement.
+
 Instruments, effects, and modulators can be connected into a sound graph.
 
-Edges in the sound graph carry one of the following types:
+Each MIDI clip connects to one or more Instruments.
 
-* MIDI events: Timed musical events such as note-on, note-off, pitch, velocity, and other performance controls.
-* Audio signal: Mono or stereo digital audio.
-* Control signal: A time-varying numeric value used to control an Instrument or Effect parameter.
+Effect routing is a DAG composed of serial effect chains, parallel sends, and summing buses.
+The implementation maps this to Surge XT’s fixed Scene A/Scene B insert, send, and global-effect topology.
+Arbitrary routing cycles are not required.
 
-Connections must have compatible types:
+Modulators connect to one or more parameters. The implementation should map this to Surge's modulation system.
 
-* MIDI Clip -> Instrument or Modulator: MIDI events
-* Instrument -> Effect: Audio signal
-* Effect -> Effect or Output: Audio signal
-* Modulator -> Instrument or Effect parameter: Control signal
+The final output of all Instruments (w/ optional Effect chain) is mixed together
 
 ### AI editing
 
