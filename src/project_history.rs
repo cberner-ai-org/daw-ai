@@ -404,31 +404,33 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
 }
 
 pub(crate) fn project_document(project: &Project, history: &ProjectHistory) -> String {
-    let mut document = serde_json::from_str::<serde_json::Value>(&project.to_json())
-        .expect("validated project serializes to a JSON object");
-    document
-        .as_object_mut()
-        .expect("a project serializes to an object")
-        .insert("history".to_owned(), history_value(history));
-    format!("{document}\n")
-}
-
-fn history_value(history: &ProjectHistory) -> serde_json::Value {
     #[derive(Serialize)]
-    struct PersistedHistory {
+    struct PersistedHistory<'a> {
         encoding: &'static str,
         current: usize,
-        snapshots: Vec<CompactSnapshot>,
-        parents: Vec<Option<usize>>,
+        snapshots: &'a [CompactSnapshot],
+        parents: &'a [Option<usize>],
     }
 
-    serde_json::to_value(PersistedHistory {
-        encoding: "delta-tree-v3",
-        current: history.current,
-        snapshots: history.snapshots.clone(),
-        parents: history.parents.clone(),
-    })
-    .expect("project history serializes to JSON")
+    let mut document = project.to_json().into_bytes();
+    assert_eq!(
+        document.pop(),
+        Some(b'}'),
+        "validated project serializes to a JSON object"
+    );
+    document.extend_from_slice(b",\"history\":");
+    serde_json::to_writer(
+        &mut document,
+        &PersistedHistory {
+            encoding: "delta-tree-v3",
+            current: history.current,
+            snapshots: &history.snapshots,
+            parents: &history.parents,
+        },
+    )
+    .expect("project history serializes to JSON");
+    document.extend_from_slice(b"}\n");
+    String::from_utf8(document).expect("project history serialization is UTF-8")
 }
 
 #[derive(Clone, Deserialize, Serialize)]
