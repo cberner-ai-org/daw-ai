@@ -1736,7 +1736,7 @@ async function run() {
               detail: 'Gemini is arranging the requested change',
               elapsedSeconds: 73,
               timeoutSeconds: 1200,
-              pollAfterMs: 100,
+              pollAfterMs: 20,
             }), {
               status: 200,
               headers: { 'Content-Type': 'application/json' },
@@ -2213,6 +2213,8 @@ async function run() {
     await evaluate(cdp, appSession, `(() => {
       const originalFetch = window.fetch;
       let competingEditCreated = false;
+      window.__competingAdmissionStatuses = [];
+      window.__competingPollStatuses = [];
       window.fetch = async function fetch(resource, options) {
         if (resource === '/api/edits') {
           window.__missingOperationId = new URLSearchParams(options.body).get('operation_id');
@@ -2225,19 +2227,39 @@ async function run() {
         if (resource === '/api/edits/missing-job') {
           if (!competingEditCreated) {
             competingEditCreated = true;
-            const accepted = await originalFetch('/api/edits', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-              body: new URLSearchParams({
-                prompt: 'increase volume',
-                start: '4',
-                end: '8',
-              }),
-            }).then((response) => response.json());
-            window.__competingOperationId = accepted.operationId;
+            window.__competingOperationId = 'qa-' + crypto.randomUUID().replaceAll('-', '');
+            const body = new URLSearchParams({
+              operation_id: window.__competingOperationId,
+              prompt: 'increase volume',
+              start: '4',
+              end: '8',
+            });
+            const acceptanceDeadline = performance.now() + 5000;
+            let accepted;
+            while (performance.now() < acceptanceDeadline) {
+              const response = await originalFetch('/api/edits', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body,
+              });
+              const payload = await response.json();
+              window.__competingAdmissionStatuses.push(response.status);
+              if (response.ok) {
+                accepted = payload;
+                break;
+              }
+              if (response.status !== 503) throw new Error(payload.error || 'Competing edit was rejected');
+              await new Promise((resolve) => window.setTimeout(resolve, 20));
+            }
+            if (!accepted) throw new Error('Competing edit admission timed out');
+            const completionDeadline = performance.now() + 5000;
             for (;;) {
-              const status = await originalFetch('/api/edits/' + accepted.id).then((response) => response.json());
+              const response = await originalFetch('/api/edits/' + accepted.id);
+              const status = await response.json();
+              window.__competingPollStatuses.push(response.status + ':' + status.status);
+              if (!response.ok) throw new Error(status.error || 'Competing edit status was lost');
               if (status.status === 'completed' || status.status === 'failed') break;
+              if (performance.now() >= completionDeadline) throw new Error('Competing edit timed out');
               await new Promise((resolve) => window.setTimeout(resolve, 20));
             }
           }
@@ -2264,7 +2286,26 @@ async function run() {
           document.querySelector('#toast-message').textContent.startsWith('The edit status was lost')`,
       ),
       "operation-bound status-loss reconciliation",
-    );
+    ).catch(async (error) => {
+      const diagnostics = await evaluate(cdp, appSession, `(async () => {
+        const project = await fetch('/api/project').then((response) => response.json());
+        return {
+          composeDisabled: document.querySelector('#compose-button').disabled,
+          toastError: document.querySelector('#toast').classList.contains('is-error'),
+          toastHidden: document.querySelector('#toast').hidden,
+          toastMessage: document.querySelector('#toast-message').textContent,
+          pendingEdit: localStorage.getItem('daw-ai.pending-edit.v1'),
+          missingOperationId: window.__missingOperationId,
+          competingOperationId: window.__competingOperationId,
+          competingAdmissionStatuses: window.__competingAdmissionStatuses,
+          competingPollStatuses: window.__competingPollStatuses,
+          projectVersion: project.version,
+          editCount: project.edits.length,
+          operationIds: project.editOperations.map((operation) => operation.operationId),
+        };
+      })()`);
+      throw new Error(`${error.message}: ${JSON.stringify(diagnostics)}`);
+    });
     const operationIdentity = await evaluate(cdp, appSession, `(async () => {
       const project = await fetch('/api/project').then((response) => response.json());
       return {

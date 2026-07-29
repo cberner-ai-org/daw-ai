@@ -884,6 +884,17 @@ impl Router {
             #[cfg(test)]
             Ai::GatedDeterministic(_) => TEST_AI_POLL_INTERVAL_MS,
         };
+        let Some(edit_permit) = self.edit_limiter.acquire() else {
+            if let Some(response) = operation_id
+                .and_then(|operation_id| self.edit_jobs.response_for_operation(operation_id))
+            {
+                return response;
+            }
+            return Response::json(
+                503,
+                error_json("the server edit queue is full; retry shortly"),
+            );
+        };
         let Ok((job_id, operation_id, created)) =
             self.edit_jobs.create(poll_after_ms, operation_id)
         else {
@@ -895,13 +906,6 @@ impl Router {
                 .response(job_id)
                 .expect("an existing edit job has a response");
         }
-        let Some(edit_permit) = self.edit_limiter.acquire() else {
-            self.edit_jobs.remove(job_id);
-            return Response::json(
-                503,
-                error_json("the server edit queue is full; retry shortly"),
-            );
-        };
         let edit = EditRequest {
             operation_id: operation_id.clone(),
             prompt: prompt.to_owned(),
@@ -917,7 +921,8 @@ impl Router {
             .name(format!("daw-ai-edit-{job_id}"))
             .spawn(move || worker.run_edit_job(job_id, edit, edit_permit));
         if let Err(error) = spawn {
-            self.edit_jobs.remove(job_id);
+            self.edit_jobs
+                .fail(job_id, 503, "could not start the edit worker".to_owned());
             eprintln!("error: could not start edit worker: {error}");
             return Response::json(503, error_json("could not start the edit worker"));
         }
@@ -1496,14 +1501,14 @@ impl Router {
         let Some(version) = studio.project().version.checked_add(1) else {
             return Response::json(500, error_json("project revision limit reached"));
         };
-        let mut candidate_history = history.clone();
-        let mut project = match candidate_history.checkout(previous_index, studio.project()) {
-            Ok(project) => project,
-            Err(error) => {
-                eprintln!("error: could not materialize undone project state: {error}");
-                return Response::json(500, error_json("could not undo project change"));
-            }
-        };
+        let (mut candidate_history, mut project) =
+            match history.clone().checkout(previous_index, studio.project()) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("error: could not materialize undone project state: {error}");
+                    return Response::json(500, error_json("could not undo project change"));
+                }
+            };
         project.version = version;
         project.edit_operations = studio.project().edit_operations.clone();
         candidate_history.update_current_metadata(&project);
@@ -1589,14 +1594,14 @@ impl Router {
         let Some(version) = studio.project().version.checked_add(1) else {
             return Response::json(500, error_json("project revision limit reached"));
         };
-        let mut candidate_history = history.clone();
-        let mut project = match candidate_history.checkout(index, studio.project()) {
-            Ok(project) => project,
-            Err(error) => {
-                eprintln!("error: could not materialize selected history state: {error}");
-                return Response::json(500, error_json("could not select history state"));
-            }
-        };
+        let (mut candidate_history, mut project) =
+            match history.clone().checkout(index, studio.project()) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("error: could not materialize selected history state: {error}");
+                    return Response::json(500, error_json("could not select history state"));
+                }
+            };
         project.version = version;
         project.edit_operations = studio.project().edit_operations.clone();
         candidate_history.update_current_metadata(&project);
@@ -2095,7 +2100,7 @@ mod tests {
         ));
         fs::write(&path, "{not json}\n").expect("invalid graph fixture");
 
-        let (_, studio, mut history) =
+        let (_, studio, history) =
             open_project_with_history(path.clone()).expect("recovered project");
 
         assert_eq!(history.len(), 1);
@@ -2103,6 +2108,7 @@ mod tests {
             history
                 .checkout(0, studio.project())
                 .expect("initial history state")
+                .1
                 .to_json(),
             studio.project().to_json()
         );
@@ -2388,6 +2394,31 @@ mod tests {
                 .expect("project JSON");
         assert_eq!(project["edits"].as_array().expect("project edits").len(), 1);
         assert!(project["edits"][0]["operationId"].is_null());
+    }
+
+    #[test]
+    fn exhausted_process_capacity_does_not_publish_an_edit_job() {
+        let mut router = Router::demo();
+        let limiter = Limiter::new(1);
+        let held_permit = limiter.acquire().expect("held edit permit");
+        router.edit_limiter = limiter;
+        let body = "operation_id=capacity-operation&start=4&end=8&prompt=increase+volume";
+
+        let rejected = router.handle(&request("POST", "/api/edits", body));
+        assert_eq!(rejected.status, 503);
+        assert!(
+            router
+                .edit_jobs
+                .response_for_operation("capacity-operation")
+                .is_none()
+        );
+
+        drop(held_permit);
+        let accepted = router.handle(&request("POST", "/api/edits", body));
+        assert_eq!(accepted.status, 202);
+        let completed = wait_for_edit(&router, &accepted);
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["operationId"], "capacity-operation");
     }
 
     #[test]
