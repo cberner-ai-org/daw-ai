@@ -1493,14 +1493,20 @@ impl Router {
         let Some(previous_index) = history.parent(history.current) else {
             return Response::json(409, error_json("nothing to undo"));
         };
-        let mut project = history.snapshots[previous_index].clone();
         let Some(version) = studio.project().version.checked_add(1) else {
             return Response::json(500, error_json("project revision limit reached"));
         };
-        project.version = version;
         let mut candidate_history = history.clone();
-        candidate_history.current = previous_index;
-        candidate_history.snapshots[previous_index] = project.clone();
+        let mut project = match candidate_history.checkout(previous_index, studio.project()) {
+            Ok(project) => project,
+            Err(error) => {
+                eprintln!("error: could not materialize undone project state: {error}");
+                return Response::json(500, error_json("could not undo project change"));
+            }
+        };
+        project.version = version;
+        project.edit_operations = studio.project().edit_operations.clone();
+        candidate_history.update_current_metadata(&project);
         if let Err(error) = self.save_state(&project, &mut candidate_history) {
             eprintln!("error: could not save undone project state: {error}");
             return Response::json(500, error_json("could not undo project change"));
@@ -1536,52 +1542,29 @@ impl Router {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entries = history
-            .snapshots
-            .iter()
+            .entries()
             .enumerate()
-            .map(|(index, project)| {
-                let previous_edit_count = history
-                    .parent(index)
-                    .and_then(|parent| history.snapshots.get(parent))
-                    .map_or(0, |previous| previous.edits.len());
-                let edit = (project.edits.len() > previous_edit_count)
-                    .then(|| project.edits.last())
-                    .flatten();
-                let (summary, source, prompt, start, end) = if index == 0 {
-                    ("Initial project", "Project", None, None, None)
-                } else if let Some(edit) = edit {
-                    let source = project
-                        .edit_operations
-                        .iter()
-                        .find(|operation| operation.project_version == project.version)
-                        .map_or("Gemini", |operation| operation.source.as_str());
-                    (
-                        edit.summary.as_str(),
-                        source,
-                        Some(edit.prompt.as_str()),
-                        Some(edit.start),
-                        Some(edit.end),
-                    )
-                } else {
-                    ("Manual project change", "Manual", None, None, None)
-                };
+            .map(|(index, entry)| {
                 serde_json::json!({
                     "index":index,
-                    "version":project.version,
-                    "summary":summary,
-                    "source":source,
-                    "prompt":prompt,
-                    "start":start,
-                    "end":end
+                    "version":entry.version,
+                    "summary":entry.summary,
+                    "source":entry.source,
+                    "prompt":entry.prompt,
+                    "start":entry.start,
+                    "end":entry.end
                 })
             })
             .collect::<Vec<_>>();
+        let current = history
+            .entry(history.current)
+            .expect("project history contains its current entry");
         Response::json(
             200,
             serde_json::json!({
                 "current":history.current,
-                "currentVersion":history.snapshots[history.current].version,
-                "currentEditCount":history.snapshots[history.current].edits.len(),
+                "currentVersion":current.version,
+                "currentEditCount":current.edit_count,
                 "entries":entries
             })
             .to_string(),
@@ -1600,16 +1583,23 @@ impl Router {
             .history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(mut project) = history.snapshots.get(index).cloned() else {
+        if index >= history.len() {
             return Response::json(404, error_json("history state not found"));
-        };
+        }
         let Some(version) = studio.project().version.checked_add(1) else {
             return Response::json(500, error_json("project revision limit reached"));
         };
-        project.version = version;
         let mut candidate_history = history.clone();
-        candidate_history.current = index;
-        candidate_history.snapshots[index] = project.clone();
+        let mut project = match candidate_history.checkout(index, studio.project()) {
+            Ok(project) => project,
+            Err(error) => {
+                eprintln!("error: could not materialize selected history state: {error}");
+                return Response::json(500, error_json("could not select history state"));
+            }
+        };
+        project.version = version;
+        project.edit_operations = studio.project().edit_operations.clone();
+        candidate_history.update_current_metadata(&project);
         if let Err(error) = self.save_state(&project, &mut candidate_history) {
             eprintln!("error: could not save selected history state: {error}");
             return Response::json(500, error_json("could not select history state"));
@@ -1641,10 +1631,12 @@ impl Router {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        history.push(candidate.project().clone()).map_err(|error| {
-            eprintln!("error: could not extend project history: {error}");
-            Response::json(500, error_json("could not save project history"))
-        })?;
+        history
+            .push(studio.project(), candidate.project())
+            .map_err(|error| {
+                eprintln!("error: could not extend project history: {error}");
+                Response::json(500, error_json("could not save project history"))
+            })?;
         if let Err(error) = self.save_state(candidate.project(), &mut history) {
             eprintln!("error: could not save project history: {error}");
             return Err(Response::json(
@@ -1670,10 +1662,7 @@ impl Router {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let current = history.current;
-        if let Some(snapshot) = history.snapshots.get_mut(current) {
-            *snapshot = candidate.project().clone();
-        }
+        history.update_current_metadata(candidate.project());
         if let Err(error) = self.save_state(candidate.project(), &mut history) {
             eprintln!("error: could not save project history metadata: {error}");
             return Err(Response::json(
@@ -2106,11 +2095,17 @@ mod tests {
         ));
         fs::write(&path, "{not json}\n").expect("invalid graph fixture");
 
-        let (_, studio, history) =
+        let (_, studio, mut history) =
             open_project_with_history(path.clone()).expect("recovered project");
 
-        assert_eq!(history.snapshots.len(), 1);
-        assert_eq!(history.snapshots[0].to_json(), studio.project().to_json());
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history
+                .checkout(0, studio.project())
+                .expect("initial history state")
+                .to_json(),
+            studio.project().to_json()
+        );
         ProjectStore::open(path.clone()).expect("replacement project is valid");
         let prefix = format!("{}.invalid-", path.file_name().unwrap().to_string_lossy());
         let quarantined = fs::read_dir(path.parent().unwrap())
@@ -2976,14 +2971,18 @@ mod tests {
 
     #[test]
     fn history_keeps_every_committed_state() {
-        let mut history = ProjectHistory::new(Studio::new().project().clone());
+        let mut current = Studio::new().project().clone();
+        let mut history = ProjectHistory::new(current.clone());
         for index in 0..8 {
             let mut project = Studio::new().project().clone();
             project.name = index.to_string();
             project.version += index + 1;
-            history.push(project).expect("append project history");
+            history
+                .push(&current, &project)
+                .expect("append project history");
+            current = project;
         }
-        assert_eq!(history.snapshots.len(), 9);
+        assert_eq!(history.len(), 9);
         assert_eq!(history.current, 8);
     }
 
