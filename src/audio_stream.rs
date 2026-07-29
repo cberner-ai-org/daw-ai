@@ -65,23 +65,42 @@ pub(crate) fn wait_for_playback_window(
     stream_started: Instant,
     is_cancelled: &impl Fn() -> bool,
 ) -> bool {
+    wait_for_playback_window_with(
+        generated_samples,
+        lookahead_samples,
+        sample_rate,
+        || stream_started.elapsed(),
+        std::thread::sleep,
+        is_cancelled,
+    )
+}
+
+fn wait_for_playback_window_with(
+    generated_samples: usize,
+    lookahead_samples: usize,
+    sample_rate: u32,
+    elapsed_time: impl Fn() -> Duration,
+    mut wait: impl FnMut(Duration),
+    is_cancelled: &impl Fn() -> bool,
+) -> bool {
     let paced_samples = generated_samples.saturating_sub(lookahead_samples);
     let target = Duration::from_secs_f64(paced_samples as f64 / f64::from(sample_rate));
     loop {
         if is_cancelled() {
             return false;
         }
-        let elapsed = stream_started.elapsed();
+        let elapsed = elapsed_time();
         if elapsed >= target {
             return true;
         }
-        std::thread::sleep((target - elapsed).min(Duration::from_millis(50)));
+        wait((target - elapsed).min(Duration::from_millis(50)));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn bounds_open_ranges_without_losing_odd_byte_alignment() {
@@ -96,5 +115,53 @@ mod tests {
     fn rejects_multiple_or_unsatisfied_ranges() {
         assert!(bounded_audio_byte_range("bytes=0-1,4-5", 100, 20).is_err());
         assert!(bounded_audio_byte_range("bytes=100-", 100, 20).is_err());
+    }
+
+    #[test]
+    fn playback_window_allows_lookahead_and_honors_cancellation() {
+        let started = Instant::now();
+        assert!(wait_for_playback_window(1_000, 1_000, 1, started, &|| {
+            false
+        }));
+        assert!(!wait_for_playback_window(2_000, 1_000, 1, started, &|| {
+            true
+        }));
+    }
+
+    #[test]
+    fn playback_window_waits_until_release_and_can_cancel_mid_wait() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let waits = Cell::new(0);
+        assert!(wait_for_playback_window_with(
+            1_500,
+            1_000,
+            1_000,
+            || elapsed.get(),
+            |duration| {
+                waits.set(waits.get() + 1);
+                elapsed.set(elapsed.get() + duration);
+            },
+            &|| false,
+        ));
+        assert_eq!(elapsed.get(), Duration::from_millis(500));
+        assert_eq!(waits.get(), 10);
+
+        elapsed.set(Duration::ZERO);
+        waits.set(0);
+        let cancelled = Cell::new(false);
+        assert!(!wait_for_playback_window_with(
+            1_500,
+            1_000,
+            1_000,
+            || elapsed.get(),
+            |duration| {
+                waits.set(waits.get() + 1);
+                elapsed.set(elapsed.get() + duration);
+                cancelled.set(true);
+            },
+            &|| cancelled.get(),
+        ));
+        assert_eq!(elapsed.get(), Duration::from_millis(50));
+        assert_eq!(waits.get(), 1);
     }
 }
