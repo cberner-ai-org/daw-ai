@@ -430,14 +430,14 @@ pub(crate) fn session_summaries() -> io::Result<Vec<JsonValue>> {
 pub(crate) fn session_summaries_in(root: &Path) -> io::Result<Vec<JsonValue>> {
     // Visible session state must always reflect lease reconciliation and retention.
     apply_session_retention(root)?;
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
+    let Some(entries) = tolerate_missing(fs::read_dir(root))? else {
+        return Ok(Vec::new());
     };
     let mut sessions = Vec::new();
     for entry in entries {
-        let entry = entry?;
+        let Some(entry) = tolerate_missing(entry)? else {
+            continue;
+        };
         let path = entry.path().join(SESSION_FILE);
         if !path.is_file() {
             continue;
@@ -479,16 +479,19 @@ pub(crate) fn apply_session_retention_with(
     root: &Path,
     policy: SessionRetention,
 ) -> io::Result<()> {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+    let Some(entries) = tolerate_missing(fs::read_dir(root))? else {
+        return Ok(());
     };
     let mut sessions = Vec::new();
     let now = SystemTime::now();
     for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        let Some(entry) = tolerate_missing(entry)? else {
+            continue;
+        };
+        let Some(file_type) = tolerate_missing(entry.file_type())? else {
+            continue;
+        };
+        if !file_type.is_dir() {
             continue;
         }
         let metadata_path = entry.path().join(SESSION_FILE);
@@ -538,15 +541,26 @@ pub(crate) fn apply_session_retention_with(
         if !expired && !over_budget {
             continue;
         }
-        for entry in fs::read_dir(&session.path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_symlink() {
+        let Some(entries) = tolerate_missing(fs::read_dir(&session.path))? else {
+            continue;
+        };
+        for entry in entries {
+            let Some(entry) = tolerate_missing(entry)? else {
+                continue;
+            };
+            let Some(file_type) = tolerate_missing(entry.file_type())? else {
+                continue;
+            };
+            if file_type.is_symlink() {
                 continue;
             }
             let is_audio = entry.path().extension().and_then(|value| value.to_str()) == Some("wav");
             if is_audio {
-                let bytes = entry.metadata()?.len();
-                fs::remove_file(entry.path())?;
+                let Some(metadata) = tolerate_missing(entry.metadata())? else {
+                    continue;
+                };
+                let bytes = metadata.len();
+                let _ = tolerate_missing(fs::remove_file(entry.path()))?;
                 session.bytes = session.bytes.saturating_sub(bytes);
                 total_bytes = total_bytes.saturating_sub(bytes);
             }
@@ -560,7 +574,7 @@ pub(crate) fn apply_session_retention_with(
         {
             continue;
         }
-        fs::remove_dir_all(&session.path)?;
+        let _ = tolerate_missing(fs::remove_dir_all(&session.path))?;
         retained_count = retained_count.saturating_sub(1);
         total_bytes = total_bytes.saturating_sub(session.bytes);
     }
@@ -587,20 +601,39 @@ fn valid_session_metadata(path: &Path, metadata: &JsonValue) -> bool {
 }
 
 fn directory_bytes(path: &Path) -> io::Result<u64> {
+    let Some(entries) = tolerate_missing(fs::read_dir(path))? else {
+        return Ok(0);
+    };
     let mut bytes = 0_u64;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.path().symlink_metadata()?;
-        if metadata.file_type().is_symlink() {
+    for entry in entries {
+        let Some(entry) = tolerate_missing(entry)? else {
             continue;
-        }
-        bytes = bytes.saturating_add(if metadata.is_dir() {
-            directory_bytes(&entry.path())?
-        } else {
-            metadata.len()
-        });
+        };
+        bytes = bytes.saturating_add(directory_entry_bytes(&entry)?);
     }
     Ok(bytes)
+}
+
+fn directory_entry_bytes(entry: &fs::DirEntry) -> io::Result<u64> {
+    let Some(metadata) = tolerate_missing(entry.path().symlink_metadata())? else {
+        return Ok(0);
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_dir() {
+        directory_bytes(&entry.path())
+    } else {
+        Ok(metadata.len())
+    }
+}
+
+fn tolerate_missing<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn configured_u64(name: &str, default: u64) -> u64 {
@@ -656,6 +689,32 @@ pub(crate) fn write_replace(path: &Path, source: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_sizing_ignores_disappearing_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-disappearing-session-artifact-{}-{}",
+            std::process::id(),
+            SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("artifact test directory");
+        let artifact = root.join("edit-progress");
+        fs::create_dir(&artifact).expect("temporary artifact directory");
+        fs::write(artifact.join("plan.json"), b"temporary").expect("temporary artifact");
+        let entry = fs::read_dir(&root)
+            .expect("artifact directory")
+            .next()
+            .expect("artifact entry")
+            .expect("read artifact entry");
+        fs::remove_dir_all(&artifact).expect("remove temporary artifact");
+
+        assert_eq!(directory_entry_bytes(&entry).expect("disappeared entry"), 0);
+        assert_eq!(
+            directory_bytes(&artifact).expect("disappeared directory"),
+            0
+        );
+        fs::remove_dir_all(root).expect("remove artifact test directory");
+    }
 
     #[test]
     fn listing_reconciles_an_abandoned_running_session() {

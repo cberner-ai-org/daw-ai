@@ -2369,6 +2369,10 @@ fn undo_agent_mutation(
     Ok(serde_json::json!({
         "message":summary,
         "version":restored.version,
+        "selection": {
+            "start": restored_start,
+            "end": restored_end
+        },
         "channels":sound_tool_inventory(&restored)
     })
     .to_string())
@@ -4298,7 +4302,13 @@ mod tests {
         assert_eq!(metadata["start"], 16.0);
         assert_eq!(metadata["end"], 32.0);
 
-        apply_agent_mutation(session.path(), "undo", &serde_json::json!({})).expect("undo tempo");
+        let undo: JsonValue = serde_json::from_str(
+            &apply_agent_mutation(session.path(), "undo", &serde_json::json!({}))
+                .expect("undo tempo"),
+        )
+        .expect("undo response");
+        assert_eq!(undo["selection"]["start"], 8.0);
+        assert_eq!(undo["selection"]["end"], 16.0);
         session.take_update().unwrap().expect("undo update");
         assert_eq!(edit_selection(session.path()).unwrap(), (8.0, 16.0));
 
