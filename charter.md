@@ -74,15 +74,14 @@ May also be tempo sync'ed, or configured to trigger off a MIDI note event
 
 #### Routing
 
-MIDI clips uses key zones, where ranges of notes are configured to route to an instrument instance.
-Multiple key zones, routing to different instruments, per MIDI clip are supported. Multiple zones may route
-to the same instrument, and zones may overlap.
+MIDI clips contain MIDI notes and connect to an Instrument Rack which routes them to one or more Instruments.
+The Rack uses key zones, where ranges of notes are configured to route to an Instrument instance.
+Multiple key zones, routing to different instruments, are supported. Multiple zones may route
+to the same Instrument, and zones may overlap.
 
 One or more MIDI clips may be used in the arrangement.
 
 Instruments, effects, and modulators can be connected into a sound graph.
-
-A MIDI clip may contain notes routed to different Instruments
 
 Effect routing is a DAG composed of serial effect chains, parallel sends, and summing buses.
 The implementation maps this to Surge XT’s fixed Scene A/Scene B insert, send, and global-effect topology.
