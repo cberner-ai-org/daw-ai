@@ -914,7 +914,7 @@ pub(crate) fn is_native_effect(name: &str) -> bool {
 }
 
 pub(crate) fn is_headless_safe_effect(name: &str) -> bool {
-    is_native_effect(name) && !matches!(name, "Audio Input" | "Spring Reverb" | "Tape" | "Vocoder")
+    is_native_effect(name) && !matches!(name, "Audio Input" | "Spring Reverb" | "Vocoder")
 }
 
 fn parameter_map(synth: &SurgeSynthesizer) -> HashMap<String, i32> {
@@ -1440,7 +1440,7 @@ mod tests {
                     &[77],
                     &[],
                     1,
-                    16_000.0,
+                    crate::audio_analysis::SAMPLE_RATE as f32,
                 )
                 .unwrap_or_else(|error| panic!("{name} did not load: {error}"));
                 engine.play_note(48, 0.8, iteration);

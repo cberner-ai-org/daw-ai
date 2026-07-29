@@ -1206,7 +1206,7 @@ mod tests {
 
     #[test]
     fn rejects_headless_unsafe_effects_when_loading() {
-        for name in ["Audio Input", "Spring Reverb", "Tape", "Vocoder"] {
+        for name in ["Audio Input", "Spring Reverb", "Vocoder"] {
             let source = project_with_eq().to_json().replacen(
                 "\"name\":\"EQ\"",
                 &format!("\"name\":\"{name}\""),

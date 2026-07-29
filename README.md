@@ -52,6 +52,8 @@ cargo run -- --port 8888
 5. Use **Duration** in AI Mode to set the song length from 1 second to 5 minutes. Shortening a song trims arrangement content past the new endpoint, and the change can be undone.
 6. The **Debug** tab lists retained AI sessions, provides a copyable environment and browser-error report, and can omit objective audio metrics from Gemini listening responses. Gemini still receives the rendered audio when metrics are disabled.
 
+Playback and WAV exports are rendered by Surge XT as 48 kHz, 16-bit stereo audio.
+
 No login is required. DAW-AI assigns each browser a private random cookie and stores its project under `users/<cookie>/sound-graph.json` beside `DAW_AI_PROJECT_PATH` (or beside the working-directory default). Each user has independent edit jobs, history, playback, and project state. DAW-AI creates the demo graph for a new user and safely saves every accepted prompt, undo, reset, and history selection.
 
 For each prompt, Gemini receives the edit range and checked-in studio contract under `gemini/`, along with registered stable-ID graph tools for reads, mutations, control discovery, undo, and Surge XT rendering. Gemini receives listening renders as audio input. Listening is independent of edit scope and model-directed.

@@ -11,15 +11,16 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value as JsonValue;
 
+use crate::gemini_session::{EditSession, SessionVariants, apply_session_retention};
 #[cfg(test)]
 use crate::gemini_tools::render_audio_request;
 use crate::gemini_tools::{
     ANALYZE_AUDIO_TOOL_NAME, AUDIO_TOOL_NAME, AUDITION_TOOL_NAME, AudioRender, AudioRenderRequest,
-    EditSession, INSTRUMENT_PARAMETER_TOOL_NAME, LOAD_TOOL_GROUP_NAME, PRESET_TOOL_NAME,
-    READ_TOOL_NAME, SOUND_TOOL_PARAMETER_TOOL_NAME, SessionVariants, apply_agent_mutation,
-    base64_audio, dynamic_tool_declarations, is_batch_mutation_tool, is_mutation_tool,
-    list_instrument_parameters, list_sound_tool_parameters, list_surge_presets,
-    prepare_audio_render, prepare_instrument_audition, read_sound_graph, tool_declarations,
+    INSTRUMENT_PARAMETER_TOOL_NAME, LOAD_TOOL_GROUP_NAME, PRESET_TOOL_NAME, READ_TOOL_NAME,
+    SOUND_TOOL_PARAMETER_TOOL_NAME, apply_agent_mutation, base64_audio, dynamic_tool_declarations,
+    is_batch_mutation_tool, is_mutation_tool, list_instrument_parameters,
+    list_sound_tool_parameters, list_surge_presets, prepare_audio_render,
+    prepare_instrument_audition, read_sound_graph, tool_declarations,
 };
 use crate::model::Project;
 use crate::prompt::EditPlan;
@@ -202,7 +203,7 @@ impl GeminiPlanner {
         if let Err(error) = session.update_status(status, &detail, applied_steps, audio_listens) {
             eprintln!("warning: could not finalize Gemini session metadata: {error}");
         }
-        if let Err(error) = crate::gemini_tools::apply_session_retention(session_root) {
+        if let Err(error) = apply_session_retention(session_root) {
             eprintln!("warning: could not apply Gemini session retention: {error}");
         }
         result
