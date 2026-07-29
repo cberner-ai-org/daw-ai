@@ -112,10 +112,6 @@ impl EditJobs {
         self.response(id)
     }
 
-    pub(crate) fn remove(&self, id: u64) {
-        self.lock().remove(&id);
-    }
-
     pub(crate) fn set_running(&self, id: u64, phase: &'static str, detail: impl Into<String>) {
         if let Some(job) = self.lock().get_mut(&id) {
             job.state = EditJobState::Running {

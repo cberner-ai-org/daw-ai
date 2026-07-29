@@ -135,7 +135,11 @@ impl ProjectHistory {
         Ok(())
     }
 
-    pub(crate) fn checkout(&mut self, index: usize, current: &Project) -> io::Result<Project> {
+    pub(crate) fn checkout(
+        mut self,
+        index: usize,
+        current: &Project,
+    ) -> io::Result<(Self, Project)> {
         if index >= self.snapshots.len() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -143,13 +147,11 @@ impl ProjectHistory {
             ));
         }
         if index == self.current {
-            return Ok(history_project(current));
+            return Ok((self, history_project(current)));
         }
-        let mut candidate = self.clone();
         let project =
-            candidate.reroot_with_peak_limit(index, current, MAX_CHECKOUT_PEAK_SOURCE_BYTES)?;
-        *self = candidate;
-        Ok(project)
+            self.reroot_with_peak_limit(index, current, MAX_CHECKOUT_PEAK_SOURCE_BYTES)?;
+        Ok((self, project))
     }
 
     fn reroot_with_peak_limit(
@@ -608,7 +610,7 @@ mod tests {
             store.read().expect("committed project").to_json(),
             project.to_json()
         );
-        let mut loaded = load_project_history(&path, &project).expect("embedded history");
+        let loaded = load_project_history(&path, &project).expect("embedded history");
         assert_eq!(loaded.current, 1);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.parent(1), Some(0));
@@ -616,6 +618,7 @@ mod tests {
             loaded
                 .checkout(0, &project)
                 .expect("materialized initial state")
+                .1
                 .to_json(),
             initial.to_json()
         );
@@ -663,9 +666,10 @@ mod tests {
             .push(&initial, &second)
             .expect("append forward history");
 
-        let restored = history
+        let (selected_history, restored) = history
             .checkout(0, &second)
             .expect("select initial history");
+        history = selected_history;
         let mut branch = restored.clone();
         branch.name = "Branch".to_owned();
         branch.version += 2;
@@ -675,11 +679,12 @@ mod tests {
 
         assert_eq!(history.len(), 3);
         assert_eq!(history.parent(2), Some(0));
-        let mut selected = history.clone();
         assert_eq!(
-            selected
+            history
+                .clone()
                 .checkout(1, &branch)
                 .expect("retained forward state")
+                .1
                 .name,
             "Forward"
         );
@@ -695,7 +700,8 @@ mod tests {
         history
             .push(&current, &second)
             .expect("append unicode snapshot");
-        let restored = history.checkout(0, &second).expect("select initial");
+        let (selected_history, restored) = history.checkout(0, &second).expect("select initial");
+        history = selected_history;
         let mut branch = restored.clone();
         branch.name = "Branch".to_owned();
         branch.version += 2;
@@ -710,7 +716,7 @@ mod tests {
         let path = root.join("sound-graph.json");
         fs::write(&path, project_document(&branch, &history)).expect("compact history");
 
-        let mut loaded = load_project_history(&path, &branch).expect("load compact history");
+        let loaded = load_project_history(&path, &branch).expect("load compact history");
         assert_eq!(loaded.current, 2);
         assert_eq!(loaded.parent(1), Some(0));
         assert_eq!(loaded.parent(2), Some(0));
@@ -718,6 +724,7 @@ mod tests {
             loaded
                 .checkout(1, &branch)
                 .expect("load forward branch")
+                .1
                 .name,
             "Mix \u{2603}"
         );
@@ -798,9 +805,10 @@ mod tests {
 
         for _ in 0..16 {
             let previous = history.parent(history.current).expect("previous snapshot");
-            let mut restored = history
+            let (selected_history, mut restored) = history
                 .checkout(previous, &current)
                 .expect("lazy one-step checkout");
+            history = selected_history;
             restored.version = current.version + 1;
             history.update_current_metadata(&restored);
             current = restored;

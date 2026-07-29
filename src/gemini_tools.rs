@@ -1805,14 +1805,12 @@ pub(crate) fn apply_agent_mutation(
         "version": studio.project().version,
         "id": result_id,
         "channels": sound_tool_inventory(studio.project()),
-        "selection": {
-            "start": response_selection_start,
-            "end": response_selection_end
-        },
-        "timing": {
-            "bpm": studio.project().bpm,
-            "secondsPerBeat": 60.0 / f64::from(studio.project().bpm)
-        }
+        "selection": mutation_selection(
+            studio.project(),
+            response_selection_start,
+            response_selection_end
+        ),
+        "timing": mutation_timing(studio.project())
     });
     if matches!(name, "add_midi_clip" | "update_midi_clip") {
         let start_beats = required_number(object, "startBeat")?;
@@ -2369,13 +2367,32 @@ fn undo_agent_mutation(
     Ok(serde_json::json!({
         "message":summary,
         "version":restored.version,
-        "selection": {
-            "start": restored_start,
-            "end": restored_end
-        },
+        "selection":mutation_selection(&restored, restored_start, restored_end),
+        "timing":mutation_timing(&restored),
         "channels":sound_tool_inventory(&restored)
     })
     .to_string())
+}
+
+fn mutation_selection(project: &Project, start: f32, end: f32) -> JsonValue {
+    let beats_per_second = f32::from(project.bpm) / 60.0;
+    serde_json::json!({
+        "start": start,
+        "end": end,
+        "startSeconds": start,
+        "endSeconds": end,
+        "durationSeconds": end - start,
+        "startBeats": start * beats_per_second,
+        "endBeats": end * beats_per_second,
+        "durationBeats": (end - start) * beats_per_second
+    })
+}
+
+fn mutation_timing(project: &Project) -> JsonValue {
+    serde_json::json!({
+        "bpm": project.bpm,
+        "secondsPerBeat": 60.0 / f64::from(project.bpm)
+    })
 }
 
 #[cfg(test)]
@@ -4309,28 +4326,33 @@ mod tests {
         .expect("undo response");
         assert_eq!(undo["selection"]["start"], 8.0);
         assert_eq!(undo["selection"]["end"], 16.0);
+        assert_eq!(undo["selection"]["startSeconds"], 8.0);
+        assert_eq!(undo["selection"]["endSeconds"], 16.0);
+        assert_eq!(undo["selection"]["durationSeconds"], 8.0);
+        assert_eq!(undo["selection"]["startBeats"], 16.0);
+        assert_eq!(undo["selection"]["endBeats"], 32.0);
+        assert_eq!(undo["selection"]["durationBeats"], 16.0);
+        assert_eq!(undo["timing"]["bpm"], 120);
+        assert_eq!(undo["timing"]["secondsPerBeat"], 0.5);
         session.take_update().unwrap().expect("undo update");
         assert_eq!(edit_selection(session.path()).unwrap(), (8.0, 16.0));
 
-        apply_agent_mutation(session.path(), "set_tempo", &serde_json::json!({"bpm":60}))
-            .expect("slower tempo again");
-        session.take_update().unwrap().expect("second tempo update");
         apply_agent_mutation(
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
                 "trackId":track_id,
-                "label":"Moved phrase",
-                "startBeat":16,
-                "durationBeats":16,
+                "label":"Restored phrase",
+                "startBeat":undo["selection"]["startBeats"],
+                "durationBeats":undo["selection"]["durationBeats"],
                 "playback":{"mode":"once"},
                 "events":[{"time":0,"duration":1,"pitch":60,"velocity":0.8}]
             }),
         )
-        .expect("MIDI mutation in rescaled selection");
+        .expect("MIDI mutation with restored timing");
         let (_, project) = session.take_update().unwrap().expect("MIDI update");
         let clip = project.tracks[0].clips.last().expect("new clip");
-        assert_eq!((clip.start, clip.end), (16.0, 32.0));
+        assert_eq!((clip.start, clip.end), (8.0, 16.0));
     }
 
     #[test]
