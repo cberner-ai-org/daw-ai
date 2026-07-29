@@ -772,6 +772,7 @@ impl Router {
         if let Some(job_id) = interrupted_edit_job_id(&request.path) {
             return if request.method == "POST" {
                 if self.edit_jobs.interrupt(job_id) {
+                    self.audio_renderer.wake_waiters();
                     self.edit_jobs.response(job_id).expect("interrupted job")
                 } else {
                     Response::json(409, error_json("edit job is not interruptible"))
@@ -1321,6 +1322,8 @@ impl Router {
                     summary: summary.clone(),
                 },
                 project,
+                selection_start: edit.start,
+                selection_end: edit.end,
             },
         )
         .map_err(planner_failure)?;
@@ -1349,8 +1352,8 @@ impl Router {
         candidate
             .replace_graph(
                 graph_edit.project,
-                edit.start,
-                edit.end,
+                graph_edit.selection_start,
+                graph_edit.selection_end,
                 &edit.prompt,
                 graph_edit.plan,
             )
@@ -1638,7 +1641,10 @@ impl Router {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        history.push(candidate.project().clone());
+        history.push(candidate.project().clone()).map_err(|error| {
+            eprintln!("error: could not extend project history: {error}");
+            Response::json(500, error_json("could not save project history"))
+        })?;
         if let Err(error) = self.save_state(candidate.project(), &mut history) {
             eprintln!("error: could not save project history: {error}");
             return Err(Response::json(
@@ -2975,7 +2981,7 @@ mod tests {
             let mut project = Studio::new().project().clone();
             project.name = index.to_string();
             project.version += index + 1;
-            history.push(project);
+            history.push(project).expect("append project history");
         }
         assert_eq!(history.snapshots.len(), 9);
         assert_eq!(history.current, 8);

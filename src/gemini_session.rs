@@ -18,6 +18,7 @@ pub(crate) const PENDING_PROGRESS_DIRECTORY: &str = ".edit-progress.pending";
 pub(crate) const PROGRESS_PLAN_FILE: &str = "plan.json";
 pub(crate) const PROGRESS_GRAPH_FILE: &str = "project.json";
 pub(crate) const UNDO_GRAPH_FILE: &str = "undo-sound-graph.json";
+pub(crate) const UNDO_REQUEST_FILE: &str = "undo-request.json";
 pub(crate) const MAX_SOUND_GRAPH_BYTES: u64 = MAX_PROJECT_BYTES as u64;
 pub(crate) const MAX_SESSION_JSON_BYTES: u64 = 64 * 1024;
 const MAX_PROGRESS_PLAN_BYTES: u64 = 64 * 1024;

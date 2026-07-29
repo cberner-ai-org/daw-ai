@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{Project, Studio};
 use crate::storage::{
@@ -28,11 +28,38 @@ impl ProjectHistory {
         }
     }
 
-    pub(crate) fn push(&mut self, project: Project) {
+    pub(crate) fn push(&mut self, project: Project) -> io::Result<()> {
+        self.push_with_limits(project, MAX_HISTORY_SNAPSHOTS, MAX_PROJECT_DOCUMENT_BYTES)
+    }
+
+    fn push_with_limits(
+        &mut self,
+        project: Project,
+        maximum_snapshots: usize,
+        maximum_document_bytes: u64,
+    ) -> io::Result<()> {
+        if self.snapshots.len() >= maximum_snapshots {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("project history is limited to {maximum_snapshots} snapshots"),
+            ));
+        }
         let parent = self.current;
         self.snapshots.push(project);
         self.parents.push(Some(parent));
         self.current = self.snapshots.len() - 1;
+        if project_document(&self.snapshots[self.current], self).len() as u64
+            > maximum_document_bytes
+        {
+            self.snapshots.pop();
+            self.parents.pop();
+            self.current = parent;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("project history exceeds the {maximum_document_bytes}-byte document limit"),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn parent(&self, index: usize) -> Option<usize> {
@@ -78,6 +105,21 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
         })
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "history parents are invalid"))?;
+    let encoding = history
+        .get("encoding")
+        .map(|encoding| {
+            encoding.as_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "history encoding is invalid")
+            })
+        })
+        .transpose()?;
+    if encoding.is_some_and(|encoding| encoding != "delta-v1") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "history encoding is unsupported",
+        ));
+    }
+    let current_source = project.to_json();
     let snapshots = snapshots
         .iter()
         .enumerate()
@@ -85,7 +127,19 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
             if snapshot.is_null() {
                 return Ok((index, None));
             }
-            Project::from_json(&snapshot.to_string())
+            let source = if encoding == Some("delta-v1") {
+                let delta =
+                    serde_json::from_value::<SnapshotDelta>(snapshot.clone()).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("history snapshot delta is invalid: {error}"),
+                        )
+                    })?;
+                apply_snapshot_delta(&current_source, &delta)?
+            } else {
+                snapshot.to_string()
+            };
+            Project::from_json(&source)
                 .map(|snapshot| (index, Some(snapshot)))
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
         })
@@ -140,30 +194,89 @@ pub(crate) fn project_document(project: &Project, history: &ProjectHistory) -> S
 fn history_value(history: &ProjectHistory) -> serde_json::Value {
     #[derive(Serialize)]
     struct PersistedHistory {
+        encoding: &'static str,
         current: usize,
         snapshots: Vec<serde_json::Value>,
         parents: Vec<Option<usize>>,
     }
 
+    let current_source = history.snapshots[history.current].to_json();
     let snapshots = history
         .snapshots
         .iter()
         .enumerate()
         .map(|(index, snapshot)| {
             if index == history.current {
-                Ok(serde_json::Value::Null)
+                serde_json::Value::Null
             } else {
-                serde_json::from_str(&snapshot.to_json())
+                serde_json::to_value(snapshot_delta(&current_source, &snapshot.to_json()))
+                    .expect("snapshot delta serializes to JSON")
             }
         })
-        .collect::<Result<Vec<_>, _>>()
-        .expect("validated project snapshots serialize to JSON values");
+        .collect();
     serde_json::to_value(PersistedHistory {
+        encoding: "delta-v1",
         current: history.current,
         snapshots,
         parents: history.parents.clone(),
     })
     .expect("project history serializes to JSON")
+}
+
+#[derive(Deserialize, Serialize)]
+struct SnapshotDelta {
+    prefix: usize,
+    suffix: usize,
+    replacement: String,
+}
+
+fn snapshot_delta(base: &str, target: &str) -> SnapshotDelta {
+    let mut prefix = 0;
+    for ((base_index, base_character), (target_index, target_character)) in
+        base.char_indices().zip(target.char_indices())
+    {
+        if base_character != target_character {
+            break;
+        }
+        prefix = (base_index + base_character.len_utf8())
+            .min(target_index + target_character.len_utf8());
+    }
+    let base_tail = &base[prefix..];
+    let target_tail = &target[prefix..];
+    let mut suffix = 0;
+    for (base_character, target_character) in base_tail.chars().rev().zip(target_tail.chars().rev())
+    {
+        if base_character != target_character {
+            break;
+        }
+        suffix += base_character.len_utf8();
+    }
+    SnapshotDelta {
+        prefix,
+        suffix,
+        replacement: target[prefix..target.len() - suffix].to_owned(),
+    }
+}
+
+fn apply_snapshot_delta(base: &str, delta: &SnapshotDelta) -> io::Result<String> {
+    let suffix_start = base
+        .len()
+        .checked_sub(delta.suffix)
+        .filter(|suffix_start| delta.prefix <= *suffix_start)
+        .filter(|suffix_start| {
+            base.is_char_boundary(delta.prefix) && base.is_char_boundary(*suffix_start)
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "history snapshot delta is out of bounds",
+            )
+        })?;
+    let mut snapshot = String::with_capacity(delta.prefix + delta.replacement.len() + delta.suffix);
+    snapshot.push_str(&base[..delta.prefix]);
+    snapshot.push_str(&delta.replacement);
+    snapshot.push_str(&base[suffix_start..]);
+    Ok(snapshot)
 }
 
 pub(crate) fn save_project_state(
@@ -229,7 +342,7 @@ mod tests {
         project.name = "Atomic revision".to_owned();
         project.version += 1;
         let mut history = ProjectHistory::new(studio.project().clone());
-        history.push(project.clone());
+        history.push(project.clone()).expect("append history");
 
         save_project_state(&store, &project, &history).expect("single-file state commit");
 
@@ -279,16 +392,89 @@ mod tests {
         let mut history = ProjectHistory::new(Project::initial());
         let mut second = history.snapshots[0].clone();
         second.version += 1;
-        history.push(second);
+        history.push(second).expect("append forward history");
         let forward = history.snapshots[1].to_json();
 
         history.current = 0;
         let mut branch = history.snapshots[0].clone();
         branch.version += 2;
-        history.push(branch);
+        history.push(branch).expect("append branch history");
 
         assert_eq!(history.snapshots.len(), 3);
         assert_eq!(history.snapshots[1].to_json(), forward);
         assert_eq!(history.parent(2), Some(0));
+    }
+
+    #[test]
+    fn compact_history_round_trips_branched_unicode_projects() {
+        let current = Project::demo();
+        let mut history = ProjectHistory::new(current.clone());
+        let mut second = current.clone();
+        second.name = "Mix \u{2603}".to_owned();
+        second.version += 1;
+        history.push(second).expect("append unicode snapshot");
+        history.current = 0;
+        let mut branch = current.clone();
+        branch.name = "Branch".to_owned();
+        branch.version += 2;
+        history.push(branch.clone()).expect("append branch");
+
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-compact-history-{}-{}",
+            std::process::id(),
+            crate::storage::unique_test_id()
+        ));
+        fs::create_dir(&root).expect("history test directory");
+        let path = root.join("sound-graph.json");
+        fs::write(&path, project_document(&branch, &history)).expect("compact history");
+
+        let loaded = load_project_history(&path, &branch).expect("load compact history");
+        assert_eq!(loaded.current, 2);
+        assert_eq!(loaded.parent(1), Some(0));
+        assert_eq!(loaded.parent(2), Some(0));
+        assert_eq!(loaded.snapshots[1].name, "Mix \u{2603}");
+        fs::remove_dir_all(root).expect("remove history test directory");
+    }
+
+    #[test]
+    fn history_limits_are_enforced_before_mutating_state() {
+        let project = Project::initial();
+        let mut count_limited = ProjectHistory::new(project.clone());
+        let error = count_limited
+            .push_with_limits(project.clone(), 1, u64::MAX)
+            .expect_err("snapshot limit");
+        assert!(error.to_string().contains("1 snapshots"));
+        assert_eq!(count_limited.snapshots.len(), 1);
+        assert_eq!(count_limited.current, 0);
+
+        let mut bytes_limited = ProjectHistory::new(project.clone());
+        let error = bytes_limited
+            .push_with_limits(project, 2, 1)
+            .expect_err("document limit");
+        assert!(error.to_string().contains("document limit"));
+        assert_eq!(bytes_limited.snapshots.len(), 1);
+        assert_eq!(bytes_limited.current, 0);
+        assert_eq!(bytes_limited.parents, vec![None]);
+    }
+
+    #[test]
+    fn compact_history_does_not_duplicate_large_unchanged_graphs() {
+        let mut project = Project::demo();
+        for index in 0..512 {
+            project.edits.push(crate::model::Edit {
+                id: 10_000 + index,
+                start: 0.0,
+                end: 1.0,
+                prompt: "x".repeat(crate::model::MAX_PROMPT_CHARACTERS),
+                summary: "Large history fixture".to_owned(),
+            });
+        }
+        Project::from_json(&project.to_json()).expect("large valid project");
+        let mut history = ProjectHistory::new(project.clone());
+        project.version += 1;
+        history.push(project.clone()).expect("append large project");
+
+        let document = project_document(&project, &history);
+        assert!(document.len() < project.to_json().len() + 2_048);
     }
 }

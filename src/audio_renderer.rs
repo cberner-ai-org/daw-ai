@@ -1,4 +1,5 @@
 use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use crate::audio_analysis;
 use crate::model::Project;
@@ -90,6 +91,8 @@ impl Drop for AudioRenderPermit<'_> {
 }
 
 impl AudioRenderer {
+    const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
     // Queue state transitions happen under `state`; caller callbacks and rendering never do.
     fn acquire(
         &self,
@@ -128,11 +131,16 @@ impl AudioRenderer {
                 drop(state);
                 return Ok(AudioRenderPermit { renderer: self });
             }
-            state = self
+            let (next_state, _) = self
                 .completed
-                .wait(state)
+                .wait_timeout(state, Self::CANCELLATION_POLL_INTERVAL)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
         }
+    }
+
+    pub(crate) fn wake_waiters(&self) {
+        self.completed.notify_all();
     }
 
     pub(crate) fn stream_sample_range(
@@ -233,5 +241,44 @@ impl AudioRenderer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .waiter_count(priority)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn cancellation_wakes_a_queued_render_without_waiting_for_the_active_render() {
+        let renderer = Arc::new(AudioRenderer::default());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        renderer.occupy_for_test();
+
+        let worker_renderer = Arc::clone(&renderer);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (completed, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = worker_renderer.render_with(
+                AudioRenderPriority::Foreground,
+                &|| worker_cancelled.load(Ordering::SeqCst),
+                || -> Result<(), String> { panic!("a cancelled queued render must not run") },
+            );
+            completed.send(result).expect("completion receiver");
+        });
+        renderer.wait_until_queued_for_test(AudioRenderPriority::Foreground);
+
+        cancelled.store(true, Ordering::SeqCst);
+        renderer.wake_waiters();
+        let result = completion.recv_timeout(Duration::from_secs(1));
+        renderer.release_for_test();
+        worker.join().expect("queued render worker");
+
+        assert!(matches!(result, Ok(Err(AudioRenderError::Cancelled))));
+        assert_eq!(renderer.queued_for_test(AudioRenderPriority::Foreground), 0);
     }
 }

@@ -82,6 +82,8 @@ pub struct GeminiPlanner;
 pub struct GeminiEdit {
     pub plan: EditPlan,
     pub project: Project,
+    pub selection_start: f32,
+    pub selection_end: f32,
 }
 
 #[derive(Default)]
@@ -355,7 +357,18 @@ fn run_session_with_transport_options(
             let (plan, project) = session
                 .finish(state.plans)
                 .map_err(|message| invalid(&message))?;
-            return Ok(GeminiEdit { plan, project });
+            let (selection_start, selection_end) =
+                crate::gemini_tools::edit_selection(session.path()).map_err(|message| {
+                    invalid(&format!(
+                        "could not read the active edit selection: {message}"
+                    ))
+                })?;
+            return Ok(GeminiEdit {
+                plan,
+                project,
+                selection_start,
+                selection_end,
+            });
         }
 
         let mut results = Vec::with_capacity(calls.len() * 2);
@@ -612,9 +625,17 @@ fn apply_and_commit_mutation(
                 .take_update()
                 .map_err(|message| invalid(&message))?
                 .ok_or_else(|| invalid("mutation tool did not publish its graph update"))?;
+            let (selection_start, selection_end) =
+                crate::gemini_tools::edit_selection(session.path()).map_err(|message| {
+                    invalid(&format!(
+                        "could not read the active edit selection: {message}"
+                    ))
+                })?;
             let committed = on_update(GeminiEdit {
                 plan: plan.clone(),
                 project,
+                selection_start,
+                selection_end,
             })?;
             session
                 .synchronize_project(&committed)
@@ -1175,13 +1196,18 @@ mod tests {
         ];
         let mut response_index = 0;
         let mut saw_retry_message = false;
+        let mut selections = Vec::new();
+        let original_bpm = Project::demo().bpm;
         let result = run_session_with_transport(
             &session,
             "shape the bass",
             0.0,
             4.0,
             &mut render_audio_request,
-            &mut |edit| Ok(edit.project),
+            &mut |edit| {
+                selections.push((edit.selection_start, edit.selection_end));
+                Ok(edit.project)
+            },
             &|| false,
             &mut |sequence, request, _| {
                 if sequence == 2 {
@@ -1197,6 +1223,10 @@ mod tests {
         .expect("producer session");
         assert!(saw_retry_message);
         assert_eq!(result.project.bpm, 140);
+        let tempo_scale = f32::from(original_bpm) / 140.0;
+        assert_eq!(selections, vec![(0.0, 4.0), (0.0, 4.0 * tempo_scale)]);
+        assert_eq!(result.selection_start, 0.0);
+        assert_eq!(result.selection_end, 4.0 * tempo_scale);
         assert_eq!(session.stats().unwrap().0, 2);
     }
 
