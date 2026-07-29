@@ -12,6 +12,7 @@ mod project_file;
 mod project_history;
 pub mod prompt;
 pub mod server;
+mod spectrum;
 mod storage;
 mod surge;
 mod surge_presets;

@@ -1,14 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use curl::easy::{Easy, List};
 use serde_json::Value as JsonValue;
 
 use crate::gemini_session::{EditSession, SessionVariants, apply_session_retention};
@@ -24,12 +22,15 @@ use crate::gemini_tools::{
 };
 use crate::model::Project;
 use crate::prompt::EditPlan;
+use crate::storage::read_bounded_text_following_links;
 
 const STUDIO_CONTRACT: &str = include_str!("../gemini/STUDIO.md");
 pub(crate) const GEMINI_MODEL: &str = "gemini-3.6-flash";
 const DEFAULT_INTERACTIONS_ENDPOINT: &str =
     "https://generativelanguage.googleapis.com/v1beta/interactions";
 const SYSTEMD_CREDENTIAL_NAME: &str = "gemini-api-key";
+const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
+const MAX_INTERACTION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const EDIT_TIMEOUT_SECONDS: u64 = 20 * 60;
 #[cfg(test)]
 const EDIT_TIMEOUT: Duration = Duration::from_secs(EDIT_TIMEOUT_SECONDS);
@@ -671,79 +672,67 @@ fn call_interactions(
     remaining: Duration,
     cancellation: &Arc<AtomicBool>,
 ) -> Result<String, PlannerError> {
-    let request_path = session
-        .path()
-        .join(format!(".{exchange_name}-pending.json"));
-    fs::write(&request_path, request.to_string()).map_err(PlannerError::Io)?;
-    let max_time = remaining.as_secs().max(1).to_string();
-    let mut command = Command::new("curl");
-    let response_path = session
-        .path()
-        .join(format!(".{exchange_name}-response-pending"));
-    let error_path = session
-        .path()
-        .join(format!(".{exchange_name}-error-pending"));
-    let response_file = fs::File::create(&response_path).map_err(PlannerError::Io)?;
-    let error_file = fs::File::create(&error_path).map_err(PlannerError::Io)?;
-    command
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--fail-with-body")
-        .arg("--connect-timeout")
-        .arg("15")
-        .arg("--max-time")
-        .arg(max_time)
-        .arg("--request")
-        .arg("POST")
-        .arg("--header")
-        .arg("Content-Type: application/json")
-        .arg("--data-binary")
-        .arg(format!("@{}", request_path.display()))
-        .arg("--config")
-        .arg("-")
-        .arg(endpoint)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::from(response_file))
-        .stderr(Stdio::from(error_file));
-    let mut child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            PlannerError::Unavailable(
-                "curl is required for the Gemini API connection; install curl and try again"
-                    .to_owned(),
-            )
-        } else {
-            PlannerError::Io(error)
-        }
-    })?;
-    let mut stdin = child.stdin.take().expect("piped curl stdin");
-    writeln!(stdin, "header = \"x-goog-api-key: {api_key}\"").map_err(PlannerError::Io)?;
-    drop(stdin);
-    let status = loop {
-        if cancellation.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = fs::remove_file(&request_path);
-            let _ = fs::remove_file(&response_path);
-            let _ = fs::remove_file(&error_path);
+    if cancellation.load(Ordering::SeqCst) {
+        return Err(PlannerError::Interrupted);
+    }
+    if remaining.is_zero() {
+        return Err(PlannerError::TimedOut);
+    }
+    let request_source = request.to_string();
+    let mut response = Vec::new();
+    let mut response_too_large = false;
+    let mut handle = Easy::new();
+    configure_interaction_request(
+        &mut handle,
+        endpoint,
+        api_key,
+        request_source.as_bytes(),
+        remaining,
+    )?;
+    let transfer_result = {
+        let mut transfer = handle.transfer();
+        transfer
+            .write_function(|data| {
+                let Some(new_length) = response.len().checked_add(data.len()) else {
+                    response_too_large = true;
+                    return Ok(0);
+                };
+                if new_length > MAX_INTERACTION_RESPONSE_BYTES {
+                    response_too_large = true;
+                    return Ok(0);
+                }
+                response.extend_from_slice(data);
+                Ok(data.len())
+            })
+            .map_err(curl_configuration_error)?;
+        transfer
+            .progress_function(|_, _, _, _| !cancellation.load(Ordering::SeqCst))
+            .map_err(curl_configuration_error)?;
+        transfer.perform()
+    };
+    let recorded_response = String::from_utf8_lossy(&response);
+    session
+        .record_exchange(exchange_name, request, &recorded_response)
+        .map_err(PlannerError::Io)?;
+    if let Err(error) = transfer_result {
+        if cancellation.load(Ordering::SeqCst) || error.is_aborted_by_callback() {
             return Err(PlannerError::Interrupted);
         }
-        if let Some(status) = child.try_wait().map_err(PlannerError::Io)? {
-            break status;
-        }
-        thread::sleep(Duration::from_millis(25));
-    };
-    let _ = fs::remove_file(&request_path);
-    let response = fs::read_to_string(&response_path).map_err(PlannerError::Io)?;
-    let stderr = fs::read_to_string(&error_path).map_err(PlannerError::Io)?;
-    let _ = fs::remove_file(&response_path);
-    let _ = fs::remove_file(&error_path);
-    session
-        .record_exchange(exchange_name, request, &response)
-        .map_err(PlannerError::Io)?;
-    if !status.success() {
-        if status.code() == Some(28) {
+        if error.is_operation_timedout() {
             return Err(PlannerError::TimedOut);
         }
+        if response_too_large {
+            return Err(invalid("interaction response exceeded the 32 MiB limit"));
+        }
+        return Err(PlannerError::Failed {
+            message: bounded_text(&error.to_string(), 1_000),
+            code: None,
+        });
+    }
+    let status = handle.response_code().map_err(curl_configuration_error)?;
+    let response =
+        String::from_utf8(response).map_err(|_| invalid("interaction response was not UTF-8"))?;
+    if status >= 400 {
         if let Some(error) = serde_json::from_str::<JsonValue>(&response)
             .ok()
             .and_then(|body| body.get("error").cloned())
@@ -751,11 +740,50 @@ fn call_interactions(
             return Err(api_failure(&error));
         }
         return Err(PlannerError::Failed {
-            message: bounded_text(&stderr, 1_000),
+            message: format!("Gemini API returned HTTP {status}"),
             code: None,
         });
     }
     Ok(response)
+}
+
+fn configure_interaction_request(
+    handle: &mut Easy,
+    endpoint: &str,
+    api_key: &str,
+    request: &[u8],
+    remaining: Duration,
+) -> Result<(), PlannerError> {
+    let remaining = remaining.max(Duration::from_millis(1));
+    handle.url(endpoint).map_err(curl_configuration_error)?;
+    handle.post(true).map_err(curl_configuration_error)?;
+    handle
+        .connect_timeout(remaining.min(Duration::from_secs(15)))
+        .map_err(curl_configuration_error)?;
+    handle
+        .timeout(remaining)
+        .map_err(curl_configuration_error)?;
+    handle.signal(false).map_err(curl_configuration_error)?;
+    handle.progress(true).map_err(curl_configuration_error)?;
+    handle
+        .post_fields_copy(request)
+        .map_err(curl_configuration_error)?;
+    let mut headers = List::new();
+    headers
+        .append("Content-Type: application/json")
+        .map_err(curl_configuration_error)?;
+    headers
+        .append(&format!("x-goog-api-key: {api_key}"))
+        .map_err(curl_configuration_error)?;
+    handle
+        .http_headers(headers)
+        .map_err(curl_configuration_error)
+}
+
+fn curl_configuration_error(error: curl::Error) -> PlannerError {
+    PlannerError::Unavailable(format!(
+        "could not configure the Gemini API connection: {error}"
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -874,13 +902,15 @@ fn load_api_key() -> Result<String, PlannerError> {
         std::env::var_os("HOME").map(PathBuf::from),
     )
     .ok_or_else(|| missing_credentials(None))?;
-    let source = fs::read_to_string(&path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            missing_credentials(Some(&path))
-        } else {
-            PlannerError::Io(error)
-        }
-    })?;
+    let source =
+        read_bounded_text_following_links(&path, MAX_CREDENTIAL_BYTES, "Gemini credentials")
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    missing_credentials(Some(&path))
+                } else {
+                    PlannerError::Io(error)
+                }
+            })?;
     let lines = source
         .lines()
         .map(str::trim)
@@ -1416,6 +1446,111 @@ mod tests {
             &cancellation,
         );
         assert!(matches!(result, Err(PlannerError::Interrupted)));
+    }
+
+    #[test]
+    fn failed_interaction_transport_records_the_attempt() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        let endpoint = format!(
+            "http://{}/",
+            listener.local_addr().expect("fixture address")
+        );
+        let fixture = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("fixture connection");
+            drop(stream);
+        });
+        let session =
+            EditSession::create(&Project::demo(), "transport failure", 0.0, 1.0).expect("session");
+        let result = call_interactions(
+            &session,
+            "connection-failure",
+            &serde_json::json!({"model": GEMINI_MODEL}),
+            "test-key",
+            &endpoint,
+            Duration::from_secs(1),
+            &Arc::new(AtomicBool::new(false)),
+        );
+        fixture.join().expect("fixture thread");
+
+        assert!(matches!(result, Err(PlannerError::Failed { .. })));
+        let recorded_request =
+            std::fs::read_to_string(session.path().join("connection-failure-request.json"))
+                .expect("recorded failed request");
+        let recorded_response =
+            std::fs::read_to_string(session.path().join("connection-failure-response.json"))
+                .expect("recorded failed response");
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&recorded_request).expect("request JSON")["model"],
+            GEMINI_MODEL
+        );
+        assert!(recorded_response.trim().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interaction_transport_posts_json_with_api_authentication() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("fixture connection");
+            let service = hyper::service::service_fn(
+                |request: http::Request<hyper::body::Incoming>| async move {
+                    use http_body_util::BodyExt;
+
+                    let authenticated = request
+                        .headers()
+                        .get("x-goog-api-key")
+                        .is_some_and(|value| value == "test-key");
+                    let body = request.into_body().collect().await?.to_bytes();
+                    let json = serde_json::from_slice::<JsonValue>(&body).ok();
+                    let (status, body) = if authenticated
+                        && json.as_ref().and_then(|value| value.get("model")).is_some()
+                    {
+                        (
+                            http::StatusCode::OK,
+                            r#"{"id":"transport-ok","status":"completed"}"#,
+                        )
+                    } else {
+                        (http::StatusCode::BAD_REQUEST, r#"{"error":{}}"#)
+                    };
+                    let response = http::Response::builder()
+                        .status(status)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from_static(
+                            body.as_bytes(),
+                        )))
+                        .expect("fixture response");
+                    Ok::<_, hyper::Error>(response)
+                },
+            );
+            let mut builder = hyper::server::conn::http1::Builder::new();
+            builder.keep_alive(false);
+            builder
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await
+        });
+        let session =
+            EditSession::create(&Project::demo(), "transport", 0.0, 1.0).expect("session");
+        let response = tokio::task::spawn_blocking(move || {
+            call_interactions(
+                &session,
+                "transport",
+                &serde_json::json!({"model": GEMINI_MODEL}),
+                "test-key",
+                &format!("http://{address}/"),
+                Duration::from_secs(5),
+                &Arc::new(AtomicBool::new(false)),
+            )
+        })
+        .await
+        .expect("interaction worker")
+        .expect("interaction response");
+        server.await.expect("fixture task").expect("fixture server");
+
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&response).expect("response JSON")["id"],
+            "transport-ok"
+        );
     }
 
     #[test]

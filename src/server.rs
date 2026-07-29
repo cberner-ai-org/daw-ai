@@ -1,12 +1,23 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fs;
+use std::future::Future;
 use std::io::{self, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use http::{Request as HttpRequest, Response as HttpResponse};
+use http_body_util::BodyExt;
+use hyper::body::{Body as HyperBody, Bytes, Frame, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::io::AsyncWriteExt;
 
 use crate::audio_analysis;
 use crate::audio_renderer::{AudioRenderError, AudioRenderPriority, AudioRenderer};
@@ -14,9 +25,7 @@ use crate::audio_stream::{
     ByteRange, WAV_HEADER_BYTES, bounded_audio_byte_range, wait_for_playback_window,
 };
 use crate::concurrency::{Limiter, Permit};
-#[cfg(test)]
-use crate::edit_jobs::fallback_operation_id;
-use crate::edit_jobs::{EditJobs, accepted_edit_job_json, new_operation_id};
+use crate::edit_jobs::{EditJobCreateError, EditJobs, accepted_edit_job_json, new_operation_id};
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
 #[cfg(test)]
 use crate::gemini_session::session_root;
@@ -25,18 +34,27 @@ use crate::gemini_tools::render_audio_request_cancellable;
 #[cfg(test)]
 use crate::http::valid_user_id;
 #[cfg(test)]
-use crate::http::{AUDIO_REQUEST_HEADER, MAX_REQUEST_HEADER_BYTES, parse_authority};
-use crate::http::{Request, Response, write_response_head};
+use crate::http::{AUDIO_REQUEST_HEADER, authority};
+use crate::http::{
+    HttpBody, MAX_REQUEST_BYTES, Request, Response, empty_body, full_body, response_with_body,
+};
 use crate::model::{Project, Studio, StudioError, json_string, valid_operation_id};
 use crate::project_history::{
     ProjectHistory, open_project_with_history, project_document, save_project_state,
 };
 #[cfg(debug_assertions)]
 use crate::prompt::EditPlan;
-use crate::storage::{ProjectStore, replace_file, replace_text_file};
+use crate::storage::{ProjectStore, read_bounded_file, replace_file, replace_text_file};
 
-const MAX_ACTIVE_CONNECTIONS: usize = 64;
 const MAX_ACTIVE_EDIT_JOBS: usize = 4;
+const MAX_ACTIVE_HTTP_CONNECTIONS: usize = 64;
+const MAX_ACTIVE_HTTP_STREAMS: usize = 64;
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
+const OVERLOAD_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const AUDIO_RANGE_SAMPLES: usize =
     (audio_analysis::MAX_REGION_SECONDS * audio_analysis::SAMPLE_RATE as f32) as usize;
 const PLAYBACK_CHUNK_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 2;
@@ -63,125 +81,316 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const AUDIO_ENGINE_JS: &str = include_str!("../web/audio-engine.js");
 const APP_JS: &str = include_str!("../web/app.js");
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-pub fn run(port: u16) -> io::Result<()> {
-    install_shutdown_handlers();
+#[derive(Clone, Copy)]
+struct BodyReadLimits {
+    idle_timeout: Duration,
+    timeout: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct HttpServerConfig {
+    max_connections: usize,
+    header_timeout: Duration,
+    body_limits: BodyReadLimits,
+    shutdown_grace_timeout: Duration,
+}
+
+impl Default for HttpServerConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: MAX_ACTIVE_HTTP_CONNECTIONS,
+            header_timeout: REQUEST_HEADER_TIMEOUT,
+            body_limits: BodyReadLimits {
+                idle_timeout: REQUEST_BODY_IDLE_TIMEOUT,
+                timeout: REQUEST_BODY_TIMEOUT,
+            },
+            shutdown_grace_timeout: SHUTDOWN_GRACE_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HttpState {
+    router: Router,
+    body_limits: BodyReadLimits,
+}
+
+pub async fn run(port: u16) -> io::Result<()> {
     let router = Router::new(port)?;
     let address = format!("127.0.0.1:{port}");
-    let listener = TcpListener::bind(&address)?;
-    listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("DAW-AI is ready at http://{address}");
     println!("Sound graph: {}", router.project_path().display());
-    let connections = Limiter::new(MAX_ACTIVE_CONNECTIONS);
+    serve_http(
+        listener,
+        router,
+        shutdown_signal(),
+        HttpServerConfig::default(),
+    )
+    .await
+}
 
-    while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let Some(permit) = connections.acquire() else {
-                    let _ = Response::json(503, error_json("server is busy; retry shortly"))
-                        .write(&mut stream);
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown: impl Future<Output = ()> + Send,
+    config: HttpServerConfig,
+) -> io::Result<()> {
+    let state = HttpState {
+        router,
+        body_limits: config.body_limits,
+    };
+    let connection_limiter = Limiter::new(config.max_connections);
+    let mut connection_tasks = tokio::task::JoinSet::new();
+    let (connection_shutdown, _) = tokio::sync::watch::channel(false);
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        eprintln!("warning: failed to accept HTTP connection: {error}");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                let Some(connection_permit) = connection_limiter.acquire() else {
+                    reject_overloaded_connection(stream).await;
                     continue;
                 };
-                let router = router.clone();
-                if let Err(error) =
-                    thread::Builder::new()
-                        .name("daw-ai-http".to_owned())
-                        .spawn(move || {
-                            let _permit = permit;
-                            if let Err(error) = serve_connection(&mut stream, &router) {
-                                eprintln!("request failed: {error}");
-                            }
-                        })
-                {
-                    eprintln!("error: outcome=request_thread_rejected error={error}");
+                let state = state.clone();
+                let header_timeout = config.header_timeout;
+                let mut shutdown = connection_shutdown.subscribe();
+                connection_tasks.spawn(async move {
+                    let _connection_permit = connection_permit;
+                    let service = service_fn(move |request| {
+                        let state = state.clone();
+                        async move {
+                            Ok::<_, Infallible>(serve_request(state, request).await)
+                        }
+                    });
+                    let mut builder = http1::Builder::new();
+                    builder
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(header_timeout)
+                        .keep_alive(false)
+                        .max_buf_size(HTTP_BUFFER_BYTES);
+                    let connection = builder.serve_connection(TokioIo::new(stream), service);
+                    tokio::pin!(connection);
+                    tokio::select! {
+                        _ = shutdown.changed() => {
+                            connection.as_mut().graceful_shutdown();
+                            let _ = connection.await;
+                        }
+                        _ = connection.as_mut() => {}
+                    }
+                });
+            }
+            completed = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    eprintln!("error: HTTP connection worker failed: {error}");
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let _ = connection_shutdown.send(true);
+    let drain = async {
+        while let Some(completed) = connection_tasks.join_next().await {
+            if let Err(error) = completed {
+                eprintln!("error: HTTP connection worker failed during shutdown: {error}");
             }
-            Err(error) => eprintln!("connection failed: {error}"),
+        }
+    };
+    if tokio::time::timeout(config.shutdown_grace_timeout, drain)
+        .await
+        .is_err()
+    {
+        connection_tasks.abort_all();
+        while let Some(completed) = connection_tasks.join_next().await {
+            if let Err(error) = completed {
+                if error.is_panic() {
+                    eprintln!("error: HTTP connection worker panicked during shutdown: {error}");
+                }
+            }
         }
     }
     Ok(())
 }
 
+async fn reject_overloaded_connection(mut stream: tokio::net::TcpStream) {
+    const BODY: &str = "{\"error\":\"server connection limit reached\"}";
+    let response = format!(
+        concat!(
+            "HTTP/1.1 503 Service Unavailable\r\n",
+            "Content-Type: application/json; charset=utf-8\r\n",
+            "Content-Length: {}\r\n",
+            "Cache-Control: no-store\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "{}"
+        ),
+        BODY.len(),
+        BODY
+    );
+    let write = async {
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await
+    };
+    let _ = tokio::time::timeout(OVERLOAD_WRITE_TIMEOUT, write).await;
+}
+
 #[cfg(unix)]
-fn install_shutdown_handlers() {
-    const SIGINT: i32 = 2;
-    const SIGTERM: i32 = 15;
-
-    unsafe extern "C" {
-        fn signal(signal: i32, handler: unsafe extern "C" fn(i32)) -> usize;
+async fn shutdown_signal() {
+    let Ok(mut terminate) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
     }
-
-    unsafe extern "C" fn request_shutdown(_signal: i32) {
-        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-    }
-
-    let _ = unsafe { signal(SIGINT, request_shutdown) };
-    let _ = unsafe { signal(SIGTERM, request_shutdown) };
 }
 
 #[cfg(not(unix))]
-fn install_shutdown_handlers() {}
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
 
-fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
+async fn serve_request(state: HttpState, request: HttpRequest<Incoming>) -> HttpResponse<HttpBody> {
     let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let response = match Request::read(stream) {
-        Ok(request) => {
-            let (scoped, new_user) = if request_needs_user_scope(&request) {
-                match router.scoped(&request) {
-                    Ok(scoped) => scoped,
-                    Err(error) => return scope_error_response(&error).write(stream),
-                }
-            } else {
-                (router.clone(), None)
-            };
-            let new_user_cookie = new_user.as_ref().map(|user_id| {
-                format!("daw_ai_user={user_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000")
-            });
-            if request.path == "/api/export.wav" {
-                return scoped.write_export(&request, stream, new_user_cookie.as_deref());
-            }
-            if request.path.starts_with("/api/audio-stream/") {
-                let cancellation_stream = stream.try_clone()?;
-                return scoped.write_playback_stream_with_cancel(
-                    &request,
-                    stream,
-                    || stream_disconnected(&cancellation_stream),
-                    new_user_cookie.as_deref(),
-                    PlaybackPacing::RealTime,
-                );
-            }
-            if request.path.starts_with("/api/track-spectrum/") {
-                let cancellation_stream = stream.try_clone()?;
-                return scoped.write_track_spectrum_with_cancel(
-                    &request,
-                    stream,
-                    || stream_disconnected(&cancellation_stream),
-                    new_user_cookie.as_deref(),
-                );
-            }
-            let mut response = scoped.handle(&request);
-            response.set_cookie = new_user_cookie;
-            log_http_response(request_id, started, &request, &response);
-            response
+    let (parts, body) = request.into_parts();
+    let body = match read_request_body(body, state.body_limits).await {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!(
+                "warning: http request_id={request_id} outcome=rejected latency_ms={} error={}",
+                started.elapsed().as_millis(),
+                single_line(error.message())
+            );
+            return Response::json(error.status(), error_json(error.message())).into_http();
         }
+    };
+    let request = match Request::from_http(parts, &body) {
+        Ok(request) => request,
         Err(error) => {
             eprintln!(
                 "warning: http request_id={request_id} outcome=rejected latency_ms={} error={}",
                 started.elapsed().as_millis(),
                 single_line(&error)
             );
-            Response::json(400, error_json(&error))
+            return Response::json(400, error_json(&error)).into_http();
         }
     };
-    response.write(stream)
+    match tokio::task::spawn_blocking(move || {
+        dispatch_request(state.router, request, request_id, started)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("error: HTTP request worker failed: {error}");
+            Response::json(500, error_json("request processing failed")).into_http()
+        }
+    }
+}
+
+enum RequestBodyReadError {
+    TimedOut,
+    TooLarge,
+    Read,
+}
+
+impl RequestBodyReadError {
+    fn status(&self) -> u16 {
+        match self {
+            Self::TimedOut => 408,
+            Self::TooLarge => 413,
+            Self::Read => 400,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::TimedOut => "request body timed out",
+            Self::TooLarge => "request is too large",
+            Self::Read => "could not read request body",
+        }
+    }
+}
+
+async fn read_request_body<B>(
+    mut body: B,
+    limits: BodyReadLimits,
+) -> Result<Bytes, RequestBodyReadError>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + limits.timeout;
+    let mut bytes = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RequestBodyReadError::TimedOut);
+        }
+        let next = tokio::time::timeout(limits.idle_timeout.min(remaining), body.frame())
+            .await
+            .map_err(|_| RequestBodyReadError::TimedOut)?;
+        let Some(frame) = next else {
+            return Ok(Bytes::from(bytes));
+        };
+        let frame = frame.map_err(|_| RequestBodyReadError::Read)?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let Some(length) = bytes.len().checked_add(data.len()) else {
+            return Err(RequestBodyReadError::TooLarge);
+        };
+        if length > MAX_REQUEST_BYTES {
+            return Err(RequestBodyReadError::TooLarge);
+        }
+        bytes.extend_from_slice(&data);
+    }
+}
+
+fn dispatch_request(
+    router: Router,
+    request: Request,
+    request_id: u64,
+    started: Instant,
+) -> HttpResponse<HttpBody> {
+    let (scoped, new_user) = if request_needs_user_scope(&request) {
+        match router.scoped(&request) {
+            Ok(scoped) => scoped,
+            Err(error) => return scope_error_response(&error).into_http(),
+        }
+    } else {
+        (router, None)
+    };
+    let new_user_cookie = new_user.as_ref().map(|user_id| {
+        format!("daw_ai_user={user_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000")
+    });
+    if request.path == "/api/export.wav" {
+        return scoped.export_response(&request, new_user_cookie.as_deref());
+    }
+    if request.path.starts_with("/api/audio-stream/") {
+        return scoped.playback_response(&request, new_user_cookie.as_deref());
+    }
+    if request.path.starts_with("/api/track-spectrum/") {
+        return scoped.track_spectrum_response(&request, new_user_cookie.as_deref());
+    }
+    let mut response = scoped.handle(&request);
+    response.set_cookie = new_user_cookie;
+    log_http_response(request_id, started, &request, &response);
+    response.into_http()
 }
 
 fn scope_error_response(error: &io::Error) -> Response {
@@ -199,30 +408,6 @@ fn scope_error_response(error: &io::Error) -> Response {
     response
 }
 
-fn stream_disconnected(stream: &TcpStream) -> bool {
-    if stream.set_nonblocking(true).is_err() {
-        return false;
-    }
-    let mut byte = [0_u8; 1];
-    let result = stream.peek(&mut byte);
-    if stream.set_nonblocking(false).is_err() {
-        return true;
-    }
-    match result {
-        Ok(0) => true,
-        Ok(_) => false,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) =>
-        {
-            false
-        }
-        Err(_) => true,
-    }
-}
-
 fn audio_byte_range(value: &str, total_length: usize) -> Result<ByteRange, ()> {
     bounded_audio_byte_range(value, total_length, AUDIO_RANGE_SAMPLES * 4)
 }
@@ -234,6 +419,7 @@ struct Router {
     ai: Ai,
     edit_jobs: Arc<EditJobs>,
     edit_limiter: Arc<Limiter>,
+    stream_limiter: Arc<Limiter>,
     audio_renderer: Arc<AudioRenderer>,
     spectrum_cache: Arc<Mutex<()>>,
     audio_token: Arc<String>,
@@ -245,6 +431,7 @@ struct UserRegistry {
     root: PathBuf,
     ai: Ai,
     edit_limiter: Arc<Limiter>,
+    stream_limiter: Arc<Limiter>,
     audio_renderer: Arc<AudioRenderer>,
     users: Mutex<HashMap<String, CachedUser>>,
 }
@@ -394,49 +581,241 @@ fn planner_failure(error: PlannerError) -> EditFailure {
     EditFailure::new(status, error.to_string())
 }
 
+struct BinaryResponse {
+    status: u16,
+    content_type: &'static str,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PlaybackSelection {
+    Full,
+    Range(ByteRange),
+    Unsatisfiable,
+}
+
+#[derive(Debug)]
+struct PlaybackPlan {
+    project: Project,
+    version: u64,
+    stream_start_sample: usize,
+    sample_count: usize,
+    total_length: usize,
+    selection: PlaybackSelection,
+}
+
+struct TrackSpectrumPlan {
+    project: Project,
+    version: u64,
+    start_milliseconds: u64,
+    start_sample: usize,
+    end_sample: usize,
+    frame_count: usize,
+    cache_path: Option<PathBuf>,
+}
+
+enum TrackSpectrumPreparation {
+    Ready(BinaryResponse),
+    Render(TrackSpectrumPlan),
+}
+
+impl TrackSpectrumPlan {
+    fn response_length(&self) -> usize {
+        32 + self.project.tracks.len() * 8
+            + self.frame_count * self.project.tracks.len() * SPECTRUM_BANDS
+    }
+}
+
+impl BinaryResponse {
+    fn into_http(self, set_cookie: Option<&str>) -> HttpResponse<HttpBody> {
+        let headers = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        response_with_body(
+            self.status,
+            self.content_type,
+            self.body.len(),
+            &headers,
+            set_cookie,
+            full_body(self.body),
+        )
+    }
+}
+
+struct ChannelWriter {
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, io::Error>>,
+}
+
+struct ReceiverBody {
+    receiver: tokio::sync::mpsc::Receiver<Result<Bytes, io::Error>>,
+    permit: Option<Permit>,
+}
+
+impl HyperBody for ReceiverBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        let body = self.get_mut();
+        match body.receiver.poll_recv(context) {
+            Poll::Ready(Some(result)) => Poll::Ready(Some(result.map(Frame::data))),
+            Poll::Ready(None) => {
+                body.permit.take();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Write for ChannelWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+        let length = buffer.len().min(STREAM_CHUNK_BYTES);
+        if length == 0 {
+            return Ok(0);
+        }
+        self.sender
+            .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..length])))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "HTTP client disconnected"))?;
+        Ok(length)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn streaming_body(
+    permit: Permit,
+    produce: impl FnOnce(&mut ChannelWriter, &dyn Fn() -> bool) -> io::Result<()> + Send + 'static,
+) -> HttpBody {
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    let cancellation = sender.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut output = ChannelWriter { sender };
+        let cancelled = || cancellation.is_closed();
+        if let Err(error) = produce(&mut output, &cancelled) {
+            if error.kind() != io::ErrorKind::BrokenPipe {
+                eprintln!("streaming response failed: {error}");
+            }
+            let kind = error.kind();
+            let message = error.to_string();
+            let _ = output
+                .sender
+                .blocking_send(Err(io::Error::new(kind, message)));
+        }
+    });
+    ReceiverBody {
+        receiver,
+        permit: Some(permit),
+    }
+    .boxed_unsync()
+}
+
+fn stream_overload_response(set_cookie: Option<&str>) -> HttpResponse<HttpBody> {
+    let mut response = Response::json(
+        503,
+        error_json("too many streaming responses are active; retry shortly"),
+    );
+    response.set_cookie = set_cookie.map(str::to_owned);
+    response.into_http()
+}
+
 impl Router {
-    fn write_track_spectrum_with_cancel(
+    fn track_spectrum_response(
         &self,
         request: &Request,
-        output: &mut impl Write,
-        is_cancelled: impl Fn() -> bool,
         set_cookie: Option<&str>,
-    ) -> io::Result<()> {
+    ) -> HttpResponse<HttpBody> {
+        match self.prepare_track_spectrum(request) {
+            Ok(TrackSpectrumPreparation::Ready(response)) => response.into_http(set_cookie),
+            Ok(TrackSpectrumPreparation::Render(plan)) => {
+                let Some(stream_permit) = self.stream_limiter.acquire() else {
+                    return stream_overload_response(set_cookie);
+                };
+                let content_length = plan.response_length();
+                let worker = self.clone();
+                let body = streaming_body(stream_permit, move |output, is_cancelled| match worker
+                    .render_track_spectrum(plan, is_cancelled)
+                {
+                    Ok(Some(response)) => output.write_all(&response.body),
+                    Ok(None) => Ok(()),
+                    Err(response) => {
+                        eprintln!("track spectrum stream failed: {}", response.body);
+                        Err(io::Error::other("could not render track spectrum"))
+                    }
+                });
+                response_with_body(
+                    200,
+                    "application/vnd.daw-ai.track-spectrum",
+                    content_length,
+                    &[("Cache-Control", "private, max-age=31536000, immutable")],
+                    set_cookie,
+                    body,
+                )
+            }
+            Err(response) => response.into_http(),
+        }
+    }
+
+    #[cfg(test)]
+    fn track_spectrum_data(
+        &self,
+        request: &Request,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<Option<BinaryResponse>, Response> {
+        match self.prepare_track_spectrum(request)? {
+            TrackSpectrumPreparation::Ready(response) => Ok(Some(response)),
+            TrackSpectrumPreparation::Render(plan) => {
+                self.render_track_spectrum(plan, &is_cancelled)
+            }
+        }
+    }
+
+    fn prepare_track_spectrum(
+        &self,
+        request: &Request,
+    ) -> Result<TrackSpectrumPreparation, Response> {
         let Some(public_host) = request.public_host() else {
-            return Response::json(400, error_json("invalid host")).write(output);
+            return Err(Response::json(400, error_json("invalid host")));
         };
         let Some((token, version, start_milliseconds, window_milliseconds)) =
             track_spectrum_stream(&request.path)
         else {
-            return Response::json(404, error_json("track spectrum not found")).write(output);
+            return Err(Response::json(404, error_json("track spectrum not found")));
         };
         if request.method != "GET" {
-            return Response::json(405, error_json("method not allowed"))
-                .with_header("Allow", "GET")
-                .write(output);
+            return Err(
+                Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
+            );
         }
         if token != self.audio_token.as_str() || !request.is_trusted_request(public_host) {
-            return Response::json(403, error_json("cross-origin audio request rejected"))
-                .write(output);
+            return Err(Response::json(
+                403,
+                error_json("cross-origin audio request rejected"),
+            ));
         }
         let project = self.lock_studio().project().clone();
         if version != project.version {
-            return Response::json(
+            return Err(Response::json(
                 409,
                 error_json("project changed before spectrum was rendered"),
-            )
-            .write(output);
+            ));
         }
-        let request_cancelled =
-            || is_cancelled() || self.lock_studio().project().version != version;
         let start_sample = audio_analysis::playback_start_sample_milliseconds(start_milliseconds);
         let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
         if start_sample >= project_end_sample {
-            return Response::json(
+            return Err(Response::json(
                 422,
                 error_json("track spectrum start is outside the project"),
-            )
-            .write(output);
+            ));
         }
         let window_samples = audio_analysis::playback_start_sample_milliseconds(
             window_milliseconds
@@ -447,60 +826,77 @@ impl Router {
         let frame_count = (end_sample - start_sample).div_ceil(SPECTRUM_FRAME_SAMPLES);
         let cache_path = self.spectrum_cache_path(start_milliseconds, window_samples as u64);
         if let Some(path) = &cache_path {
+            let expected_length = 8usize
+                .saturating_add(32)
+                .saturating_add(project.tracks.len().saturating_mul(8))
+                .saturating_add(
+                    frame_count
+                        .saturating_mul(project.tracks.len())
+                        .saturating_mul(SPECTRUM_BANDS),
+                );
             let cached = {
                 let _cache_guard = self
                     .spectrum_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                fs::read(path)
+                read_bounded_file(path, expected_length as u64, "track spectrum cache")
             };
             if let Ok(cached) = cached {
-                let expected_length = 8usize
-                    .saturating_add(32)
-                    .saturating_add(project.tracks.len().saturating_mul(8))
-                    .saturating_add(
-                        frame_count
-                            .saturating_mul(project.tracks.len())
-                            .saturating_mul(SPECTRUM_BANDS),
-                    );
                 if cached.len() == expected_length
                     && cached[..8] == version.to_le_bytes()
                     && cached[8..16] == *TRACK_SPECTRUM_MAGIC
                 {
-                    write_response_head(
-                        output,
-                        200,
-                        "application/vnd.daw-ai.track-spectrum",
-                        cached.len() - 8,
-                        &[("Cache-Control", "private, max-age=31536000, immutable")],
-                        set_cookie,
-                    )?;
-                    return output.write_all(&cached[8..]);
+                    return Ok(TrackSpectrumPreparation::Ready(BinaryResponse {
+                        status: 200,
+                        content_type: "application/vnd.daw-ai.track-spectrum",
+                        headers: vec![(
+                            "Cache-Control".to_owned(),
+                            "private, max-age=31536000, immutable".to_owned(),
+                        )],
+                        body: cached[8..].to_vec(),
+                    }));
                 }
             }
         }
-        let mut body = Vec::with_capacity(
-            32 + project.tracks.len() * 8 + frame_count * project.tracks.len() * SPECTRUM_BANDS,
-        );
+        Ok(TrackSpectrumPreparation::Render(TrackSpectrumPlan {
+            project,
+            version,
+            start_milliseconds,
+            start_sample,
+            end_sample,
+            frame_count,
+            cache_path,
+        }))
+    }
+
+    fn render_track_spectrum(
+        &self,
+        plan: TrackSpectrumPlan,
+        is_cancelled: &(impl Fn() -> bool + ?Sized),
+    ) -> Result<Option<BinaryResponse>, Response> {
+        let request_cancelled =
+            || is_cancelled() || self.lock_studio().project().version != plan.version;
+        let mut body = Vec::with_capacity(plan.response_length());
         body.extend_from_slice(TRACK_SPECTRUM_MAGIC);
-        body.extend_from_slice(&(project.tracks.len() as u32).to_le_bytes());
-        body.extend_from_slice(&(frame_count as u32).to_le_bytes());
-        body.extend_from_slice(&start_milliseconds.to_le_bytes());
+        body.extend_from_slice(&(plan.project.tracks.len() as u32).to_le_bytes());
+        body.extend_from_slice(&(plan.frame_count as u32).to_le_bytes());
+        body.extend_from_slice(&plan.start_milliseconds.to_le_bytes());
         body.extend_from_slice(&(SPECTRUM_FRAME_SAMPLES as u32).to_le_bytes());
         body.extend_from_slice(&audio_analysis::SAMPLE_RATE.to_le_bytes());
-        for track in &project.tracks {
+        for track in &plan.project.tracks {
             body.extend_from_slice(&track.id.to_le_bytes());
         }
-        let mut cursor = start_sample;
-        while cursor < end_sample {
+        let project_end_sample = audio_analysis::playback_sample_count(0.0, plan.project.duration);
+        let mut cursor = plan.start_sample;
+        while cursor < plan.end_sample {
             if request_cancelled() {
-                return Ok(());
+                return Ok(None);
             }
-            let chunk_end = (cursor + SPECTRUM_RENDER_CHUNK_SAMPLES).min(end_sample);
+            let chunk_end = (cursor + SPECTRUM_RENDER_CHUNK_SAMPLES).min(plan.end_sample);
             let render_start = cursor.saturating_sub(SPECTRUM_FFT_SAMPLES / 2);
             let render_end = (chunk_end + SPECTRUM_FFT_SAMPLES / 2).min(project_end_sample);
             let stems = match self.audio_renderer.stream_stems_sample_range(
-                &project,
+                &plan.project,
                 render_start,
                 render_end,
                 &request_cancelled,
@@ -508,17 +904,21 @@ impl Router {
                 Ok(stems) => stems,
                 Err(AudioRenderError::Render(error)) => {
                     eprintln!("error: could not render track spectrum: {error}");
-                    return Err(io::Error::other("could not render track spectrum"));
+                    return Err(Response::json(
+                        500,
+                        error_json("could not render track spectrum"),
+                    ));
                 }
-                Err(AudioRenderError::Cancelled) => return Ok(()),
+                Err(AudioRenderError::Cancelled) => return Ok(None),
             };
             let chunk_frames = (chunk_end - cursor).div_ceil(SPECTRUM_FRAME_SAMPLES);
             for frame in 0..chunk_frames {
                 let center = cursor - render_start + frame * SPECTRUM_FRAME_SAMPLES;
-                for (expected, (track_id, region)) in project.tracks.iter().zip(&stems) {
+                for (expected, (track_id, region)) in plan.project.tracks.iter().zip(&stems) {
                     if expected.id != *track_id {
-                        return Err(io::Error::other(
-                            "track spectrum order changed during render",
+                        return Err(Response::json(
+                            500,
+                            error_json("track spectrum order changed during render"),
                         ));
                     }
                     body.extend_from_slice(&spectrum_levels(&region.samples, center));
@@ -526,46 +926,57 @@ impl Router {
             }
             cursor = chunk_end;
         }
-        if let Some(path) = &cache_path {
+        if let Some(path) = &plan.cache_path {
             let _cache_guard = self
                 .spectrum_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut cached = Vec::with_capacity(8 + body.len());
-            cached.extend_from_slice(&version.to_le_bytes());
+            cached.extend_from_slice(&plan.version.to_le_bytes());
             cached.extend_from_slice(&body);
             if let Err(error) = replace_file(path, &cached) {
                 eprintln!("warning: could not persist track spectrum cache: {error}");
             }
         }
-        write_response_head(
-            output,
-            200,
-            "application/vnd.daw-ai.track-spectrum",
-            body.len(),
-            &[("Cache-Control", "private, max-age=31536000, immutable")],
-            set_cookie,
-        )?;
-        output.write_all(&body)
+        Ok(Some(BinaryResponse {
+            status: 200,
+            content_type: "application/vnd.daw-ai.track-spectrum",
+            headers: vec![(
+                "Cache-Control".to_owned(),
+                "private, max-age=31536000, immutable".to_owned(),
+            )],
+            body,
+        }))
     }
 
-    fn write_export(
+    fn export_response(
         &self,
         request: &Request,
-        output: &mut impl Write,
         set_cookie: Option<&str>,
-    ) -> io::Result<()> {
+    ) -> HttpResponse<HttpBody> {
         let Some(public_host) = request.public_host() else {
-            return Response::json(400, error_json("invalid host")).write(output);
+            return Response::json(400, error_json("invalid host")).into_http();
         };
-        if request.method != "GET" || !request.is_trusted_request(public_host) {
-            return Response::json(405, error_json("method not allowed")).write(output);
+        if request.method != "GET" {
+            return Response::json(405, error_json("method not allowed"))
+                .with_header("Allow", "GET")
+                .into_http();
+        }
+        if !request.is_trusted_request(public_host) {
+            return Response::json(403, error_json("cross-origin export request rejected"))
+                .into_http();
         }
         let project = self.lock_studio().project().clone();
         let sample_count = audio_analysis::playback_sample_count(0.0, project.duration);
         let total_length = WAV_HEADER_BYTES.saturating_add(sample_count.saturating_mul(4));
-        write_response_head(
-            output,
+        let Some(stream_permit) = self.stream_limiter.acquire() else {
+            return stream_overload_response(set_cookie);
+        };
+        let worker = self.clone();
+        let body = streaming_body(stream_permit, move |output, is_cancelled| {
+            worker.write_export_body(&project, sample_count, output, is_cancelled)
+        });
+        response_with_body(
             200,
             "audio/wav",
             total_length,
@@ -574,15 +985,31 @@ impl Router {
                 ("Content-Disposition", "attachment; filename=project.wav"),
             ],
             set_cookie,
-        )?;
+            body,
+        )
+    }
+
+    fn write_export_body(
+        &self,
+        project: &Project,
+        sample_count: usize,
+        output: &mut impl Write,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        if is_cancelled() {
+            return Ok(());
+        }
         output.write_all(&audio_analysis::wav_header(sample_count))?;
         let mut cursor = 0;
         while cursor < sample_count {
+            if is_cancelled() {
+                return Ok(());
+            }
             let end = (cursor + AUDIO_RANGE_SAMPLES).min(sample_count);
             let region =
                 match self
                     .audio_renderer
-                    .stream_sample_range(&project, cursor, end, &|| false)
+                    .stream_sample_range(project, cursor, end, is_cancelled)
                 {
                     Ok(region) => region,
                     Err(AudioRenderError::Render(error)) => {
@@ -591,6 +1018,9 @@ impl Router {
                     }
                     Err(AudioRenderError::Cancelled) => return Ok(()),
                 };
+            if is_cancelled() {
+                return Ok(());
+            }
             output.write_all(&audio_analysis::pcm_bytes(&region.samples))?;
             cursor = end;
         }
@@ -618,11 +1048,13 @@ impl Router {
         let (store, studio, history) = open_project_with_history(project_path)?;
         save_project_state(&store, studio.project(), &history)?;
         let edit_limiter = Limiter::new(MAX_ACTIVE_EDIT_JOBS);
+        let stream_limiter = Limiter::new(MAX_ACTIVE_HTTP_STREAMS);
         let audio_renderer = Arc::new(AudioRenderer::default());
         let users = Arc::new(UserRegistry {
             root,
             ai: ai.clone(),
             edit_limiter: Arc::clone(&edit_limiter),
+            stream_limiter: Arc::clone(&stream_limiter),
             audio_renderer: Arc::clone(&audio_renderer),
             users: Mutex::new(HashMap::new()),
         });
@@ -633,9 +1065,10 @@ impl Router {
             ai,
             edit_jobs: Arc::new(EditJobs::new()),
             edit_limiter,
+            stream_limiter,
             audio_renderer,
             spectrum_cache: Arc::new(Mutex::new(())),
-            audio_token: Arc::new(new_operation_id(0)),
+            audio_token: Arc::new(new_operation_id().map_err(io::Error::other)?),
             users: Some(users),
         })
     }
@@ -651,6 +1084,7 @@ impl Router {
             ai: Ai::Deterministic(Duration::ZERO),
             edit_jobs: Arc::new(EditJobs::new()),
             edit_limiter: Limiter::new(MAX_ACTIVE_EDIT_JOBS),
+            stream_limiter: Limiter::new(MAX_ACTIVE_HTTP_STREAMS),
             audio_renderer: Arc::new(AudioRenderer::default()),
             spectrum_cache: Arc::new(Mutex::new(())),
             audio_token: Arc::new("test-audio-token".to_owned()),
@@ -672,9 +1106,10 @@ impl Router {
                 ));
             }
         }
-        let user_id = existing
-            .map(str::to_owned)
-            .unwrap_or_else(|| new_operation_id(0));
+        let user_id = match existing {
+            Some(existing) => existing.to_owned(),
+            None => new_operation_id().map_err(io::Error::other)?,
+        };
         let mut users = registry
             .users
             .lock()
@@ -722,9 +1157,10 @@ impl Router {
             ai: registry.ai.clone(),
             edit_jobs: Arc::new(EditJobs::new()),
             edit_limiter: Arc::clone(&registry.edit_limiter),
+            stream_limiter: Arc::clone(&registry.stream_limiter),
             audio_renderer: Arc::clone(&registry.audio_renderer),
             spectrum_cache: Arc::new(Mutex::new(())),
-            audio_token: Arc::new(new_operation_id(0)),
+            audio_token: Arc::new(new_operation_id().map_err(io::Error::other)?),
             users: None,
         };
         users.insert(
@@ -896,10 +1332,18 @@ impl Router {
                 error_json("the server edit queue is full; retry shortly"),
             );
         };
-        let Ok((job_id, operation_id, created)) =
-            self.edit_jobs.create(poll_after_ms, operation_id)
-        else {
-            return Response::json(503, error_json("too many edits are already being planned"));
+        let (job_id, operation_id, created) = match self
+            .edit_jobs
+            .create(poll_after_ms, operation_id)
+        {
+            Ok(job) => job,
+            Err(EditJobCreateError::Capacity) => {
+                return Response::json(503, error_json("too many edits are already being planned"));
+            }
+            Err(EditJobCreateError::Entropy(error)) => {
+                eprintln!("error: could not create a secure operation ID: {error}");
+                return Response::json(500, error_json("could not create the edit job"));
+            }
         };
         if !created {
             return self
@@ -934,145 +1378,192 @@ impl Router {
         )
     }
 
-    #[cfg(test)]
-    fn write_playback_stream(&self, request: &Request, output: &mut impl Write) -> io::Result<()> {
-        self.write_playback_stream_with_cancel(
-            request,
-            output,
-            || false,
-            None,
-            PlaybackPacing::Unpaced,
-        )
-    }
-
-    fn write_playback_stream_with_cancel(
-        &self,
-        request: &Request,
-        output: &mut impl Write,
-        is_cancelled: impl Fn() -> bool,
-        set_cookie: Option<&str>,
-        pacing: PlaybackPacing,
-    ) -> io::Result<()> {
+    fn playback_plan(&self, request: &Request) -> Result<PlaybackPlan, Response> {
         let Some(public_host) = request.public_host() else {
-            return Response::json(400, error_json("invalid host")).write(output);
+            return Err(Response::json(400, error_json("invalid host")));
         };
         if request.method != "GET" {
-            return Response::json(405, error_json("method not allowed"))
-                .with_header("Allow", "GET")
-                .write(output);
+            return Err(
+                Response::json(405, error_json("method not allowed")).with_header("Allow", "GET")
+            );
         }
         let Some((token, version, start_milliseconds)) = playback_audio_stream(&request.path)
         else {
-            return Response::json(404, error_json("audio stream not found")).write(output);
+            return Err(Response::json(404, error_json("audio stream not found")));
         };
         if token != self.audio_token.as_str() || !request.is_trusted_request(public_host) {
-            return Response::json(403, error_json("cross-origin audio request rejected"))
-                .write(output);
+            return Err(Response::json(
+                403,
+                error_json("cross-origin audio request rejected"),
+            ));
         }
 
         let project = self.lock_studio().project().clone();
         if version != project.version {
-            return Response::json(409, error_json("project changed before playback started"))
-                .write(output);
+            return Err(Response::json(
+                409,
+                error_json("project changed before playback started"),
+            ));
         }
         let stream_start_sample =
             audio_analysis::playback_start_sample_milliseconds(start_milliseconds);
         let project_end_sample = audio_analysis::playback_sample_count(0.0, project.duration);
         if stream_start_sample >= project_end_sample {
-            return Response::json(422, error_json("playback start is outside the project"))
-                .write(output);
-        }
-        if is_cancelled() {
-            return Ok(());
+            return Err(Response::json(
+                422,
+                error_json("playback start is outside the project"),
+            ));
         }
 
         let sample_count = project_end_sample - stream_start_sample;
         let total_length = WAV_HEADER_BYTES.saturating_add(sample_count.saturating_mul(4));
-        if let Some(range_value) = request.headers.get("range") {
-            let range = match audio_byte_range(range_value, total_length) {
-                Ok(range) => range,
-                Err(()) => {
-                    let content_range = format!("bytes */{total_length}");
-                    return write_response_head(
-                        output,
-                        416,
-                        "audio/wav",
-                        0,
-                        &[
-                            ("Cache-Control", "no-store"),
-                            ("Accept-Ranges", "bytes"),
-                            ("Content-Range", content_range.as_str()),
-                        ],
-                        set_cookie,
-                    );
+        let selection = request
+            .headers
+            .get("range")
+            .map_or(PlaybackSelection::Full, |range| {
+                match audio_byte_range(range, total_length) {
+                    Ok(range) => PlaybackSelection::Range(range),
+                    Err(()) => PlaybackSelection::Unsatisfiable,
                 }
-            };
-            let content_range = format!("bytes {}-{}/{total_length}", range.start, range.end);
-            write_response_head(
-                output,
-                206,
-                "audio/wav",
-                range.len(),
-                &[
-                    ("Cache-Control", "no-store"),
-                    ("Accept-Ranges", "bytes"),
-                    ("Content-Range", content_range.as_str()),
-                ],
-                set_cookie,
-            )?;
-            return self.write_playback_byte_range(
-                &project,
-                stream_start_sample,
-                sample_count,
-                range,
-                output,
-                &is_cancelled,
-            );
-        }
-
-        write_response_head(
-            output,
-            200,
-            "audio/wav",
+            });
+        Ok(PlaybackPlan {
+            project,
+            version,
+            stream_start_sample,
+            sample_count,
             total_length,
-            &[("Cache-Control", "no-store"), ("Accept-Ranges", "bytes")],
-            set_cookie,
-        )?;
-        output.write_all(&audio_analysis::wav_header(sample_count))?;
+            selection,
+        })
+    }
 
-        let mut remaining = sample_count;
-        let mut cursor = stream_start_sample;
+    fn playback_response(
+        &self,
+        request: &Request,
+        set_cookie: Option<&str>,
+    ) -> HttpResponse<HttpBody> {
+        let plan = match self.playback_plan(request) {
+            Ok(plan) => plan,
+            Err(response) => return response.into_http(),
+        };
+        match plan.selection {
+            PlaybackSelection::Unsatisfiable => {
+                let content_range = format!("bytes */{}", plan.total_length);
+                response_with_body(
+                    416,
+                    "audio/wav",
+                    0,
+                    &[
+                        ("Cache-Control", "no-store"),
+                        ("Accept-Ranges", "bytes"),
+                        ("Content-Range", &content_range),
+                    ],
+                    set_cookie,
+                    empty_body(),
+                )
+            }
+            PlaybackSelection::Range(range) => {
+                let Some(stream_permit) = self.stream_limiter.acquire() else {
+                    return stream_overload_response(set_cookie);
+                };
+                let content_range =
+                    format!("bytes {}-{}/{}", range.start, range.end, plan.total_length);
+                let worker = self.clone();
+                let body = streaming_body(stream_permit, move |output, is_cancelled| {
+                    worker.write_playback_byte_range(
+                        &plan.project,
+                        plan.stream_start_sample,
+                        plan.sample_count,
+                        range,
+                        output,
+                        is_cancelled,
+                    )
+                });
+                response_with_body(
+                    206,
+                    "audio/wav",
+                    range.len(),
+                    &[
+                        ("Cache-Control", "no-store"),
+                        ("Accept-Ranges", "bytes"),
+                        ("Content-Range", &content_range),
+                    ],
+                    set_cookie,
+                    body,
+                )
+            }
+            PlaybackSelection::Full => {
+                let Some(stream_permit) = self.stream_limiter.acquire() else {
+                    return stream_overload_response(set_cookie);
+                };
+                let total_length = plan.total_length;
+                let worker = self.clone();
+                let body = streaming_body(stream_permit, move |output, is_cancelled| {
+                    worker.write_playback_body(
+                        &plan,
+                        output,
+                        is_cancelled,
+                        PlaybackPacing::RealTime,
+                    )
+                });
+                response_with_body(
+                    200,
+                    "audio/wav",
+                    total_length,
+                    &[("Cache-Control", "no-store"), ("Accept-Ranges", "bytes")],
+                    set_cookie,
+                    body,
+                )
+            }
+        }
+    }
+
+    fn write_playback_body(
+        &self,
+        plan: &PlaybackPlan,
+        output: &mut impl Write,
+        is_cancelled: &(impl Fn() -> bool + ?Sized),
+        pacing: PlaybackPacing,
+    ) -> io::Result<()> {
+        if is_cancelled() {
+            return Ok(());
+        }
+        output.write_all(&audio_analysis::wav_header(plan.sample_count))?;
+
+        let mut remaining = plan.sample_count;
+        let mut cursor = plan.stream_start_sample;
         let stream_started = Instant::now();
-        let stream_id = new_operation_id(version);
+        let stream_id = new_operation_id().unwrap_or_else(|_| format!("stream-{}", plan.version));
         let mut bytes_written = WAV_HEADER_BYTES;
         while remaining > 0 {
             let next_region_samples = remaining.min(PLAYBACK_CHUNK_SAMPLES);
-            let generated_samples = cursor - stream_start_sample + next_region_samples;
+            let generated_samples = cursor - plan.stream_start_sample + next_region_samples;
             if matches!(pacing, PlaybackPacing::RealTime)
                 && !wait_for_playback_window(
                     generated_samples,
                     AUDIO_STREAM_LOOKAHEAD_SAMPLES,
                     audio_analysis::SAMPLE_RATE,
                     stream_started,
-                    &is_cancelled,
+                    is_cancelled,
                 )
             {
                 eprintln!(
-                    "audio_stream id={stream_id} outcome=cancelled version={version} bytes_written={bytes_written}"
+                    "audio_stream id={stream_id} outcome=cancelled version={} bytes_written={bytes_written}",
+                    plan.version
                 );
                 return Ok(());
             }
             let end = cursor + next_region_samples;
             let region = match self.audio_renderer.stream_sample_range(
-                &project,
+                &plan.project,
                 cursor,
                 end,
-                &is_cancelled,
+                is_cancelled,
             ) {
                 Ok(rendered) => rendered,
                 Err(AudioRenderError::Render(error)) => {
                     eprintln!(
-                        "error: audio_stream id={stream_id} outcome=render_failed version={version} bytes_written={bytes_written}: {error}"
+                        "error: audio_stream id={stream_id} outcome=render_failed version={} bytes_written={bytes_written}: {error}",
+                        plan.version
                     );
                     return Err(io::Error::other("could not render playback stream"));
                 }
@@ -1094,7 +1585,8 @@ impl Router {
             cursor = end;
         }
         eprintln!(
-            "audio_stream id={stream_id} outcome=completed version={version} bytes_written={bytes_written} elapsed_ms={}",
+            "audio_stream id={stream_id} outcome=completed version={} bytes_written={bytes_written} elapsed_ms={}",
+            plan.version,
             stream_started.elapsed().as_millis()
         );
         Ok(())
@@ -1107,7 +1599,7 @@ impl Router {
         sample_count: usize,
         range: ByteRange,
         output: &mut impl Write,
-        is_cancelled: &impl Fn() -> bool,
+        is_cancelled: &(impl Fn() -> bool + ?Sized),
     ) -> io::Result<()> {
         let header = audio_analysis::wav_header(sample_count);
         let mut cursor = range.start;
@@ -1811,80 +2303,19 @@ fn track_spectrum_stream(path: &str) -> Option<(&str, u64, u64, Option<u64>)> {
     Some((token, version, start_milliseconds, window_milliseconds))
 }
 
-struct SpectrumFftTables {
-    bit_reversed: Vec<usize>,
-    window: Vec<f64>,
-    cosine: Vec<f64>,
-    sine: Vec<f64>,
-}
-
 fn spectrum_levels(samples: &[f32], center_frame: usize) -> [u8; SPECTRUM_BANDS] {
-    static TABLES: OnceLock<SpectrumFftTables> = OnceLock::new();
-    let tables = TABLES.get_or_init(|| {
-        let bit_reversed = (0..SPECTRUM_FFT_SAMPLES)
-            .map(|index: usize| index.reverse_bits() >> (usize::BITS - 10))
-            .collect();
-        let window = (0..SPECTRUM_FFT_SAMPLES)
-            .map(|index| {
-                0.5 - 0.5
-                    * (2.0 * std::f64::consts::PI * index as f64
-                        / (SPECTRUM_FFT_SAMPLES - 1) as f64)
-                        .cos()
-            })
-            .collect();
-        let cosine = (0..SPECTRUM_FFT_SAMPLES / 2)
-            .map(|index| {
-                (-2.0 * std::f64::consts::PI * index as f64 / SPECTRUM_FFT_SAMPLES as f64).cos()
-            })
-            .collect();
-        let sine = (0..SPECTRUM_FFT_SAMPLES / 2)
-            .map(|index| {
-                (-2.0 * std::f64::consts::PI * index as f64 / SPECTRUM_FFT_SAMPLES as f64).sin()
-            })
-            .collect();
-        SpectrumFftTables {
-            bit_reversed,
-            window,
-            cosine,
-            sine,
-        }
-    });
     let channel_fft = |channel: usize| {
-        let mut real = vec![0.0f64; SPECTRUM_FFT_SAMPLES];
-        let mut imaginary = vec![0.0f64; SPECTRUM_FFT_SAMPLES];
         let start = center_frame as isize - (SPECTRUM_FFT_SAMPLES / 2) as isize;
-        for index in 0..SPECTRUM_FFT_SAMPLES {
+        crate::spectrum::magnitudes_1024((0..SPECTRUM_FFT_SAMPLES).map(|index| {
             let sample = start + index as isize;
-            if sample >= 0 {
-                let source = sample as usize * 2 + channel;
-                if source < samples.len() {
-                    real[tables.bit_reversed[index]] =
-                        samples[source] as f64 * tables.window[index];
-                }
+            if sample < 0 {
+                return 0.0;
             }
-        }
-        let mut length = 2;
-        while length <= SPECTRUM_FFT_SAMPLES {
-            let table_step = SPECTRUM_FFT_SAMPLES / length;
-            for offset in (0..SPECTRUM_FFT_SAMPLES).step_by(length) {
-                for index in 0..length / 2 {
-                    let cosine = tables.cosine[index * table_step];
-                    let sine = tables.sine[index * table_step];
-                    let even = offset + index;
-                    let odd = even + length / 2;
-                    let odd_real = real[odd] * cosine - imaginary[odd] * sine;
-                    let odd_imaginary = real[odd] * sine + imaginary[odd] * cosine;
-                    real[odd] = real[even] - odd_real;
-                    imaginary[odd] = imaginary[even] - odd_imaginary;
-                    real[even] += odd_real;
-                    imaginary[even] += odd_imaginary;
-                }
-            }
-            length *= 2;
-        }
-        (0..SPECTRUM_FFT_SAMPLES / 2)
-            .map(|index| real[index].hypot(imaginary[index]) / (SPECTRUM_FFT_SAMPLES / 2) as f64)
-            .collect::<Vec<_>>()
+            samples
+                .get(sample as usize * audio_analysis::CHANNEL_COUNT + channel)
+                .copied()
+                .unwrap_or(0.0) as f64
+        }))
     };
     let left = channel_fft(0);
     let right = channel_fft(1);
@@ -1911,12 +2342,8 @@ fn edit_operation_id(path: &str) -> Option<&str> {
 }
 
 fn parse_form(body: &str) -> HashMap<String, String> {
-    body.split('&')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let (key, value) = part.split_once('=').unwrap_or((part, ""));
-            (url_decode(key), url_decode(value))
-        })
+    url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
         .collect()
 }
 
@@ -1929,46 +2356,6 @@ fn parse_optional_boolean(
         Some("true") => Ok(true),
         Some(_) => Err("boolean setting must be true or false"),
     }
-}
-
-fn url_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => output.push(b' '),
-            b'%' if index + 2 < bytes.len() => {
-                if let (Some(high), Some(low)) =
-                    (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-                {
-                    output.push(high * 16 + low);
-                    index += 2;
-                } else {
-                    output.push(bytes[index]);
-                }
-            }
-            byte => output.push(byte),
-        }
-        index += 1;
-    }
-    String::from_utf8_lossy(&output).into_owned()
-}
-
-const fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn error_json(message: &str) -> String {
@@ -2030,6 +2417,7 @@ mod tests {
     use super::*;
     use crate::model::Project;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::AsyncReadExt;
 
     static TEST_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -2040,6 +2428,21 @@ mod tests {
             headers: HashMap::from([("host".to_owned(), "127.0.0.1:8888".to_owned())]),
             body: body.to_owned(),
         }
+    }
+
+    fn framework_request(
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<Request, String> {
+        let mut builder = HttpRequest::builder().method(method).uri(path);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(()).expect("framework request");
+        let (parts, ()) = request.into_parts();
+        Request::from_http(parts, body)
     }
 
     fn audio_request(path: &str) -> Request {
@@ -2095,6 +2498,7 @@ mod tests {
                 ai: Ai::Deterministic(Duration::ZERO),
                 edit_jobs: Arc::new(EditJobs::new()),
                 edit_limiter: Limiter::new(MAX_ACTIVE_EDIT_JOBS),
+                stream_limiter: Limiter::new(MAX_ACTIVE_HTTP_STREAMS),
                 audio_renderer: Arc::new(AudioRenderer::default()),
                 spectrum_cache: Arc::new(Mutex::new(())),
                 audio_token: Arc::new("test-audio-token".to_owned()),
@@ -2435,38 +2839,44 @@ mod tests {
     }
 
     #[test]
-    fn parses_http_request_and_encoded_forms() {
+    fn converts_framework_requests_and_decodes_forms() {
         let body = "prompt=warm+%26+wide&start=0&end=4";
-        let raw = format!(
-            "POST /api/edits HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        let parsed = Request::read(&mut raw.as_bytes()).expect("valid request");
+        let parsed = framework_request(
+            "POST",
+            "/api/edits?source=test",
+            &[("host", "localhost")],
+            body.as_bytes(),
+        )
+        .expect("valid request");
         assert_eq!(parsed.path, "/api/edits");
         assert_eq!(parsed.headers["host"], "localhost");
         assert_eq!(parse_form(&parsed.body)["prompt"], "warm & wide");
     }
 
     #[test]
-    fn rejects_ambiguous_or_unbounded_http_headers() {
-        for raw in [
-            "POST /api/logs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n",
-            "POST /api/logs HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
-            "GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            "GET / HTTP/2\r\nHost: localhost\r\n\r\n",
-            "GET / HTTP/1.1\r\nmalformed\r\n\r\n",
-        ] {
-            assert!(
-                Request::read(&mut raw.as_bytes()).is_err(),
-                "accepted {raw:?}"
-            );
-        }
-
-        let oversized = format!(
-            "GET / HTTP/1.1\r\nHost: localhost\r\nX-Fill: {}\r\n\r\n",
-            "x".repeat(MAX_REQUEST_HEADER_BYTES)
+    fn rejects_ambiguous_unbounded_or_absolute_framework_requests() {
+        assert!(
+            framework_request(
+                "POST",
+                "/api/logs",
+                &[("content-length", "0"), ("content-length", "1")],
+                b"",
+            )
+            .is_err()
         );
-        assert!(Request::read(&mut oversized.as_bytes()).is_err());
+        assert!(
+            framework_request("GET", "http://localhost/", &[("host", "localhost")], b"",).is_err()
+        );
+        let oversized = "x".repeat(crate::http::MAX_REQUEST_HEADER_BYTES);
+        assert!(
+            framework_request(
+                "GET",
+                "/",
+                &[("host", "localhost"), ("x-fill", &oversized)],
+                b""
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2528,27 +2938,23 @@ mod tests {
         assert_eq!(access["streamToken"], "test-audio-token");
 
         let version = router.lock_studio().project().version;
-        let mut stream = Vec::new();
+        let stream_request = request(
+            "GET",
+            &format!("/api/audio-stream/test-audio-token/{version}/0"),
+            "",
+        );
+        let plan = router
+            .playback_plan(&stream_request)
+            .expect("continuous playback plan");
+        assert!(matches!(plan.selection, PlaybackSelection::Full));
+        let mut body = Vec::new();
         router
-            .write_playback_stream(
-                &request(
-                    "GET",
-                    &format!("/api/audio-stream/test-audio-token/{version}/0"),
-                    "",
-                ),
-                &mut stream,
-            )
+            .write_playback_body(&plan, &mut body, &|| false, PlaybackPacing::Unpaced)
             .expect("continuous WAV stream");
-        let body_start = find_bytes(&stream, b"\r\n\r\n").expect("HTTP response head") + 4;
-        let response_head =
-            std::str::from_utf8(&stream[..body_start]).expect("UTF-8 response head");
-        let body = &stream[body_start..];
         let expected_samples =
             audio_analysis::playback_sample_count(0.0, router.lock_studio().project().duration);
 
-        assert!(stream.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\n"));
-        assert!(response_head.contains(&format!("Content-Length: {}\r\n", body.len())));
-        assert!(response_head.contains("Accept-Ranges: bytes\r\n"));
+        assert_eq!(plan.total_length, body.len());
         assert_eq!(body.len(), 44 + expected_samples * 4);
         assert_eq!(&body[..4], b"RIFF");
         assert_eq!(&body[8..12], b"WAVE");
@@ -2561,44 +2967,14 @@ mod tests {
                 * 4;
         assert_ne!(&body[render_boundary..render_boundary + 4], b"RIFF");
 
-        let mut cookie_stream = Vec::new();
-        let mut cookie_request = request(
-            "GET",
-            &format!("/api/audio-stream/test-audio-token/{version}/0"),
-            "",
-        );
-        cookie_request
-            .headers
-            .insert("range".to_owned(), "bytes=0-43".to_owned());
-        router
-            .write_playback_stream_with_cancel(
-                &cookie_request,
-                &mut cookie_stream,
-                || false,
-                Some("daw_ai_user=0123456789abcdef0123456789abcdef; Path=/"),
-                PlaybackPacing::RealTime,
-            )
-            .expect("cookie-bearing WAV stream");
-        let cookie_head_end = find_bytes(&cookie_stream, b"\r\n\r\n").expect("cookie head") + 4;
-        let cookie_head =
-            std::str::from_utf8(&cookie_stream[..cookie_head_end]).expect("cookie UTF-8");
-        assert!(
-            cookie_head
-                .contains("Set-Cookie: daw_ai_user=0123456789abcdef0123456789abcdef; Path=/\r\n")
-        );
-
-        let mut rejected = Vec::new();
-        router
-            .write_playback_stream(
-                &request(
-                    "GET",
-                    &format!("/api/audio-stream/wrong-token/{version}/0"),
-                    "",
-                ),
-                &mut rejected,
-            )
-            .expect("rejected stream response");
-        assert!(rejected.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+        let rejected = router
+            .playback_plan(&request(
+                "GET",
+                &format!("/api/audio-stream/wrong-token/{version}/0"),
+                "",
+            ))
+            .expect_err("wrong token must be rejected");
+        assert_eq!(rejected.status, 403);
     }
 
     #[test]
@@ -2637,15 +3013,11 @@ mod tests {
         project.duration = 0.25;
         *router.lock_studio() = Studio::from_project(project.clone());
         let path = format!("/api/track-spectrum/test-audio-token/{}/0", project.version);
-        let mut first = Vec::new();
-        router
-            .write_track_spectrum_with_cancel(
-                &request("GET", &path, ""),
-                &mut first,
-                || false,
-                None,
-            )
-            .expect("cold spectrum response");
+        let first = router
+            .track_spectrum_data(&request("GET", &path, ""), || false)
+            .expect("cold spectrum request")
+            .expect("cold spectrum response")
+            .body;
         let cache_path = router
             .spectrum_cache_path(
                 0,
@@ -2675,31 +3047,22 @@ mod tests {
             project.version
         );
         let cold = thread::spawn(move || {
-            let mut response = Vec::new();
-            cold_router.write_track_spectrum_with_cancel(
-                &request("GET", &cold_path, ""),
-                &mut response,
-                || false,
-                None,
-            )
+            cold_router.track_spectrum_data(&request("GET", &cold_path, ""), || false)
         });
         router
             .audio_renderer
             .wait_until_queued_for_test(AudioRenderPriority::Background);
-        let mut second = Vec::new();
-        router
-            .write_track_spectrum_with_cancel(
-                &request("GET", &path, ""),
-                &mut second,
-                || false,
-                None,
-            )
-            .expect("cached spectrum response");
+        let second = router
+            .track_spectrum_data(&request("GET", &path, ""), || false)
+            .expect("cached spectrum request")
+            .expect("cached spectrum response")
+            .body;
         assert_eq!(first, second);
 
         router.audio_renderer.release_for_test();
         cold.join()
             .expect("cold spectrum worker")
+            .expect("unrelated cold spectrum request")
             .expect("unrelated cold spectrum response");
 
         fs::remove_file(cache_path).expect("remove spectrum cache");
@@ -2715,32 +3078,20 @@ mod tests {
     }
 
     #[test]
-    fn export_streams_wav_bytes_and_sets_a_new_user_cookie() {
+    fn export_streams_wav_bytes() {
         let router = Router::demo();
         let mut project = router.lock_studio().project().clone();
         project.duration = 0.5;
         *router.lock_studio() = Studio::from_project(project);
-        let mut response = Vec::new();
-
+        let project = router.lock_studio().project().clone();
+        let expected_samples = audio_analysis::playback_sample_count(0.0, 0.5);
+        let mut body = Vec::new();
         router
-            .write_export(
-                &request("GET", "/api/export.wav", ""),
-                &mut response,
-                Some("daw_ai_user=0123456789abcdef0123456789abcdef; Path=/"),
-            )
+            .write_export_body(&project, expected_samples, &mut body, &|| false)
             .expect("streamed export");
 
-        let body_start = find_bytes(&response, b"\r\n\r\n").expect("export response head") + 4;
-        let head = std::str::from_utf8(&response[..body_start]).expect("export UTF-8 head");
-        let expected_samples = audio_analysis::playback_sample_count(0.0, 0.5);
-        assert!(
-            head.contains("Set-Cookie: daw_ai_user=0123456789abcdef0123456789abcdef; Path=/\r\n")
-        );
-        assert_eq!(
-            response.len() - body_start,
-            WAV_HEADER_BYTES + expected_samples * 4
-        );
-        assert_eq!(&response[body_start..body_start + 4], b"RIFF");
+        assert_eq!(body.len(), WAV_HEADER_BYTES + expected_samples * 4);
+        assert_eq!(&body[..4], b"RIFF");
     }
 
     #[test]
@@ -2758,22 +3109,29 @@ mod tests {
         range_request
             .headers
             .insert("range".to_owned(), "bytes=0-99".to_owned());
-        let mut response = Vec::new();
-
-        router
-            .write_playback_stream(&range_request, &mut response)
-            .expect("partial WAV response");
-
-        let body_start = find_bytes(&response, b"\r\n\r\n").expect("HTTP response head") + 4;
-        let head = std::str::from_utf8(&response[..body_start]).expect("UTF-8 response head");
+        let plan = router
+            .playback_plan(&range_request)
+            .expect("partial playback plan");
         let total_length = WAV_HEADER_BYTES
             + audio_analysis::playback_sample_count(0.0, audio_analysis::MAX_WAV_SECONDS) * 4;
-        assert!(head.starts_with("HTTP/1.1 206 Partial Content\r\n"));
-        assert!(head.contains("Content-Length: 100\r\n"));
-        assert!(head.contains("Accept-Ranges: bytes\r\n"));
-        assert!(head.contains(&format!("Content-Range: bytes 0-99/{total_length}\r\n")));
-        assert_eq!(response.len() - body_start, 100);
-        assert_eq!(&response[body_start..body_start + 4], b"RIFF");
+        assert_eq!(plan.total_length, total_length);
+        let PlaybackSelection::Range(range) = plan.selection else {
+            panic!("expected a byte range");
+        };
+        assert_eq!(range, ByteRange { start: 0, end: 99 });
+        let mut body = Vec::new();
+        router
+            .write_playback_byte_range(
+                &plan.project,
+                plan.stream_start_sample,
+                plan.sample_count,
+                range,
+                &mut body,
+                &|| false,
+            )
+            .expect("partial WAV response");
+        assert_eq!(body.len(), 100);
+        assert_eq!(&body[..4], b"RIFF");
 
         let open_range = audio_byte_range("bytes=44-", total_length).expect("open byte range");
         assert_eq!(open_range.len(), AUDIO_RANGE_SAMPLES * 4);
@@ -3038,16 +3396,7 @@ mod tests {
             "",
         );
         let worker_router = router.clone();
-        let worker = thread::spawn(move || {
-            let mut response = Vec::new();
-            let result = worker_router.write_track_spectrum_with_cancel(
-                &request,
-                &mut response,
-                || false,
-                None,
-            );
-            (result, response)
-        });
+        let worker = thread::spawn(move || worker_router.track_spectrum_data(&request, || false));
 
         router
             .audio_renderer
@@ -3057,21 +3406,15 @@ mod tests {
         *router.lock_studio() = Studio::from_project(project);
         router.audio_renderer.release_for_test();
 
-        let (result, response) = worker.join().expect("spectrum worker");
-        assert!(result.is_ok());
-        assert!(response.is_empty());
+        let result = worker.join().expect("spectrum worker");
+        assert!(matches!(result, Ok(None)));
     }
 
     #[test]
-    fn rejects_content_lengths_that_overflow_the_request_bound() {
-        let raw = format!(
-            "POST /api/edits HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
-            usize::MAX
-        );
-        let error = Request::read(&mut raw.as_bytes())
-            .err()
-            .expect("oversized request must be rejected");
-        assert_eq!(error, "request is too large");
+    fn rejects_non_utf8_request_bodies() {
+        let error = framework_request("POST", "/api/edits", &[("host", "localhost")], &[0xff])
+            .expect_err("non-UTF-8 body must be rejected");
+        assert_eq!(error, "request body must be UTF-8");
     }
 
     #[test]
@@ -3089,22 +3432,268 @@ mod tests {
 
     #[test]
     fn parses_public_and_ipv6_authorities() {
-        assert_eq!(
-            parse_authority("studio.example:8443"),
-            Some(("studio.example", Some(8443)))
-        );
-        assert_eq!(parse_authority("[::1]:8888"), Some(("[::1]", Some(8888))));
-        assert_eq!(parse_authority("studio.example/path"), None);
+        let public = authority("studio.example:8443").expect("public authority");
+        assert_eq!(public.host(), "studio.example");
+        assert_eq!(public.port_u16(), Some(8443));
+        let ipv6 = authority("[::1]:8888").expect("IPv6 authority");
+        assert_eq!(ipv6.host(), "[::1]");
+        assert_eq!(ipv6.port_u16(), Some(8888));
+        assert!(authority("studio.example/path").is_none());
+
+        let mut request = request("POST", "/api/mix", "");
+        request
+            .headers
+            .insert("host".to_owned(), "[::1]:8888".to_owned());
+        request
+            .headers
+            .insert("origin".to_owned(), "http://[::1]:8888".to_owned());
+        assert!(request.is_trusted_request("[::1]:8888"));
+
+        request
+            .headers
+            .insert("origin".to_owned(), "http://[::1]:8888/path".to_owned());
+        assert!(!request.is_trusted_request("[::1]:8888"));
     }
 
     #[test]
     fn response_contains_security_and_length_headers() {
-        let response = Response::json(200, "{\"ok\":true}".to_owned());
-        let mut bytes = Vec::new();
-        response.write(&mut bytes).expect("writable buffer");
-        let rendered = String::from_utf8(bytes).expect("UTF-8 response");
-        assert!(rendered.contains("Content-Length: 11"));
-        assert!(rendered.contains("X-Content-Type-Options: nosniff"));
+        let mut response = Response::json(200, "{\"ok\":true}".to_owned());
+        response.set_cookie =
+            Some("daw_ai_user=0123456789abcdef0123456789abcdef; Path=/".to_owned());
+        let response = response.into_http();
+        assert_eq!(response.headers()["content-length"], "11");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            response.headers()["set-cookie"],
+            "daw_ai_user=0123456789abcdef0123456789abcdef; Path=/"
+        );
+    }
+
+    #[tokio::test]
+    async fn total_body_deadline_bounds_clients_that_keep_trickling_data() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let producer = tokio::spawn(async move {
+            loop {
+                if sender
+                    .send(Ok::<_, io::Error>(Bytes::from_static(b"x")))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let body = ReceiverBody {
+            receiver,
+            permit: None,
+        }
+        .boxed_unsync();
+        let result = read_request_body(
+            body,
+            BodyReadLimits {
+                idle_timeout: Duration::from_millis(50),
+                timeout: Duration::from_millis(75),
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(RequestBodyReadError::TimedOut)));
+        producer.await.expect("body producer");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_header_and_body_timeouts_preserve_capacity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test address");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_http(
+            listener,
+            Router::demo(),
+            async move {
+                let _ = stopped.await;
+            },
+            HttpServerConfig {
+                max_connections: 1,
+                header_timeout: Duration::from_millis(75),
+                body_limits: BodyReadLimits {
+                    idle_timeout: Duration::from_millis(75),
+                    timeout: Duration::from_millis(250),
+                },
+                shutdown_grace_timeout: Duration::from_millis(75),
+            },
+        ));
+
+        let mut missing_headers = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("header-stalled connection");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let mut header_overload = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("header overload connection");
+        let header_overload = read_test_connection(&mut header_overload).await;
+        assert!(header_overload.starts_with("HTTP/1.1 503"));
+        assert!(
+            read_test_connection(&mut missing_headers).await.is_empty(),
+            "an incomplete header cannot receive an HTTP response"
+        );
+
+        let mut missing_body = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("body-stalled connection");
+        missing_body
+            .write_all(b"POST /api/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1\r\n\r\n")
+            .await
+            .expect("partial request");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let mut body_overload = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("body overload connection");
+        let body_overload = read_test_connection(&mut body_overload).await;
+        assert!(body_overload.starts_with("HTTP/1.1 503"));
+        let timed_out = read_test_connection(&mut missing_body).await;
+        assert!(timed_out.starts_with("HTTP/1.1 408"));
+
+        let mut health = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("health connection");
+        health
+            .write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("health request");
+        let health = read_test_connection(&mut health).await;
+        assert!(health.starts_with("HTTP/1.1 200"));
+
+        shutdown.send(()).expect("stop test server");
+        server
+            .await
+            .expect("test server task")
+            .expect("test server result");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cancels_a_long_lived_stream_after_the_grace_period() {
+        let mut router = Router::demo();
+        let limiter = Limiter::new(1);
+        router.stream_limiter = Arc::clone(&limiter);
+        let mut project = router.lock_studio().project().clone();
+        project.duration = 300.0;
+        let version = project.version;
+        *router.lock_studio() = Studio::from_project(project);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test address");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_http(
+            listener,
+            router,
+            async move {
+                let _ = stopped.await;
+            },
+            HttpServerConfig {
+                max_connections: 1,
+                header_timeout: Duration::from_secs(1),
+                body_limits: BodyReadLimits {
+                    idle_timeout: Duration::from_secs(1),
+                    timeout: Duration::from_secs(2),
+                },
+                shutdown_grace_timeout: Duration::from_millis(75),
+            },
+        ));
+
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("playback connection");
+        stream
+            .write_all(
+                format!(
+                    "GET /api/audio-stream/test-audio-token/{version}/0 HTTP/1.1\r\n\
+                     Host: 127.0.0.1\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("playback request");
+        let mut response = [0_u8; 1024];
+        let response_length =
+            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response))
+                .await
+                .expect("playback response timed out")
+                .expect("playback response");
+        assert!(response[..response_length].starts_with(b"HTTP/1.1 200"));
+        assert!(limiter.acquire().is_none());
+
+        let started = tokio::time::Instant::now();
+        shutdown.send(()).expect("stop test server");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server shutdown exceeded its bound")
+            .expect("test server task")
+            .expect("test server result");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(limiter.acquire().is_some());
+    }
+
+    async fn read_test_connection(stream: &mut tokio::net::TcpStream) -> String {
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("HTTP connection timed out")
+            .expect("read HTTP connection");
+        String::from_utf8(response).expect("ASCII HTTP response")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_streaming_response_cancels_its_producer() {
+        let (events, received) = std::sync::mpsc::channel();
+        let limiter = Limiter::new(1);
+        let permit = limiter.acquire().expect("stream permit");
+        let body = streaming_body(permit, move |_, is_cancelled| {
+            events.send("started").expect("event receiver");
+            while !is_cancelled() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            events.send("cancelled").expect("event receiver");
+            Ok(())
+        });
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)), Ok("started"));
+        assert!(limiter.acquire().is_none());
+        drop(body);
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)),
+            Ok("cancelled")
+        );
+        assert!(limiter.acquire().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_capacity_rejects_overload_and_releases_on_drop() {
+        let mut router = Router::demo();
+        let limiter = Limiter::new(1);
+        let held = limiter.acquire().expect("held stream permit");
+        router.stream_limiter = Arc::clone(&limiter);
+        let version = router.lock_studio().project().version;
+        let mut stream_request = request(
+            "GET",
+            &format!("/api/audio-stream/test-audio-token/{version}/0"),
+            "",
+        );
+        stream_request
+            .headers
+            .insert("range".to_owned(), "bytes=0-43".to_owned());
+
+        let overloaded = router.playback_response(&stream_request, None);
+        assert_eq!(overloaded.status(), 503);
+        drop(held);
+
+        let response = router.playback_response(&stream_request, None);
+        assert_eq!(response.status(), 206);
+        assert!(limiter.acquire().is_none());
+        drop(response);
+        assert!(limiter.acquire().is_some());
     }
 
     #[test]
@@ -3188,12 +3777,14 @@ mod tests {
             fs::create_dir(root.join(format!("{index:032x}"))).expect("bounded user directory");
         }
         let edit_limiter = Limiter::new(MAX_ACTIVE_EDIT_JOBS);
+        let stream_limiter = Limiter::new(MAX_ACTIVE_HTTP_STREAMS);
         let audio_renderer = Arc::new(AudioRenderer::default());
         let base = Router {
             users: Some(Arc::new(UserRegistry {
                 root: root.clone(),
                 ai: Ai::Deterministic(Duration::ZERO),
                 edit_limiter,
+                stream_limiter,
                 audio_renderer,
                 users: Mutex::new(HashMap::new()),
             })),
@@ -3235,14 +3826,17 @@ mod tests {
         ));
         fs::create_dir(&root).expect("shared resource root");
         let edit_limiter = Limiter::new(MAX_ACTIVE_EDIT_JOBS);
+        let stream_limiter = Limiter::new(MAX_ACTIVE_HTTP_STREAMS);
         let audio_renderer = Arc::new(AudioRenderer::default());
         let base = Router {
             edit_limiter: Arc::clone(&edit_limiter),
+            stream_limiter: Arc::clone(&stream_limiter),
             audio_renderer: Arc::clone(&audio_renderer),
             users: Some(Arc::new(UserRegistry {
                 root: root.clone(),
                 ai: Ai::Deterministic(Duration::ZERO),
                 edit_limiter,
+                stream_limiter,
                 audio_renderer,
                 users: Mutex::new(HashMap::new()),
             })),
@@ -3257,6 +3851,7 @@ mod tests {
             .expect("second user");
 
         assert!(Arc::ptr_eq(&first.edit_limiter, &second.edit_limiter));
+        assert!(Arc::ptr_eq(&first.stream_limiter, &second.stream_limiter));
         assert!(Arc::ptr_eq(&first.audio_renderer, &second.audio_renderer));
         fs::remove_dir_all(root).expect("remove shared resource root");
     }
@@ -3288,9 +3883,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_user_ids_preserve_the_cookie_contract() {
-        let first = fallback_operation_id(1);
-        let second = fallback_operation_id(2);
+    fn random_user_ids_preserve_the_cookie_contract() {
+        let first = new_operation_id().expect("first random ID");
+        let second = new_operation_id().expect("second random ID");
         assert!(valid_user_id(&first));
         assert!(valid_user_id(&second));
         assert_ne!(first, second);

@@ -97,10 +97,50 @@ pub(crate) fn read_bounded_text(
     maximum_bytes: u64,
     description: &str,
 ) -> io::Result<String> {
+    bounded_utf8(
+        read_bounded_file(path, maximum_bytes, description)?,
+        description,
+    )
+}
+
+pub(crate) fn read_bounded_text_following_links(
+    path: &Path,
+    maximum_bytes: u64,
+    description: &str,
+) -> io::Result<String> {
+    bounded_utf8(
+        read_bounded_file_with(path, maximum_bytes, description, false)?,
+        description,
+    )
+}
+
+fn bounded_utf8(source: Vec<u8>, description: &str) -> io::Result<String> {
+    String::from_utf8(source).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} must be UTF-8"),
+        )
+    })
+}
+
+pub(crate) fn read_bounded_file(
+    path: &Path,
+    maximum_bytes: u64,
+    description: &str,
+) -> io::Result<Vec<u8>> {
+    read_bounded_file_with(path, maximum_bytes, description, true)
+}
+
+fn read_bounded_file_with(
+    path: &Path,
+    maximum_bytes: u64,
+    description: &str,
+    no_follow: bool,
+) -> io::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options.custom_flags(libc::O_NONBLOCK | if no_follow { libc::O_NOFOLLOW } else { 0 });
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -115,8 +155,8 @@ pub(crate) fn read_bounded_text(
             format!("{description} exceeds the {maximum_bytes}-byte limit"),
         ));
     }
-    let mut source = String::with_capacity(metadata.len() as usize);
-    file.take(maximum_bytes + 1).read_to_string(&mut source)?;
+    let mut source = Vec::with_capacity(metadata.len() as usize);
+    file.take(maximum_bytes + 1).read_to_end(&mut source)?;
     if source.len() as u64 > maximum_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

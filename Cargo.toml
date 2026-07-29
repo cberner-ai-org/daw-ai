@@ -10,10 +10,19 @@ license = "MIT"
 exclude = ["vendor/surge-bridge", "vendor/surge-rs", "vendor/surge-sys"]
 
 [dependencies]
+curl = "0.4"
+getrandom = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+rustfft = "6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 surge-rs = { git = "https://github.com/surge-synthesizer/surge-rs.git", rev = "7bfeafc76d1c57860a177e9e076bed7ec764009a" }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+url = "2.5"
 
 [patch."https://github.com/surge-synthesizer/surge-rs.git"]
 # The official alpha binding needs ABI and lifetime fixes documented in each

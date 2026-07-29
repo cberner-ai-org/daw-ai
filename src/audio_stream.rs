@@ -63,7 +63,7 @@ pub(crate) fn wait_for_playback_window(
     lookahead_samples: usize,
     sample_rate: u32,
     stream_started: Instant,
-    is_cancelled: &impl Fn() -> bool,
+    is_cancelled: &(impl Fn() -> bool + ?Sized),
 ) -> bool {
     wait_for_playback_window_with(
         generated_samples,
@@ -81,7 +81,7 @@ fn wait_for_playback_window_with(
     sample_rate: u32,
     elapsed_time: impl Fn() -> Duration,
     mut wait: impl FnMut(Duration),
-    is_cancelled: &impl Fn() -> bool,
+    is_cancelled: &(impl Fn() -> bool + ?Sized),
 ) -> bool {
     let paced_samples = generated_samples.saturating_sub(lookahead_samples);
     let target = Duration::from_secs_f64(paced_samples as f64 / f64::from(sample_rate));

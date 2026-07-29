@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let port = match daw_ai::parse_port(&arguments) {
         Ok(port) => port,
@@ -10,7 +11,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match daw_ai::server::run(port) {
+    match daw_ai::server::run(port).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("DAW-AI stopped: {error}");

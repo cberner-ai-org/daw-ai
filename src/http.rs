@@ -1,10 +1,30 @@
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io;
 
-const MAX_REQUEST_BYTES: usize = 6 * 1024 * 1024;
+use http::request::Parts;
+use http::uri::Authority;
+use http::{HeaderMap, HeaderName, HeaderValue, Response as HttpResponse, StatusCode};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use url::Url;
+
+pub(crate) const MAX_REQUEST_BYTES: usize = 6 * 1024 * 1024;
 pub(crate) const MAX_REQUEST_HEADER_BYTES: usize = 32 * 1024;
 pub(crate) const AUDIO_REQUEST_HEADER: &str = "x-daw-ai-audio";
+pub(crate) type HttpBody = UnsyncBoxBody<Bytes, io::Error>;
 
+pub(crate) fn full_body(body: impl Into<Bytes>) -> HttpBody {
+    Full::new(body.into())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+pub(crate) fn empty_body() -> HttpBody {
+    full_body(Bytes::new())
+}
+
+#[derive(Debug)]
 pub(crate) struct Request {
     pub(crate) method: String,
     pub(crate) path: String,
@@ -13,115 +33,45 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    pub(crate) fn user_id(&self) -> Option<&str> {
-        self.headers.get("cookie")?.split(';').find_map(|part| {
-            let (name, value) = part.trim().split_once('=')?;
-            (name == "daw_ai_user" && valid_user_id(value)).then_some(value)
-        })
-    }
-
-    pub(crate) fn read(stream: &mut impl Read) -> Result<Self, String> {
-        let mut bytes = Vec::with_capacity(2048);
-        let header_end = loop {
-            let mut chunk = [0_u8; 2048];
-            let count = stream.read(&mut chunk).map_err(|error| error.to_string())?;
-            if count == 0 {
-                return Err("incomplete request".to_owned());
-            }
-            bytes.extend_from_slice(&chunk[..count]);
-            if let Some(position) = find_bytes(&bytes, b"\r\n\r\n") {
-                break position + 4;
-            }
-            if bytes.len() > MAX_REQUEST_HEADER_BYTES {
-                return Err("request headers are too large".to_owned());
-            }
-        };
-        if header_end > MAX_REQUEST_HEADER_BYTES {
-            return Err("request headers are too large".to_owned());
-        }
-
-        let headers = std::str::from_utf8(&bytes[..header_end])
-            .map_err(|_| "request headers must be UTF-8".to_owned())?;
-        let mut lines = headers.split("\r\n");
-        let request_line = lines
-            .next()
-            .ok_or_else(|| "missing request line".to_owned())?;
-        let mut request_parts = request_line.split_whitespace();
-        let method = request_parts
-            .next()
-            .ok_or_else(|| "missing method".to_owned())?
-            .to_owned();
-        let target = request_parts
-            .next()
-            .ok_or_else(|| "missing path".to_owned())?;
-        let version = request_parts
-            .next()
-            .ok_or_else(|| "missing HTTP version".to_owned())?;
-        if request_parts.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
-            return Err("invalid request line".to_owned());
-        }
-        if !target.starts_with('/') {
+    pub(crate) fn from_http(parts: Parts, body: &[u8]) -> Result<Self, String> {
+        if parts.uri.scheme().is_some() || parts.uri.authority().is_some() {
             return Err("request path must be origin-form".to_owned());
         }
-        let path = target.split('?').next().unwrap_or(target).to_owned();
-
-        let mut parsed_headers = HashMap::new();
-        for line in lines.filter(|line| !line.is_empty()) {
-            let (name, value) = line
-                .split_once(':')
-                .ok_or_else(|| "invalid request header".to_owned())?;
-            if name.is_empty()
-                || name.trim() != name
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
-            {
-                return Err("invalid request header name".to_owned());
+        let mut header_bytes = 0_usize;
+        let mut headers = HashMap::new();
+        for (name, value) in &parts.headers {
+            header_bytes = header_bytes
+                .checked_add(name.as_str().len())
+                .and_then(|length| length.checked_add(value.as_bytes().len() + 4))
+                .ok_or_else(|| "request headers are too large".to_owned())?;
+            if header_bytes > MAX_REQUEST_HEADER_BYTES {
+                return Err("request headers are too large".to_owned());
             }
-            let name = name.to_ascii_lowercase();
-            if parsed_headers
-                .insert(name, value.trim().to_owned())
+            let value = value
+                .to_str()
+                .map_err(|_| "request headers must be UTF-8".to_owned())?;
+            if headers
+                .insert(name.as_str().to_owned(), value.to_owned())
                 .is_some()
             {
                 return Err("duplicate request header".to_owned());
             }
         }
-        let headers = parsed_headers;
-        if headers.contains_key("transfer-encoding") {
-            return Err("transfer encoding is not supported".to_owned());
-        }
-        let content_length = headers.get("content-length").map_or(Ok(0_usize), |value| {
-            value
-                .parse::<usize>()
-                .map_err(|_| "invalid content length".to_owned())
-        })?;
-        let body_end = header_end
-            .checked_add(content_length)
-            .ok_or_else(|| "request is too large".to_owned())?;
-        if body_end > MAX_REQUEST_BYTES {
-            return Err("request is too large".to_owned());
-        }
-
-        while bytes.len() < body_end {
-            let remaining = body_end - bytes.len();
-            let mut chunk = [0_u8; 2048];
-            let count = stream
-                .read(&mut chunk[..remaining.min(2048)])
-                .map_err(|error| error.to_string())?;
-            if count == 0 {
-                return Err("incomplete request body".to_owned());
-            }
-            bytes.extend_from_slice(&chunk[..count]);
-        }
-
-        let body = std::str::from_utf8(&bytes[header_end..body_end])
+        let body = std::str::from_utf8(body)
             .map_err(|_| "request body must be UTF-8".to_owned())?
             .to_owned();
         Ok(Self {
-            method,
-            path,
+            method: parts.method.as_str().to_owned(),
+            path: parts.uri.path().to_owned(),
             headers,
             body,
+        })
+    }
+
+    pub(crate) fn user_id(&self) -> Option<&str> {
+        self.headers.get("cookie")?.split(';').find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            (name == "daw_ai_user" && valid_user_id(value)).then_some(value)
         })
     }
 
@@ -140,7 +90,7 @@ impl Request {
 
     pub(crate) fn public_host(&self) -> Option<&str> {
         let transport_host = self.headers.get("host")?;
-        parse_authority(transport_host)?;
+        authority(transport_host)?;
         let forwarded = match self.headers.get("x-forwarded-host") {
             Some(value) => Some(forwarded_host(value)?),
             None => None,
@@ -177,6 +127,7 @@ pub(crate) fn valid_user_id(value: &str) -> bool {
     value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[derive(Debug)]
 pub(crate) struct Response {
     pub(crate) status: u16,
     content_type: &'static str,
@@ -214,145 +165,96 @@ impl Response {
         self
     }
 
-    pub(crate) fn write(&self, stream: &mut impl Write) -> io::Result<()> {
-        write_response_head(
-            stream,
+    pub(crate) fn into_http(self) -> HttpResponse<HttpBody> {
+        response_with_body(
             self.status,
             self.content_type,
             self.body.len(),
             &self.headers,
             self.set_cookie.as_deref(),
-        )?;
-        stream.write_all(self.body.as_bytes())
+            full_body(self.body),
+        )
     }
 }
 
-pub(crate) fn write_response_head(
-    stream: &mut impl Write,
+pub(crate) fn response_with_body(
     status: u16,
     content_type: &str,
     content_length: usize,
     headers: &[(&str, &str)],
     set_cookie: Option<&str>,
-) -> io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        202 => "Accepted",
-        206 => "Partial Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        409 => "Conflict",
-        416 => "Range Not Satisfiable",
-        422 => "Unprocessable Content",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        507 => "Insufficient Storage",
-        _ => "Error",
-    };
-    let mut head = format!(
-        concat!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
-            "Connection: close\r\nX-Content-Type-Options: nosniff\r\n",
-            "Content-Security-Policy: default-src 'self'; script-src 'self'; ",
-            "style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; ",
-            "media-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none';\r\n",
-            "Referrer-Policy: no-referrer\r\n"
-        ),
-        status, reason, content_type, content_length
+    body: HttpBody,
+) -> HttpResponse<HttpBody> {
+    let mut response = HttpResponse::new(body);
+    *response.status_mut() =
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let response_headers = response.headers_mut();
+    insert_header(response_headers, "content-type", content_type);
+    insert_header(
+        response_headers,
+        "content-length",
+        &content_length.to_string(),
     );
+    insert_header(response_headers, "x-content-type-options", "nosniff");
+    insert_header(
+        response_headers,
+        "content-security-policy",
+        concat!(
+            "default-src 'self'; script-src 'self'; ",
+            "style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; ",
+            "media-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none';"
+        ),
+    );
+    insert_header(response_headers, "referrer-policy", "no-referrer");
     for (name, value) in headers {
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(value);
-        head.push_str("\r\n");
+        insert_header(response_headers, name, value);
     }
     if let Some(cookie) = set_cookie {
-        head.push_str("Set-Cookie: ");
-        head.push_str(cookie);
-        head.push_str("\r\n");
+        insert_header(response_headers, "set-cookie", cookie);
     }
-    head.push_str("\r\n");
-    stream.write_all(head.as_bytes())
+    response
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) {
+    let name = HeaderName::from_bytes(name.as_bytes()).expect("response header name is valid");
+    let value = HeaderValue::from_str(value).expect("response header value is valid");
+    headers.insert(name, value);
 }
 
 fn forwarded_host(value: &str) -> Option<&str> {
     let host = value.split(',').next()?.trim();
-    parse_authority(host).map(|_| host)
+    authority(host).map(|_| host)
 }
 
 fn origin_matches_host(origin: &str, host: &str) -> bool {
-    let (authority, default_port) = origin
-        .strip_prefix("http://")
-        .map(|authority| (authority, 80))
-        .or_else(|| {
-            origin
-                .strip_prefix("https://")
-                .map(|authority| (authority, 443))
-        })
-        .unwrap_or(("", 0));
-    if default_port == 0 {
+    let Ok(origin) = Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(origin.scheme(), "http" | "https")
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
         return false;
     }
-    let Some((origin_host, origin_port)) = parse_authority(authority) else {
+    let Some(request) = authority(host) else {
         return false;
     };
-    let Some((request_host, request_port)) = parse_authority(host) else {
-        return false;
-    };
-    origin_host.eq_ignore_ascii_case(request_host)
-        && origin_port.unwrap_or(default_port) == request_port.unwrap_or(default_port)
+    let default_port = if origin.scheme() == "http" { 80 } else { 443 };
+    origin
+        .host_str()
+        .is_some_and(|origin_host| origin_host.eq_ignore_ascii_case(request.host()))
+        && origin.port_or_known_default() == Some(request.port_u16().unwrap_or(default_port))
 }
 
-pub(crate) fn parse_authority(value: &str) -> Option<(&str, Option<u16>)> {
-    if value.is_empty()
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-        || value.contains(['/', '\\', '?', '#', '@', ','])
-    {
+pub(crate) fn authority(value: &str) -> Option<Authority> {
+    if value.contains('@') {
         return None;
     }
-    if value.starts_with('[') {
-        let end = value.find(']')?;
-        let hostname = &value[..=end];
-        if hostname.len() <= 2 {
-            return None;
-        }
-        let remainder = &value[end + 1..];
-        let port = if remainder.is_empty() {
-            None
-        } else {
-            Some(parse_port(remainder.strip_prefix(':')?)?)
-        };
-        return Some((hostname, port));
-    }
-    let (hostname, port) = value
-        .rsplit_once(':')
-        .map_or((value, None), |(hostname, port)| (hostname, Some(port)));
-    if hostname.is_empty()
-        || hostname.contains(':')
-        || !hostname
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-    {
-        return None;
-    }
-    let port = match port {
-        Some(port) => Some(parse_port(port)?),
-        None => None,
-    };
-    Some((hostname, port))
-}
-
-fn parse_port(value: &str) -> Option<u16> {
-    value.parse::<u16>().ok().filter(|port| *port > 0)
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    value
+        .parse::<Authority>()
+        .ok()
+        .filter(|authority| authority.port_u16() != Some(0))
 }
