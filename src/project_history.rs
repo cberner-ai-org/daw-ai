@@ -12,8 +12,7 @@ use crate::storage::{
 };
 
 const MAX_HISTORY_SNAPSHOTS: usize = 10_000;
-const MAX_LEGACY_DECODE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_CHECKOUT_WORK_BYTES: usize = 256 * 1024 * 1024;
+const MAX_CHECKOUT_PEAK_SOURCE_BYTES: usize = MAX_PROJECT_BYTES * 3;
 
 #[derive(Clone)]
 pub(crate) struct ProjectHistory {
@@ -106,6 +105,11 @@ impl ProjectHistory {
         let next = self.snapshots.len();
         let current_source = history_source(current);
         let next_source = history_source(project);
+        if current_source.len() > MAX_PROJECT_BYTES || next_source.len() > MAX_PROJECT_BYTES {
+            return Err(invalid_data(
+                "project history snapshot exceeds the graph limit",
+            ));
+        }
         validate_snapshot_source(&previous_current, &current_source)?;
         self.snapshots[parent].base = Some(next);
         self.snapshots[parent].delta = Some(snapshot_delta(&next_source, &current_source));
@@ -142,12 +146,18 @@ impl ProjectHistory {
             return Ok(history_project(current));
         }
         let mut candidate = self.clone();
-        let project = candidate.reroot(index, current)?;
+        let project =
+            candidate.reroot_with_peak_limit(index, current, MAX_CHECKOUT_PEAK_SOURCE_BYTES)?;
         *self = candidate;
         Ok(project)
     }
 
-    fn reroot(&mut self, index: usize, current: &Project) -> io::Result<Project> {
+    fn reroot_with_peak_limit(
+        &mut self,
+        index: usize,
+        current: &Project,
+        maximum_peak_source_bytes: usize,
+    ) -> io::Result<Project> {
         let mut path = Vec::new();
         let mut cursor = index;
         while cursor != self.current {
@@ -164,34 +174,54 @@ impl ProjectHistory {
         let mut base_index = self.current;
         let mut base_source = history_source(current);
         validate_snapshot_source(&self.snapshots[base_index], &base_source)?;
-        let mut work_bytes = base_source.len();
-        let mut project = history_project(current);
         for target_index in path {
+            let target_bytes = self.snapshots[target_index].source_bytes;
             let delta = self.snapshots[target_index]
                 .delta
-                .clone()
+                .as_ref()
                 .ok_or_else(|| invalid_data("project history snapshot delta is missing"))?;
-            let target_source = apply_snapshot_delta(&base_source, &delta)?;
-            validate_snapshot_source(&self.snapshots[target_index], &target_source)?;
-            work_bytes = work_bytes
-                .checked_add(target_source.len())
-                .filter(|bytes| *bytes <= MAX_CHECKOUT_WORK_BYTES)
+            let reverse_replacement_bytes = base_source
+                .len()
+                .checked_sub(delta.prefix)
+                .and_then(|bytes| bytes.checked_sub(delta.suffix))
+                .ok_or_else(|| invalid_data("project history snapshot delta is out of bounds"))?;
+            base_source
+                .len()
+                .checked_add(target_bytes)
+                .and_then(|bytes| bytes.checked_add(reverse_replacement_bytes))
+                .filter(|bytes| *bytes <= maximum_peak_source_bytes)
                 .ok_or_else(|| {
                     invalid_data(format!(
-                        "history checkout exceeds the {MAX_CHECKOUT_WORK_BYTES}-byte work limit"
+                        "history checkout exceeds the {maximum_peak_source_bytes}-byte peak source limit"
                     ))
                 })?;
-            project = Project::from_json(&target_source)
-                .map_err(|error| invalid_data(error.to_string()))?;
+            let prefix = delta.prefix;
+            let suffix = delta.suffix;
+            let delta = self.snapshots[target_index]
+                .delta
+                .take()
+                .expect("checked history snapshot delta exists");
+            let target_source = apply_snapshot_delta(&base_source, &delta)?;
+            drop(delta);
+            validate_snapshot_source(&self.snapshots[target_index], &target_source)?;
+            let suffix_start = base_source
+                .len()
+                .checked_sub(suffix)
+                .filter(|suffix_start| prefix <= *suffix_start)
+                .ok_or_else(|| invalid_data("project history snapshot delta is out of bounds"))?;
+            let reverse_delta = SnapshotDelta {
+                prefix,
+                suffix,
+                replacement: base_source[prefix..suffix_start].to_owned(),
+            };
             self.snapshots[base_index].base = Some(target_index);
-            self.snapshots[base_index].delta = Some(snapshot_delta(&target_source, &base_source));
+            self.snapshots[base_index].delta = Some(reverse_delta);
             self.snapshots[target_index].base = None;
-            self.snapshots[target_index].delta = None;
             base_source = target_source;
             base_index = target_index;
         }
         self.current = index;
-        Ok(project)
+        Project::from_json(&base_source).map_err(|error| invalid_data(error.to_string()))
     }
 
     pub(crate) fn parent(&self, index: usize) -> Option<usize> {
@@ -254,26 +284,19 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "history current is invalid"))?;
     let encoding = history
         .get("encoding")
-        .map(|encoding| {
-            encoding.as_str().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "history encoding is invalid")
-            })
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_data("history encoding is required"))?;
+    if encoding != "delta-tree-v2" {
+        return Err(invalid_data("history encoding is unsupported"));
+    }
+    let snapshots = snapshot_values
+        .iter()
+        .cloned()
+        .map(|snapshot| {
+            serde_json::from_value::<CompactSnapshot>(snapshot)
+                .map_err(|error| invalid_data(format!("history snapshot is invalid: {error}")))
         })
-        .transpose()?;
-    let snapshots = match encoding {
-        Some("delta-tree-v2") => snapshot_values
-            .iter()
-            .cloned()
-            .map(|snapshot| {
-                serde_json::from_value::<CompactSnapshot>(snapshot)
-                    .map_err(|error| invalid_data(format!("history snapshot is invalid: {error}")))
-            })
-            .collect::<io::Result<Vec<_>>>()?,
-        Some("delta-v1") | None => {
-            load_legacy_snapshots(snapshot_values, encoding, current, project, &parents)?
-        }
-        Some(_) => return Err(invalid_data("history encoding is unsupported")),
-    };
+        .collect::<io::Result<Vec<_>>>()?;
     validate_compact_snapshots(&snapshots, current)?;
     validate_snapshot_source(&snapshots[current], &history_source(project))?;
     let mut loaded = ProjectHistory {
@@ -420,66 +443,6 @@ fn history_entry(project: &Project, index: usize, previous_edit_count: usize) ->
         start: None,
         end: None,
     }
-}
-
-fn load_legacy_snapshots(
-    values: &[serde_json::Value],
-    encoding: Option<&str>,
-    current: usize,
-    project: &Project,
-    parents: &[Option<usize>],
-) -> io::Result<Vec<CompactSnapshot>> {
-    let current_source = project.to_json();
-    let current_history_source = history_source(project);
-    let mut decoded_bytes = 0usize;
-    let mut entries = Vec::with_capacity(values.len());
-    for (index, value) in values.iter().enumerate() {
-        let snapshot = if value.is_null() {
-            if index != current {
-                return Err(invalid_data(
-                    "only the current history snapshot may be omitted",
-                ));
-            }
-            project.clone()
-        } else {
-            let source = if encoding == Some("delta-v1") {
-                let delta =
-                    serde_json::from_value::<SnapshotDelta>(value.clone()).map_err(|error| {
-                        invalid_data(format!("history snapshot delta is invalid: {error}"))
-                    })?;
-                apply_snapshot_delta(&current_source, &delta)?
-            } else {
-                value.to_string()
-            };
-            decoded_bytes = decoded_bytes
-                .checked_add(source.len())
-                .filter(|bytes| *bytes <= MAX_LEGACY_DECODE_BYTES)
-                .ok_or_else(|| {
-                    invalid_data(format!(
-                        "legacy history exceeds the {MAX_LEGACY_DECODE_BYTES}-byte decode limit"
-                    ))
-                })?;
-            Project::from_json(&source).map_err(|error| invalid_data(error.to_string()))?
-        };
-        if index == current && snapshot.to_json() != project.to_json() {
-            return Err(invalid_data(
-                "history current does not match the saved project",
-            ));
-        }
-        let previous_edit_count = parents[index]
-            .and_then(|parent| entries.get(parent))
-            .map_or(0, |entry: &CompactSnapshot| entry.entry.edit_count);
-        let target_source = history_source(&snapshot);
-        entries.push(CompactSnapshot {
-            base: (index != current).then_some(current),
-            delta: (index != current)
-                .then(|| snapshot_delta(&current_history_source, &target_source)),
-            source_bytes: target_source.len(),
-            checksum: source_checksum(&target_source),
-            entry: history_entry(&snapshot, index, previous_edit_count),
-        });
-    }
-    Ok(entries)
 }
 
 fn validate_compact_snapshots(snapshots: &[CompactSnapshot], current: usize) -> io::Result<()> {
@@ -810,6 +773,7 @@ mod tests {
     #[test]
     fn many_large_snapshots_stay_compact_in_memory_and_on_disk() {
         let mut current = large_project(512);
+        let initial_source = history_source(&current);
         let mut history = ProjectHistory::new(current.clone());
         for _ in 0..64 {
             let mut next = current.clone();
@@ -822,6 +786,15 @@ mod tests {
         assert_eq!(history.len(), 65);
         assert!(history.stored_delta_bytes() < 4_096);
         assert!(project_document(&current, &history).len() < current.to_json().len() + 128 * 1024);
+
+        let source_bytes = history_source(&current).len();
+        let peak_limit = source_bytes * 2 + 4_096;
+        assert!(source_bytes * history.len() > peak_limit);
+        let mut direct = history.clone();
+        let restored = direct
+            .reroot_with_peak_limit(0, &current, peak_limit)
+            .expect("direct checkout with bounded peak source memory");
+        assert_eq!(history_source(&restored), initial_source);
 
         for _ in 0..16 {
             let previous = history.parent(history.current).expect("previous snapshot");
@@ -841,81 +814,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_delta_history_migrates_without_retaining_decoded_projects() {
-        let previous = Project::demo();
-        let mut current = previous.clone();
-        current.name = "Current".to_owned();
-        current.version += 1;
-        let current_source = current.to_json();
+    fn non_current_history_encoding_is_rejected() {
+        let current = Project::demo();
+        let history = ProjectHistory::new(current.clone());
         let mut document =
-            serde_json::from_str::<serde_json::Value>(&current_source).expect("current JSON");
-        document["history"] = serde_json::json!({
-            "encoding":"delta-v1",
-            "current":1,
-            "snapshots":[
-                serde_json::to_value(snapshot_delta(&current_source, &previous.to_json())).unwrap(),
-                serde_json::Value::Null
-            ],
-            "parents":[null,0]
-        });
+            serde_json::from_str::<serde_json::Value>(&project_document(&current, &history))
+                .expect("current project document");
+        document["history"]["encoding"] = "delta-v1".into();
         let root = std::env::temp_dir().join(format!(
-            "daw-ai-legacy-history-{}-{}",
+            "daw-ai-unsupported-history-{}-{}",
             std::process::id(),
             crate::storage::unique_test_id()
         ));
-        fs::create_dir(&root).expect("legacy test directory");
+        fs::create_dir(&root).expect("unsupported history test directory");
         let path = root.join("sound-graph.json");
-        fs::write(&path, format!("{document}\n")).expect("legacy history");
-
-        let mut loaded = load_project_history(&path, &current).expect("legacy migration");
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(
-            loaded
-                .checkout(0, &current)
-                .expect("legacy previous state")
-                .name,
-            previous.name
-        );
-        assert!(loaded.stored_delta_bytes() < 128);
-        fs::remove_dir_all(root).expect("remove legacy test directory");
-    }
-
-    #[test]
-    fn legacy_decode_work_is_bounded() {
-        let mut current = large_project(512);
-        current.version = 100;
-        let mut previous = current.clone();
-        previous.version = 1;
-        let current_source = current.to_json();
-        let delta =
-            serde_json::to_value(snapshot_delta(&current_source, &previous.to_json())).unwrap();
-        let current_index = 65;
-        let mut snapshots = vec![delta; current_index];
-        snapshots.push(serde_json::Value::Null);
-        let mut parents = vec![serde_json::Value::Null];
-        parents.extend((0..current_index).map(serde_json::Value::from));
-        let mut document =
-            serde_json::from_str::<serde_json::Value>(&current_source).expect("current JSON");
-        document["history"] = serde_json::json!({
-            "encoding":"delta-v1",
-            "current":current_index,
-            "snapshots":snapshots,
-            "parents":parents
-        });
-        let root = std::env::temp_dir().join(format!(
-            "daw-ai-legacy-work-{}-{}",
-            std::process::id(),
-            crate::storage::unique_test_id()
-        ));
-        fs::create_dir(&root).expect("legacy work directory");
-        let path = root.join("sound-graph.json");
-        fs::write(&path, format!("{document}\n")).expect("legacy work history");
+        fs::write(&path, format!("{document}\n")).expect("unsupported history");
 
         let error = match load_project_history(&path, &current) {
-            Ok(_) => panic!("legacy decode should be bounded"),
+            Ok(_) => panic!("unsupported history encoding should be rejected"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("decode limit"));
-        fs::remove_dir_all(root).expect("remove legacy work directory");
+        assert!(error.to_string().contains("unsupported"));
+        fs::remove_dir_all(root).expect("remove unsupported history test directory");
     }
 }
