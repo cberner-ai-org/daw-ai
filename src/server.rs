@@ -1,26 +1,34 @@
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::Write as FmtWrite;
-use std::fs::{self, File};
-use std::hash::{BuildHasher, Hash, Hasher};
-use std::io::{self, Read, Write};
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::audio_analysis;
+#[cfg(test)]
+use crate::audio_renderer::AudioRenderPriority;
+use crate::audio_renderer::{AudioRenderError, AudioRenderer};
 use crate::audio_stream::{
     ByteRange, WAV_HEADER_BYTES, bounded_audio_byte_range, wait_for_playback_window,
 };
 use crate::concurrency::Limiter;
+use crate::edit_jobs::{EditJobs, accepted_edit_job_json, new_operation_id};
+#[cfg(test)]
+use crate::edit_jobs::{MAX_ACTIVE_EDIT_JOBS, fallback_operation_id};
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
+#[cfg(test)]
+use crate::gemini_session::session_root;
+use crate::gemini_session::session_summaries_in;
 use crate::gemini_tools::render_audio_request;
 #[cfg(test)]
+use crate::http::valid_user_id;
+#[cfg(test)]
 use crate::http::{AUDIO_REQUEST_HEADER, MAX_REQUEST_HEADER_BYTES, parse_authority};
-use crate::http::{Request, Response, valid_user_id, write_response_head};
+use crate::http::{Request, Response, write_response_head};
 use crate::model::{Project, Studio, StudioError, json_string, valid_operation_id};
 #[cfg(test)]
 use crate::project_history::MAX_HISTORY_BYTES;
@@ -33,8 +41,6 @@ use crate::prompt::EditPlan;
 use crate::storage::{ProjectStore, replace_file, replace_text_file};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
-const MAX_ACTIVE_EDIT_JOBS: usize = 4;
-const MAX_RETAINED_EDIT_JOBS: usize = 64;
 const AUDIO_RANGE_SAMPLES: usize =
     (audio_analysis::MAX_REGION_SECONDS * audio_analysis::SAMPLE_RATE as f32) as usize;
 const PLAYBACK_CHUNK_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 2;
@@ -44,7 +50,8 @@ const SPECTRUM_FFT_SAMPLES: usize = 1024;
 const SPECTRUM_FRAME_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize / 30;
 const SPECTRUM_BANDS: usize = 8;
 const MAX_TRACK_SPECTRUM_WINDOW_MS: u64 = 64_000;
-const SPECTRUM_RENDER_CHUNK_SAMPLES: usize = SPECTRUM_FRAME_SAMPLES * 60;
+// Full render regions avoid replaying Surge's DSP preroll for every spectrum frame batch.
+const SPECTRUM_RENDER_CHUNK_SAMPLES: usize = AUDIO_RANGE_SAMPLES;
 const GEMINI_POLL_INTERVAL_MS: u64 = 1_000;
 #[cfg(debug_assertions)]
 const TEST_AI_POLL_INTERVAL_MS: u64 = 25;
@@ -58,6 +65,7 @@ enum PlaybackPacing {
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
+const AUDIO_ENGINE_JS: &str = include_str!("../web/audio-engine.js");
 const APP_JS: &str = include_str!("../web/app.js");
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -349,7 +357,7 @@ enum Ai {
 #[cfg(test)]
 struct PlannerGate {
     state: Mutex<(bool, bool)>,
-    changed: Condvar,
+    changed: std::sync::Condvar,
 }
 
 #[cfg(test)]
@@ -357,7 +365,7 @@ impl PlannerGate {
     fn new() -> Self {
         Self {
             state: Mutex::new((false, false)),
-            changed: Condvar::new(),
+            changed: std::sync::Condvar::new(),
         }
     }
 
@@ -398,31 +406,6 @@ impl PlannerGate {
     }
 }
 
-struct EditJobs {
-    next_id: AtomicU64,
-    jobs: Mutex<BTreeMap<u64, EditJob>>,
-}
-
-struct EditJob {
-    operation_id: String,
-    started_at: Instant,
-    finished_at: Option<Instant>,
-    poll_after_ms: u64,
-    applied_steps: usize,
-    project_version: Option<u64>,
-    state: EditJobState,
-    interrupted: bool,
-    cancellation: Arc<AtomicBool>,
-    worker_active: bool,
-}
-
-enum EditJobState {
-    Queued,
-    Running { phase: &'static str, detail: String },
-    Completed { message: String },
-    Failed { status: u16, error: String },
-}
-
 struct EditRequest {
     operation_id: String,
     prompt: String,
@@ -437,364 +420,6 @@ struct EditRequest {
 struct EditFailure {
     status: u16,
     message: String,
-}
-
-#[derive(Default)]
-struct AudioRenderState {
-    rendering: bool,
-    foreground_waiters: usize,
-    background_waiters: usize,
-}
-
-#[derive(Default)]
-struct AudioRenderer {
-    state: Mutex<AudioRenderState>,
-    completed: Condvar,
-}
-
-struct AudioWaiter<'a> {
-    renderer: &'a AudioRenderer,
-    priority: AudioRenderPriority,
-    active: bool,
-}
-
-struct AudioRenderPermit<'a> {
-    renderer: &'a AudioRenderer,
-}
-
-#[derive(Debug)]
-enum AudioRenderError {
-    Render(String),
-    Cancelled,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AudioRenderPriority {
-    Foreground,
-    Background,
-}
-
-impl AudioRenderState {
-    fn add_waiter(&mut self, priority: AudioRenderPriority) {
-        match priority {
-            AudioRenderPriority::Foreground => self.foreground_waiters += 1,
-            AudioRenderPriority::Background => self.background_waiters += 1,
-        }
-    }
-
-    fn remove_waiter(&mut self, priority: AudioRenderPriority) {
-        match priority {
-            AudioRenderPriority::Foreground => self.foreground_waiters -= 1,
-            AudioRenderPriority::Background => self.background_waiters -= 1,
-        }
-    }
-}
-
-impl Drop for AudioWaiter<'_> {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let mut state = self
-            .renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.remove_waiter(self.priority);
-        self.renderer.completed.notify_all();
-    }
-}
-
-impl Drop for AudioRenderPermit<'_> {
-    fn drop(&mut self) {
-        let mut state = self
-            .renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.rendering = false;
-        self.renderer.completed.notify_all();
-    }
-}
-
-impl AudioRenderer {
-    // Queue state transitions happen under `state`; caller callbacks and rendering never do.
-    fn acquire(
-        &self,
-        priority: AudioRenderPriority,
-        is_cancelled: &impl Fn() -> bool,
-    ) -> Result<AudioRenderPermit<'_>, AudioRenderError> {
-        if is_cancelled() {
-            return Err(AudioRenderError::Cancelled);
-        }
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.add_waiter(priority);
-        let mut waiter = AudioWaiter {
-            renderer: self,
-            priority,
-            active: true,
-        };
-        self.completed.notify_all();
-        loop {
-            drop(state);
-            if is_cancelled() {
-                return Err(AudioRenderError::Cancelled);
-            }
-            state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !state.rendering
-                && (priority == AudioRenderPriority::Foreground || state.foreground_waiters == 0)
-            {
-                state.rendering = true;
-                state.remove_waiter(priority);
-                waiter.active = false;
-                drop(state);
-                return Ok(AudioRenderPermit { renderer: self });
-            }
-            state = self
-                .completed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-
-    fn stream_sample_range(
-        &self,
-        project: &crate::model::Project,
-        start_sample: usize,
-        end_sample: usize,
-        is_cancelled: &impl Fn() -> bool,
-    ) -> Result<audio_analysis::AudioRegion, AudioRenderError> {
-        self.stream_region_with(
-            project,
-            start_sample,
-            end_sample,
-            is_cancelled,
-            AudioRenderPriority::Foreground,
-            audio_analysis::render_project_sample_range,
-        )
-    }
-
-    fn stream_stems_sample_range(
-        &self,
-        project: &crate::model::Project,
-        start_sample: usize,
-        end_sample: usize,
-        is_cancelled: &impl Fn() -> bool,
-    ) -> Result<Vec<(u64, audio_analysis::AudioRegion)>, AudioRenderError> {
-        self.stream_region_with(
-            project,
-            start_sample,
-            end_sample,
-            is_cancelled,
-            AudioRenderPriority::Background,
-            audio_analysis::render_project_stems_sample_range,
-        )
-    }
-
-    fn stream_region_with<T>(
-        &self,
-        project: &crate::model::Project,
-        start_sample: usize,
-        end_sample: usize,
-        is_cancelled: &impl Fn() -> bool,
-        priority: AudioRenderPriority,
-        render: impl FnOnce(&crate::model::Project, usize, usize) -> Result<T, String>,
-    ) -> Result<T, AudioRenderError> {
-        let _permit = self.acquire(priority, is_cancelled)?;
-
-        if is_cancelled() {
-            return Err(AudioRenderError::Cancelled);
-        }
-        render(project, start_sample, end_sample).map_err(AudioRenderError::Render)
-    }
-}
-
-impl EditJobs {
-    fn new() -> Self {
-        Self {
-            next_id: AtomicU64::new(1),
-            jobs: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    fn has_active(&self) -> bool {
-        self.lock().values().any(|job| job.worker_active)
-    }
-
-    fn create(
-        &self,
-        poll_after_ms: u64,
-        requested_operation_id: Option<&str>,
-    ) -> Result<(u64, String, bool), ()> {
-        let mut jobs = self.lock();
-        if let Some(operation_id) = requested_operation_id {
-            if let Some((id, job)) = jobs
-                .iter()
-                .find(|(_, job)| job.operation_id == operation_id)
-            {
-                return Ok((*id, job.operation_id.clone(), false));
-            }
-        }
-        let active_jobs = jobs.values().filter(|job| job.worker_active).count();
-        if active_jobs >= MAX_ACTIVE_EDIT_JOBS {
-            return Err(());
-        }
-        while jobs.len() >= MAX_RETAINED_EDIT_JOBS {
-            let Some(id) = jobs.iter().find_map(|(id, job)| {
-                matches!(
-                    &job.state,
-                    EditJobState::Completed { .. } | EditJobState::Failed { .. }
-                )
-                .then_some(*id)
-            }) else {
-                return Err(());
-            };
-            jobs.remove(&id);
-        }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let operation_id = requested_operation_id
-            .map(str::to_owned)
-            .unwrap_or_else(|| new_operation_id(id));
-        jobs.insert(
-            id,
-            EditJob {
-                operation_id: operation_id.clone(),
-                started_at: Instant::now(),
-                finished_at: None,
-                poll_after_ms,
-                applied_steps: 0,
-                project_version: None,
-                state: EditJobState::Queued,
-                interrupted: false,
-                cancellation: Arc::new(AtomicBool::new(false)),
-                worker_active: true,
-            },
-        );
-        Ok((id, operation_id, true))
-    }
-
-    fn response_for_operation(&self, operation_id: &str) -> Option<Response> {
-        let id = self
-            .jobs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .find(|(_, job)| job.operation_id == operation_id)
-            .map(|(id, _)| *id)?;
-        self.response(id)
-    }
-
-    fn remove(&self, id: u64) {
-        self.lock().remove(&id);
-    }
-
-    fn set_running(&self, id: u64, phase: &'static str, detail: impl Into<String>) {
-        if let Some(job) = self.lock().get_mut(&id) {
-            job.state = EditJobState::Running {
-                phase,
-                detail: detail.into(),
-            };
-        }
-    }
-
-    fn publish_update(&self, id: u64, project_version: u64, summary: &str) {
-        if let Some(job) = self.lock().get_mut(&id) {
-            job.applied_steps += 1;
-            job.project_version = Some(project_version);
-            job.state = EditJobState::Running {
-                phase: "editing",
-                detail: format!("Applied step {}: {summary}", job.applied_steps),
-            };
-        }
-    }
-
-    fn finalize_updates(&self, id: u64, project_version: u64) {
-        if let Some(job) = self.lock().get_mut(&id) {
-            job.project_version = Some(project_version);
-            job.state = EditJobState::Running {
-                phase: "finalizing",
-                detail: "Gemini finished the sound graph edit".to_owned(),
-            };
-        }
-    }
-
-    fn complete(&self, id: u64, message: String) {
-        if let Some(job) = self.lock().get_mut(&id) {
-            if job.interrupted {
-                return;
-            }
-            job.finished_at = Some(Instant::now());
-            job.state = EditJobState::Completed { message };
-            job.worker_active = false;
-        }
-    }
-
-    fn fail(&self, id: u64, status: u16, error: String) {
-        if let Some(job) = self.lock().get_mut(&id) {
-            if job.interrupted {
-                return;
-            }
-            job.finished_at = Some(Instant::now());
-            job.state = EditJobState::Failed { status, error };
-            job.worker_active = false;
-        }
-    }
-
-    fn worker_finished(&self, id: u64) {
-        if let Some(job) = self.lock().get_mut(&id) {
-            job.worker_active = false;
-        }
-    }
-
-    fn interrupt(&self, id: u64) -> bool {
-        let mut jobs = self.lock();
-        let Some(job) = jobs.get_mut(&id) else {
-            return false;
-        };
-        if !matches!(
-            job.state,
-            EditJobState::Queued | EditJobState::Running { .. }
-        ) {
-            return false;
-        }
-        job.interrupted = true;
-        job.cancellation.store(true, Ordering::SeqCst);
-        job.finished_at = Some(Instant::now());
-        job.state = EditJobState::Failed {
-            status: 409,
-            error: "Edit interrupted by the user.".to_owned(),
-        };
-        true
-    }
-
-    fn is_interrupted(&self, id: u64) -> bool {
-        self.lock().get(&id).is_some_and(|job| job.interrupted)
-    }
-
-    fn cancellation(&self, id: u64) -> Arc<AtomicBool> {
-        self.lock()
-            .get(&id)
-            .map(|job| Arc::clone(&job.cancellation))
-            .expect("edit job must exist while its worker is running")
-    }
-
-    fn response(&self, id: u64) -> Option<Response> {
-        self.lock()
-            .get(&id)
-            .map(|job| Response::json(200, edit_job_json(id, job)))
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, EditJob>> {
-        self.jobs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 }
 
 impl EditFailure {
@@ -1230,6 +855,9 @@ impl Router {
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/") => Response::static_asset("text/html; charset=utf-8", INDEX_HTML),
             ("GET", "/app.css") => Response::static_asset("text/css; charset=utf-8", APP_CSS),
+            ("GET", "/audio-engine.js") => {
+                Response::static_asset("text/javascript; charset=utf-8", AUDIO_ENGINE_JS)
+            }
             ("GET", "/app.js") => Response::static_asset("text/javascript; charset=utf-8", APP_JS),
             ("GET", "/api/health") => Response::json(200, "{\"status\":\"ok\"}".to_owned()),
             ("GET", "/api/project") => {
@@ -1855,7 +1483,7 @@ impl Router {
     }
 
     fn gemini_sessions(&self) -> Response {
-        match crate::gemini_tools::session_summaries_in(&self.gemini_session_root()) {
+        match session_summaries_in(&self.gemini_session_root()) {
             Ok(sessions) => {
                 Response::json(200, serde_json::json!({"sessions": sessions}).to_string())
             }
@@ -2126,7 +1754,7 @@ impl Router {
                 .join("gemini-sessions");
         }
         #[cfg(test)]
-        return crate::gemini_tools::session_root();
+        return session_root();
         #[cfg(not(test))]
         unreachable!("production routers always have project storage")
     }
@@ -2136,48 +1764,6 @@ impl Router {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-}
-
-fn new_operation_id(id: u64) -> String {
-    let mut random = [0_u8; 16];
-    if File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut random))
-        .is_ok()
-    {
-        let mut token = String::with_capacity(32);
-        for byte in random {
-            write!(token, "{byte:02x}").expect("writing to a string cannot fail");
-        }
-        return token;
-    }
-    if let Ok(uuid) = fs::read_to_string("/proc/sys/kernel/random/uuid") {
-        let token = uuid
-            .bytes()
-            .filter(|byte| byte.is_ascii_hexdigit())
-            .map(char::from)
-            .collect::<String>();
-        if valid_user_id(&token) {
-            return token;
-        }
-    }
-    fallback_operation_id(id)
-}
-
-fn fallback_operation_id(id: u64) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let hash = |domain: u8| {
-        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-        domain.hash(&mut hasher);
-        nanos.hash(&mut hasher);
-        std::process::id().hash(&mut hasher);
-        std::thread::current().id().hash(&mut hasher);
-        id.hash(&mut hasher);
-        hasher.finish()
-    };
-    format!("{:016x}{:016x}", hash(0), hash(1))
 }
 
 fn recovered_operation_json(operation: &crate::model::EditOperation) -> String {
@@ -2215,72 +1801,6 @@ fn recovered_operation_json(operation: &crate::model::EditOperation) -> String {
             json_string(recovered_status),
             json_string(&operation.message)
         )
-    }
-}
-
-fn accepted_edit_job_json(id: u64, operation_id: &str, poll_after_ms: u64) -> String {
-    format!(
-        concat!(
-            "{{\"id\":\"{}\",\"operationId\":{},\"status\":\"queued\",\"phase\":\"queued\",",
-            "\"detail\":\"Waiting for the edit worker\",\"elapsedSeconds\":0,",
-            "\"appliedSteps\":0,\"projectVersion\":null,",
-            "\"timeoutSeconds\":{},\"pollAfterMs\":{}}}"
-        ),
-        id,
-        json_string(operation_id),
-        EDIT_TIMEOUT_SECONDS,
-        poll_after_ms
-    )
-}
-
-fn edit_job_json(id: u64, job: &EditJob) -> String {
-    let ended_at = job.finished_at.unwrap_or_else(Instant::now);
-    let elapsed = ended_at.saturating_duration_since(job.started_at).as_secs();
-    let project_version = job
-        .project_version
-        .map_or_else(|| "null".to_owned(), |version| version.to_string());
-    let common = format!(
-        concat!(
-            "\"id\":\"{}\",\"operationId\":{},\"elapsedSeconds\":{},",
-            "\"timeoutSeconds\":{},\"appliedSteps\":{},\"projectVersion\":{}"
-        ),
-        id,
-        json_string(&job.operation_id),
-        elapsed,
-        EDIT_TIMEOUT_SECONDS,
-        job.applied_steps,
-        project_version
-    );
-    match &job.state {
-        EditJobState::Queued => format!(
-            concat!(
-                "{{{},\"status\":\"queued\",\"phase\":\"queued\",",
-                "\"detail\":\"Waiting for the edit worker\",",
-                "\"pollAfterMs\":{}}}"
-            ),
-            common, job.poll_after_ms
-        ),
-        EditJobState::Running { phase, detail } => format!(
-            concat!(
-                "{{{},\"status\":\"running\",\"phase\":{},\"detail\":{},",
-                "\"pollAfterMs\":{}}}"
-            ),
-            common,
-            json_string(phase),
-            json_string(detail),
-            job.poll_after_ms
-        ),
-        EditJobState::Completed { message } => format!(
-            "{{{},\"status\":\"completed\",\"phase\":\"completed\",\"message\":{}}}",
-            common,
-            json_string(message)
-        ),
-        EditJobState::Failed { status, error } => format!(
-            "{{{},\"status\":\"failed\",\"phase\":\"failed\",\"errorStatus\":{},\"error\":{}}}",
-            common,
-            status,
-            json_string(error)
-        ),
     }
 }
 
@@ -2659,6 +2179,9 @@ mod tests {
             "Cache-Control",
             "no-store, no-cache, must-revalidate, max-age=0"
         )));
+        let audio_engine = router.handle(&request("GET", "/audio-engine.js", ""));
+        assert_eq!(audio_engine.status, 200);
+        assert!(audio_engine.body.contains("createDawAiAudioEngine"));
         let project = router.handle(&request("GET", "/api/project", ""));
         assert_eq!(project.status, 200);
         assert!(project.body.contains("\"tracks\""));
@@ -3144,12 +2667,7 @@ mod tests {
             );
         }
 
-        router
-            .audio_renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .rendering = true;
+        router.audio_renderer.occupy_for_test();
         let cold_router = router.clone();
         let cold_path = format!(
             "/api/track-spectrum/test-audio-token/{}/100",
@@ -3164,18 +2682,9 @@ mod tests {
                 None,
             )
         });
-        let state = router
+        router
             .audio_renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        drop(
-            router
-                .audio_renderer
-                .completed
-                .wait_while(state, |state| state.background_waiters == 0)
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+            .wait_until_queued_for_test(AudioRenderPriority::Background);
         let mut second = Vec::new();
         router
             .write_track_spectrum_with_cancel(
@@ -3187,14 +2696,7 @@ mod tests {
             .expect("cached spectrum response");
         assert_eq!(first, second);
 
-        let mut state = router
-            .audio_renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.rendering = false;
-        drop(state);
-        router.audio_renderer.completed.notify_all();
+        router.audio_renderer.release_for_test();
         cold.join()
             .expect("cold spectrum worker")
             .expect("unrelated cold spectrum response");
@@ -3282,11 +2784,7 @@ mod tests {
         let project = Project::demo();
         let cancelled = Arc::new(AtomicBool::new(false));
         let checked = Arc::new(std::sync::Barrier::new(2));
-        let mut state = renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.rendering = true;
+        renderer.occupy_for_test();
 
         let second_renderer = Arc::clone(&renderer);
         let second_cancelled = Arc::clone(&cancelled);
@@ -3312,9 +2810,7 @@ mod tests {
 
         checked.wait();
         cancelled.store(true, Ordering::SeqCst);
-        state.rendering = false;
-        drop(state);
-        renderer.completed.notify_all();
+        renderer.release_for_test();
         assert!(matches!(
             second.join().expect("cancelled stream thread"),
             Err(AudioRenderError::Cancelled)
@@ -3355,11 +2851,7 @@ mod tests {
     fn panicking_cancellation_check_releases_a_queued_waiter() {
         let renderer = AudioRenderer::default();
         let project = Project::demo();
-        renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .rendering = true;
+        renderer.occupy_for_test();
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let first_check = AtomicBool::new(true);
@@ -3380,21 +2872,13 @@ mod tests {
         }));
         assert!(panic.is_err());
 
-        let state = renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(state.background_waiters, 0);
+        assert_eq!(renderer.queued_for_test(AudioRenderPriority::Background), 0);
     }
 
     #[test]
     fn playback_render_precedes_queued_spectrum_work() {
         let renderer = Arc::new(AudioRenderer::default());
-        renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .rendering = true;
+        renderer.occupy_for_test();
         let project = Project::demo();
         let (completed, order) = std::sync::mpsc::channel();
 
@@ -3416,16 +2900,7 @@ mod tests {
                 },
             )
         });
-        let state = renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        drop(
-            renderer
-                .completed
-                .wait_while(state, |state| state.background_waiters == 0)
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        renderer.wait_until_queued_for_test(AudioRenderPriority::Background);
 
         let foreground_renderer = Arc::clone(&renderer);
         let foreground_completed = completed.clone();
@@ -3444,17 +2919,8 @@ mod tests {
                 },
             )
         });
-        let mut state = renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state = renderer
-            .completed
-            .wait_while(state, |state| state.foreground_waiters == 0)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.rendering = false;
-        drop(state);
-        renderer.completed.notify_all();
+        renderer.wait_until_queued_for_test(AudioRenderPriority::Foreground);
+        renderer.release_for_test();
 
         assert_eq!(
             order
@@ -3469,12 +2935,7 @@ mod tests {
     #[test]
     fn queued_spectrum_render_stops_when_its_project_version_is_stale() {
         let router = Router::demo();
-        router
-            .audio_renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .rendering = true;
+        router.audio_renderer.occupy_for_test();
         let version = router.lock_studio().project().version;
         let request = request(
             "GET",
@@ -3493,29 +2954,13 @@ mod tests {
             (result, response)
         });
 
-        let state = router
+        router
             .audio_renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        drop(
-            router
-                .audio_renderer
-                .completed
-                .wait_while(state, |state| state.background_waiters == 0)
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+            .wait_until_queued_for_test(AudioRenderPriority::Background);
         let mut project = router.lock_studio().project().clone();
         project.version += 1;
         *router.lock_studio() = Studio::from_project(project);
-        let mut state = router
-            .audio_renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.rendering = false;
-        drop(state);
-        router.audio_renderer.completed.notify_all();
+        router.audio_renderer.release_for_test();
 
         let (result, response) = worker.join().expect("spectrum worker");
         assert!(result.is_ok());
@@ -3598,6 +3043,11 @@ mod tests {
     fn static_requests_do_not_create_users_and_user_storage_is_bounded() {
         assert!(!request_needs_user_scope(&request("GET", "/", "")));
         assert!(!request_needs_user_scope(&request("GET", "/app.js", "")));
+        assert!(!request_needs_user_scope(&request(
+            "GET",
+            "/audio-engine.js",
+            ""
+        )));
         assert!(!request_needs_user_scope(&request("GET", "/missing", "")));
         assert!(!request_needs_user_scope(&request(
             "GET",

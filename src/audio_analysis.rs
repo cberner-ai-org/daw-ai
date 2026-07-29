@@ -2,10 +2,11 @@ use std::f32::consts::PI;
 
 use crate::model::{Clip, ClipEvent, Project, Track};
 
-pub(crate) const SAMPLE_RATE: u32 = 16_000;
+pub(crate) const SAMPLE_RATE: u32 = 48_000;
 pub(crate) const CHANNEL_COUNT: usize = 2;
 pub(crate) const MAX_REGION_SECONDS: f32 = 16.0;
-pub(crate) const MAX_WAV_SECONDS: f32 = 67_108.0;
+pub(crate) const MAX_WAV_SECONDS: f32 =
+    (u32::MAX - 36) as f32 / (SAMPLE_RATE * CHANNEL_COUNT as u32 * 2) as f32;
 const DSP_SETTLING_SECONDS: f32 = MAX_REGION_SECONDS;
 const FFT_SIZE: usize = 512;
 const FFT_HOP: usize = 256;
@@ -1049,7 +1050,10 @@ mod tests {
         let onset = 80_000.001_f64;
         let precise = midi_event_sample(onset);
 
-        assert_eq!(precise, 80_000 * SAMPLE_RATE as usize + 16);
+        assert_eq!(
+            precise,
+            80_000 * SAMPLE_RATE as usize + SAMPLE_RATE as usize / 1_000
+        );
         assert_ne!(precise, playback_start_sample(onset as f32));
     }
 

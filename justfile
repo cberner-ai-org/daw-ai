@@ -4,7 +4,9 @@ run port="8888":
 pre:
   cargo fmt --check
   cargo clippy --all-targets --all-features -- -D warnings
+  node --check web/audio-engine.js
   node --check web/app.js
+  node --check qa/browser-support.js
   node --check qa/browser.test.js
 
 test: pre

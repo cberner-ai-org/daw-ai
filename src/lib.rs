@@ -1,7 +1,10 @@
 mod audio_analysis;
+mod audio_renderer;
 mod audio_stream;
 mod concurrency;
+mod edit_jobs;
 pub mod gemini;
+mod gemini_session;
 pub mod gemini_tools;
 mod http;
 pub mod model;

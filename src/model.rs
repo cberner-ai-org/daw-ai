@@ -2018,9 +2018,9 @@ fn demo_role_track(id: u64, role: DemoPart) -> Track {
         name: name.to_owned(),
         color: color.to_owned(),
         volume: match role {
-            DemoPart::Drums => 0.78,
-            DemoPart::Bass => 0.95,
-            DemoPart::Chords => 0.85,
+            DemoPart::Drums => 0.62,
+            DemoPart::Bass => 0.76,
+            DemoPart::Chords => 0.68,
         },
         muted: false,
         instrument: Instrument {
