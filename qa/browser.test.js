@@ -744,8 +744,8 @@ async function run() {
         suggestions: [
           { label: "Waltz", prompt: "Turn this section into a waltz" },
           {
-            label: "Drop",
-            prompt: "Turn this section into a classic dubstep drop. It builds in speed and intensity for the first 80%, then the drop, and then the outro into the rest of the track",
+            label: "Build",
+            prompt: "Build intensity through this section and make the transition into what follows land clearly",
           },
           { label: "Warm", prompt: "Make the chords warm and spacious, and this section relaxing" },
         ],

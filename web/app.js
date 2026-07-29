@@ -271,7 +271,7 @@
           .slice()
           .reverse()
           .map(
-            (entry) => `<button class="history-item" type="button" data-history-index="${entry.index}" data-history-version="${entry.version}" data-history-source="${escapeHtml(entry.source)}" ${entry.index === state.projectHistory.current ? 'aria-current="step"' : ""}><span class="history-marker" aria-hidden="true">${entry.index + 1}</span><span class="history-copy"><span class="history-title"><strong>${escapeHtml(entry.summary)}</strong><em class="history-source history-source-${entry.source.toLowerCase()}">${escapeHtml(entry.source)}</em></span>${entry.prompt ? `<span class="history-prompt">&ldquo;${escapeHtml(entry.prompt)}&rdquo;</span>` : ""}<span>Version ${entry.version}${entry.start == null ? "" : ` &middot; ${entry.start.toFixed(1)} - ${entry.end.toFixed(1)}s`}</span></span><span class="history-current">Current</span></button>`,
+            (entry) => `<button class="history-item" type="button" data-history-index="${entry.index}" data-history-version="${entry.version}" data-history-source="${escapeHtml(entry.source)}" ${entry.index === state.projectHistory.current ? 'aria-current="step"' : ""}><span class="history-marker" aria-hidden="true">${entry.index + 1}</span><span class="history-copy"><span class="history-title"><strong>${escapeHtml(entry.summary)}</strong><em class="history-source ${entry.source === "Gemini" ? "history-source-gemini" : ""}">${escapeHtml(entry.source)}</em></span>${entry.prompt ? `<span class="history-prompt">&ldquo;${escapeHtml(entry.prompt)}&rdquo;</span>` : ""}<span>Version ${entry.version}${entry.start == null ? "" : ` &middot; ${entry.start.toFixed(1)} - ${entry.end.toFixed(1)}s`}</span></span><span class="history-current">Current</span></button>`,
           )
           .join("");
       } catch (error) {
@@ -316,11 +316,12 @@
     const duration = state.project.duration;
     elements.trackRows.innerHTML = state.project.tracks
       .map((track) => {
+        const trackColor = /^#[0-9a-f]{6}$/i.test(track.color) ? track.color : "#808080";
         const midiClips = track.clips
           .map((clip) => {
             const left = (clip.start / duration) * 100;
             const width = ((clip.end - clip.start) / duration) * 100;
-            return `<div class="clip ${clip.style === "generated" ? "is-generated" : ""} ${track.muted ? "is-muted" : ""}" style="left:${left}%;width:${width}%;--track-color:${track.color}">
+            return `<div class="clip ${clip.style === "generated" ? "is-generated" : ""} ${track.muted ? "is-muted" : ""}" style="left:${left}%;width:${width}%;--track-color:${trackColor}">
               <span class="clip-name">${escapeHtml(clip.label)}</span>
               <span class="timeline-midi" aria-hidden="true">${renderTimelineNotes(track, clip)}</span>
             </div>`;
@@ -334,7 +335,7 @@
             return `<span class="edit-marker" style="left:${left}%;width:${width}%" title="${escapeHtml(edit.summary)}"></span>`;
           })
           .join("");
-        return `<div class="track-row" style="--track-color:${track.color}">
+        return `<div class="track-row" style="--track-color:${trackColor}">
           <div class="track-label">
             <span class="track-color" aria-hidden="true"></span>
             <button class="track-mute" type="button" data-track-mute="${track.id}" aria-label="${track.muted ? "Unmute" : "Mute"} ${escapeHtml(track.name)}" aria-pressed="${track.muted}" title="${track.muted ? "Unmute" : "Mute"} track">M</button>

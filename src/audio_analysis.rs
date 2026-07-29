@@ -5,6 +5,7 @@ use crate::model::{Clip, ClipEvent, Project, Track};
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
 pub(crate) const CHANNEL_COUNT: usize = 2;
 pub(crate) const MAX_REGION_SECONDS: f32 = 16.0;
+#[cfg(test)]
 pub(crate) const MAX_WAV_SECONDS: f32 =
     (u32::MAX - 36) as f32 / (SAMPLE_RATE * CHANNEL_COUNT as u32 * 2) as f32;
 const DSP_SETTLING_SECONDS: f32 = MAX_REGION_SECONDS;
@@ -417,8 +418,7 @@ fn render_track(
     while output_frame < frame_count {
         let block_start = start_sample + output_frame;
         let count = crate::surge::BLOCK_SIZE.min(frame_count - output_frame);
-        let block_end = block_start + count;
-        for event in scheduled_midi_events_before(&midi, &mut event_index, block_end) {
+        for event in scheduled_midi_events_through(&midi, &mut event_index, block_start) {
             if event.note_on {
                 engine.play_note(event.pitch, event.velocity, event.note_id);
             } else {
@@ -444,13 +444,13 @@ struct ScheduledMidiEvent {
     note_on: bool,
 }
 
-fn scheduled_midi_events_before<'a>(
+fn scheduled_midi_events_through<'a>(
     midi: &'a [ScheduledMidiEvent],
     event_index: &mut usize,
-    block_end: usize,
+    block_start: usize,
 ) -> &'a [ScheduledMidiEvent] {
     let start = *event_index;
-    *event_index += midi[start..].partition_point(|event| event.sample < block_end);
+    *event_index += midi[start..].partition_point(|event| event.sample <= block_start);
     &midi[start..*event_index]
 }
 
@@ -1058,9 +1058,8 @@ mod tests {
     }
 
     #[test]
-    fn final_partial_block_does_not_dispatch_later_events() {
+    fn midi_events_are_never_dispatched_before_their_sample() {
         let block_start = crate::surge::BLOCK_SIZE;
-        let copied_block_end = block_start + 1;
         let midi = [
             ScheduledMidiEvent {
                 sample: block_start,
@@ -1070,7 +1069,7 @@ mod tests {
                 note_on: true,
             },
             ScheduledMidiEvent {
-                sample: copied_block_end,
+                sample: block_start + 1,
                 note_id: 2,
                 pitch: 62,
                 velocity: 1.0,
@@ -1079,7 +1078,7 @@ mod tests {
         ];
         let mut event_index = 0;
 
-        let dispatched = scheduled_midi_events_before(&midi, &mut event_index, copied_block_end);
+        let dispatched = scheduled_midi_events_through(&midi, &mut event_index, block_start);
 
         assert_eq!(dispatched.len(), 1);
         assert_eq!(dispatched[0].note_id, 1);

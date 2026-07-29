@@ -6,41 +6,37 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::audio_analysis;
-#[cfg(test)]
-use crate::audio_renderer::AudioRenderPriority;
-use crate::audio_renderer::{AudioRenderError, AudioRenderer};
+use crate::audio_renderer::{AudioRenderError, AudioRenderPriority, AudioRenderer};
 use crate::audio_stream::{
     ByteRange, WAV_HEADER_BYTES, bounded_audio_byte_range, wait_for_playback_window,
 };
-use crate::concurrency::Limiter;
-use crate::edit_jobs::{EditJobs, accepted_edit_job_json, new_operation_id};
+use crate::concurrency::{Limiter, Permit};
 #[cfg(test)]
-use crate::edit_jobs::{MAX_ACTIVE_EDIT_JOBS, fallback_operation_id};
+use crate::edit_jobs::fallback_operation_id;
+use crate::edit_jobs::{EditJobs, accepted_edit_job_json, new_operation_id};
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
 #[cfg(test)]
 use crate::gemini_session::session_root;
-use crate::gemini_session::session_summaries_in;
-use crate::gemini_tools::render_audio_request;
+use crate::gemini_session::{session_root_for_project, session_summaries_in};
+use crate::gemini_tools::render_audio_request_cancellable;
 #[cfg(test)]
 use crate::http::valid_user_id;
 #[cfg(test)]
 use crate::http::{AUDIO_REQUEST_HEADER, MAX_REQUEST_HEADER_BYTES, parse_authority};
 use crate::http::{Request, Response, write_response_head};
 use crate::model::{Project, Studio, StudioError, json_string, valid_operation_id};
-#[cfg(test)]
-use crate::project_history::MAX_HISTORY_BYTES;
 use crate::project_history::{
     ProjectHistory, open_project_with_history, project_document, save_project_state,
-    trim_project_history,
 };
 #[cfg(debug_assertions)]
 use crate::prompt::EditPlan;
 use crate::storage::{ProjectStore, replace_file, replace_text_file};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
+const MAX_ACTIVE_EDIT_JOBS: usize = 4;
 const AUDIO_RANGE_SAMPLES: usize =
     (audio_analysis::MAX_REGION_SECONDS * audio_analysis::SAMPLE_RATE as f32) as usize;
 const PLAYBACK_CHUNK_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 2;
@@ -237,6 +233,7 @@ struct Router {
     store: Option<ProjectStore>,
     ai: Ai,
     edit_jobs: Arc<EditJobs>,
+    edit_limiter: Arc<Limiter>,
     audio_renderer: Arc<AudioRenderer>,
     spectrum_cache: Arc<Mutex<()>>,
     audio_token: Arc<String>,
@@ -247,63 +244,19 @@ struct Router {
 struct UserRegistry {
     root: PathBuf,
     ai: Ai,
+    edit_limiter: Arc<Limiter>,
+    audio_renderer: Arc<AudioRenderer>,
     users: Mutex<HashMap<String, CachedUser>>,
 }
 
 struct CachedUser {
     router: Router,
     last_used: Instant,
-    last_persisted: Instant,
 }
 
 const MAX_CACHED_USERS: usize = 64;
 const MAX_PERSISTED_USERS: usize = 256;
 const USER_CACHE_IDLE: Duration = Duration::from_secs(60 * 60);
-const USER_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const USER_USE_PERSIST_INTERVAL: Duration = Duration::from_secs(60 * 60);
-const USER_LAST_USED_FILE: &str = ".last-used";
-
-fn persist_user_use(directory: &std::path::Path) -> io::Result<()> {
-    let milliseconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    replace_text_file(
-        &directory.join(USER_LAST_USED_FILE),
-        &format!("{milliseconds}\n"),
-    )
-}
-
-fn persisted_user_use(directory: &std::path::Path) -> io::Result<SystemTime> {
-    let marker = directory.join(USER_LAST_USED_FILE);
-    if let Ok(source) = fs::read_to_string(&marker) {
-        if let Ok(milliseconds) = source.trim().parse::<u64>() {
-            return Ok(UNIX_EPOCH + Duration::from_millis(milliseconds));
-        }
-    }
-    fs::metadata(directory.join("sound-graph.json").as_path())
-        .or_else(|_| fs::metadata(directory))?
-        .modified()
-}
-
-fn expire_persisted_users(
-    root: &std::path::Path,
-    cached: &HashMap<String, CachedUser>,
-) -> io::Result<()> {
-    let now = SystemTime::now();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let id = entry.file_name().to_string_lossy().into_owned();
-        if !entry.path().is_dir() || cached.contains_key(&id) {
-            continue;
-        }
-        let last_used = persisted_user_use(&entry.path())?;
-        if now.duration_since(last_used).unwrap_or_default() >= USER_RETENTION {
-            fs::remove_dir_all(entry.path())?;
-        }
-    }
-    Ok(())
-}
 
 fn request_needs_user_scope(request: &Request) -> bool {
     matches!(
@@ -661,12 +614,15 @@ impl Router {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("users");
         fs::create_dir_all(&root)?;
-        let (store, studio, mut history) = open_project_with_history(project_path)?;
-        trim_project_history(studio.project(), &mut history);
+        let (store, studio, history) = open_project_with_history(project_path)?;
         save_project_state(&store, studio.project(), &history)?;
+        let edit_limiter = Limiter::new(MAX_ACTIVE_EDIT_JOBS);
+        let audio_renderer = Arc::new(AudioRenderer::default());
         let users = Arc::new(UserRegistry {
             root,
             ai: ai.clone(),
+            edit_limiter: Arc::clone(&edit_limiter),
+            audio_renderer: Arc::clone(&audio_renderer),
             users: Mutex::new(HashMap::new()),
         });
         Ok(Self {
@@ -675,7 +631,8 @@ impl Router {
             store: Some(store),
             ai,
             edit_jobs: Arc::new(EditJobs::new()),
-            audio_renderer: Arc::new(AudioRenderer::default()),
+            edit_limiter,
+            audio_renderer,
             spectrum_cache: Arc::new(Mutex::new(())),
             audio_token: Arc::new(new_operation_id(0)),
             users: Some(users),
@@ -692,6 +649,7 @@ impl Router {
             store: None,
             ai: Ai::Deterministic(Duration::ZERO),
             edit_jobs: Arc::new(EditJobs::new()),
+            edit_limiter: Limiter::new(MAX_ACTIVE_EDIT_JOBS),
             audio_renderer: Arc::new(AudioRenderer::default()),
             spectrum_cache: Arc::new(Mutex::new(())),
             audio_token: Arc::new("test-audio-token".to_owned()),
@@ -723,15 +681,6 @@ impl Router {
         users.retain(|_, user| user.last_used.elapsed() < USER_CACHE_IDLE || !user.can_evict());
         if let Some(user) = users.get_mut(&user_id) {
             user.last_used = Instant::now();
-            if user.last_persisted.elapsed() >= USER_USE_PERSIST_INTERVAL {
-                persist_user_use(
-                    user.router
-                        .project_path()
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new(".")),
-                )?;
-                user.last_persisted = Instant::now();
-            }
             return Ok((user.router.clone(), existing.is_none().then_some(user_id)));
         }
         expire_and_bound_user_cache(&mut users);
@@ -750,19 +699,10 @@ impl Router {
                 .take(MAX_PERSISTED_USERS + 1)
                 .count();
             if persisted_count >= MAX_PERSISTED_USERS {
-                expire_persisted_users(&registry.root, &users)?;
-                if fs::read_dir(&registry.root)?
-                    .filter_map(Result::ok)
-                    .filter(|entry| entry.path().is_dir())
-                    .take(MAX_PERSISTED_USERS + 1)
-                    .count()
-                    >= MAX_PERSISTED_USERS
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::StorageFull,
-                        "persistent user project limit reached",
-                    ));
-                }
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "persistent user project limit reached; existing projects were preserved",
+                ));
             }
         }
         fs::create_dir_all(&directory)?;
@@ -772,17 +712,16 @@ impl Router {
             let history = ProjectHistory::new(studio.project().clone());
             replace_text_file(&project_path, &project_document(studio.project(), &history))?;
         }
-        let (store, studio, mut history) = open_project_with_history(project_path)?;
-        trim_project_history(studio.project(), &mut history);
+        let (store, studio, history) = open_project_with_history(project_path)?;
         save_project_state(&store, studio.project(), &history)?;
-        persist_user_use(&directory)?;
         let router = Self {
             history: Arc::new(Mutex::new(history)),
             studio: Arc::new(Mutex::new(studio)),
             store: Some(store),
             ai: registry.ai.clone(),
             edit_jobs: Arc::new(EditJobs::new()),
-            audio_renderer: Arc::new(AudioRenderer::default()),
+            edit_limiter: Arc::clone(&registry.edit_limiter),
+            audio_renderer: Arc::clone(&registry.audio_renderer),
             spectrum_cache: Arc::new(Mutex::new(())),
             audio_token: Arc::new(new_operation_id(0)),
             users: None,
@@ -792,7 +731,6 @@ impl Router {
             CachedUser {
                 router: router.clone(),
                 last_used: Instant::now(),
-                last_persisted: Instant::now(),
             },
         );
         Ok((router, existing.is_none().then_some(user_id)))
@@ -956,6 +894,13 @@ impl Router {
                 .response(job_id)
                 .expect("an existing edit job has a response");
         }
+        let Some(edit_permit) = self.edit_limiter.acquire() else {
+            self.edit_jobs.remove(job_id);
+            return Response::json(
+                503,
+                error_json("the server edit queue is full; retry shortly"),
+            );
+        };
         let edit = EditRequest {
             operation_id: operation_id.clone(),
             prompt: prompt.to_owned(),
@@ -969,7 +914,7 @@ impl Router {
         let worker = self.clone();
         let spawn = thread::Builder::new()
             .name(format!("daw-ai-edit-{job_id}"))
-            .spawn(move || worker.run_edit_job(job_id, edit));
+            .spawn(move || worker.run_edit_job(job_id, edit, edit_permit));
         if let Err(error) = spawn {
             self.edit_jobs.remove(job_id);
             eprintln!("error: could not start edit worker: {error}");
@@ -1216,7 +1161,7 @@ impl Router {
             )
     }
 
-    fn run_edit_job(&self, job_id: u64, edit: EditRequest) {
+    fn run_edit_job(&self, job_id: u64, edit: EditRequest, _edit_permit: Permit) {
         let operation_id = edit.operation_id.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.perform_edit(job_id, edit)
@@ -1286,6 +1231,7 @@ impl Router {
         let mut expected_version = edit.project.version;
         let mut published_update = false;
         let cancellation = self.edit_jobs.cancellation(job_id);
+        let render_cancellation = Arc::clone(&cancellation);
         let completed = GeminiPlanner::interpret_with_updates(
             &self.gemini_session_root(),
             &edit.prompt,
@@ -1300,9 +1246,20 @@ impl Router {
                 self.edit_jobs.set_running(
                     job_id,
                     "rendering",
-                    "Rendering the current sound graph with the Rust audio engine",
+                    "Rendering the current sound graph with Surge XT",
                 );
-                let result = render_audio_request(request);
+                let cancelled = || render_cancellation.load(Ordering::SeqCst);
+                let result = self
+                    .audio_renderer
+                    .render_with(AudioRenderPriority::Foreground, &cancelled, || {
+                        render_audio_request_cancellable(request, || {
+                            render_cancellation.load(Ordering::SeqCst)
+                        })
+                    })
+                    .map_err(|error| match error {
+                        AudioRenderError::Render(error) => error,
+                        AudioRenderError::Cancelled => "audio render interrupted".to_owned(),
+                    });
                 self.edit_jobs.set_running(
                     job_id,
                     "planning",
@@ -1530,7 +1487,7 @@ impl Router {
             .history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(previous_index) = history.current.checked_sub(1) else {
+        let Some(previous_index) = history.parent(history.current) else {
             return Response::json(409, error_json("nothing to undo"));
         };
         let mut project = history.snapshots[previous_index].clone();
@@ -1547,7 +1504,10 @@ impl Router {
         }
         *history = candidate_history;
         *studio = Studio::from_project(project);
-        Response::json(200, studio.to_json_with_can_undo(history.current > 0))
+        Response::json(
+            200,
+            studio.to_json_with_can_undo(history.parent(history.current).is_some()),
+        )
     }
 
     fn reset(&self) -> Response {
@@ -1577,9 +1537,9 @@ impl Router {
             .iter()
             .enumerate()
             .map(|(index, project)| {
-                let previous_edit_count = index
-                    .checked_sub(1)
-                    .and_then(|previous| history.snapshots.get(previous))
+                let previous_edit_count = history
+                    .parent(index)
+                    .and_then(|parent| history.snapshots.get(parent))
                     .map_or(0, |previous| previous.edits.len());
                 let edit = (project.edits.len() > previous_edit_count)
                     .then(|| project.edits.last())
@@ -1653,16 +1613,18 @@ impl Router {
         }
         *history = candidate_history;
         *studio = Studio::from_project(project);
-        Response::json(200, studio.to_json_with_can_undo(history.current > 0))
+        Response::json(
+            200,
+            studio.to_json_with_can_undo(history.parent(history.current).is_some()),
+        )
     }
 
     fn project_response(&self, studio: &Studio) -> Response {
-        let can_undo = self
+        let history = self
             .history
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .current
-            > 0;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let can_undo = history.parent(history.current).is_some();
         Response::json(200, studio.to_json_with_can_undo(can_undo))
     }
 
@@ -1722,7 +1684,6 @@ impl Router {
     }
 
     fn save_state(&self, project: &Project, history: &mut ProjectHistory) -> io::Result<()> {
-        trim_project_history(project, history);
         let Some(store) = &self.store else {
             return Ok(());
         };
@@ -1747,11 +1708,7 @@ impl Router {
 
     fn gemini_session_root(&self) -> PathBuf {
         if let Some(store) = &self.store {
-            return store
-                .path()
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("gemini-sessions");
+            return session_root_for_project(store.path());
         }
         #[cfg(test)]
         return session_root();
@@ -2124,6 +2081,7 @@ mod tests {
                 store: Some(store),
                 ai: Ai::Deterministic(Duration::ZERO),
                 edit_jobs: Arc::new(EditJobs::new()),
+                edit_limiter: Limiter::new(MAX_ACTIVE_EDIT_JOBS),
                 audio_renderer: Arc::new(AudioRenderer::default()),
                 spectrum_cache: Arc::new(Mutex::new(())),
                 audio_token: Arc::new("test-audio-token".to_owned()),
@@ -2307,14 +2265,12 @@ mod tests {
     }
 
     #[test]
-    fn edit_jobs_bound_concurrent_project_snapshots() {
+    fn edit_jobs_allow_one_active_edit_per_project() {
         let jobs = EditJobs::new();
-        let active = (0..MAX_ACTIVE_EDIT_JOBS)
-            .map(|_| jobs.create(750, None).expect("active edit job").0)
-            .collect::<Vec<_>>();
+        let active = jobs.create(750, None).expect("active edit job").0;
         assert!(jobs.create(750, None).is_err());
 
-        jobs.fail(active[0], 503, "planner stopped".to_owned());
+        jobs.fail(active, 503, "planner stopped".to_owned());
         assert!(jobs.create(750, None).is_ok());
     }
 
@@ -3013,30 +2969,16 @@ mod tests {
     }
 
     #[test]
-    fn history_is_bounded_by_bytes_and_keeps_the_current_project() {
-        let mut snapshots = Vec::new();
+    fn history_keeps_every_committed_state() {
+        let mut history = ProjectHistory::new(Studio::new().project().clone());
         for index in 0..8 {
             let mut project = Studio::new().project().clone();
-            project.name = format!("{index}{}", "x".repeat(1024 * 1024));
-            snapshots.push(project);
+            project.name = index.to_string();
+            project.version += index + 1;
+            history.push(project);
         }
-        let current_project = snapshots.last().expect("current snapshot").clone();
-        let mut history = ProjectHistory {
-            current: snapshots.len() - 1,
-            snapshots,
-        };
-
-        trim_project_history(&current_project, &mut history);
-
-        assert!(
-            project_document(&current_project, &history).len()
-                <= current_project.to_json().len() + MAX_HISTORY_BYTES
-        );
-        assert_eq!(
-            history.snapshots[history.current].name,
-            current_project.name
-        );
-        assert!(history.snapshots.len() < 8);
+        assert_eq!(history.snapshots.len(), 9);
+        assert_eq!(history.current, 8);
     }
 
     #[test]
@@ -3078,7 +3020,6 @@ mod tests {
             CachedUser {
                 router: active_router,
                 last_used: Instant::now() - USER_CACHE_IDLE - Duration::from_secs(1),
-                last_persisted: Instant::now(),
             },
         );
         for index in 0..MAX_CACHED_USERS {
@@ -3087,7 +3028,6 @@ mod tests {
                 CachedUser {
                     router: Router::demo(),
                     last_used: Instant::now(),
-                    last_persisted: Instant::now(),
                 },
             );
         }
@@ -3104,15 +3044,14 @@ mod tests {
         for index in 0..MAX_PERSISTED_USERS {
             fs::create_dir(root.join(format!("{index:032x}"))).expect("bounded user directory");
         }
-        replace_text_file(
-            &root.join(format!("{:032x}", 0)).join(USER_LAST_USED_FILE),
-            "0\n",
-        )
-        .expect("expired user marker");
+        let edit_limiter = Limiter::new(MAX_ACTIVE_EDIT_JOBS);
+        let audio_renderer = Arc::new(AudioRenderer::default());
         let base = Router {
             users: Some(Arc::new(UserRegistry {
                 root: root.clone(),
                 ai: Ai::Deterministic(Duration::ZERO),
+                edit_limiter,
+                audio_renderer,
                 users: Mutex::new(HashMap::new()),
             })),
             ..Router::demo()
@@ -3134,27 +3073,56 @@ mod tests {
                 .set_cookie
                 .is_some_and(|cookie| cookie.contains("Max-Age=0"))
         );
-        let (_, replacement_id) = base
-            .scoped(&request("GET", "/api/project", ""))
-            .expect("expired persisted user is reclaimed");
-        assert!(replacement_id.is_some());
-        assert!(!root.join(format!("{:032x}", 0)).exists());
         let error = match base.scoped(&request("GET", "/api/project", "")) {
             Ok(_) => panic!("new persistent user must be rejected at the bound"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
         assert_eq!(scope_error_response(&error).status, 507);
+        assert!(root.join(format!("{:032x}", 0)).is_dir());
         fs::remove_dir_all(root).expect("remove user limit root");
+    }
+
+    #[test]
+    fn user_routers_share_process_wide_edit_and_render_limits() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-shared-resources-{}-{}",
+            std::process::id(),
+            crate::storage::unique_test_id()
+        ));
+        fs::create_dir(&root).expect("shared resource root");
+        let edit_limiter = Limiter::new(MAX_ACTIVE_EDIT_JOBS);
+        let audio_renderer = Arc::new(AudioRenderer::default());
+        let base = Router {
+            edit_limiter: Arc::clone(&edit_limiter),
+            audio_renderer: Arc::clone(&audio_renderer),
+            users: Some(Arc::new(UserRegistry {
+                root: root.clone(),
+                ai: Ai::Deterministic(Duration::ZERO),
+                edit_limiter,
+                audio_renderer,
+                users: Mutex::new(HashMap::new()),
+            })),
+            ..Router::demo()
+        };
+
+        let (first, _) = base
+            .scoped(&request("GET", "/api/project", ""))
+            .expect("first user");
+        let (second, _) = base
+            .scoped(&request("GET", "/api/project", ""))
+            .expect("second user");
+
+        assert!(Arc::ptr_eq(&first.edit_limiter, &second.edit_limiter));
+        assert!(Arc::ptr_eq(&first.audio_renderer, &second.audio_renderer));
+        fs::remove_dir_all(root).expect("remove shared resource root");
     }
 
     #[test]
     fn interrupt_is_terminal_and_blocks_late_completion() {
         let jobs = EditJobs::new();
         let (id, _, _) = jobs.create(100, None).expect("job");
-        let other_jobs = (1..MAX_ACTIVE_EDIT_JOBS)
-            .map(|_| jobs.create(100, None).expect("other active job").0)
-            .collect::<Vec<_>>();
+        assert!(jobs.create(100, None).is_err());
         let cancellation = jobs.cancellation(id);
         jobs.set_running(id, "editing", "working");
         assert!(jobs.interrupt(id));
@@ -3168,9 +3136,6 @@ mod tests {
         assert!(jobs.create(100, None).is_err());
         jobs.worker_finished(id);
         assert!(jobs.create(100, None).is_ok());
-        for other_id in other_jobs {
-            jobs.fail(other_id, 500, "test cleanup".to_owned());
-        }
     }
 
     #[test]
