@@ -8,7 +8,7 @@ use serde_json::Value as JsonValue;
 
 use crate::model::{Project, json_string};
 use crate::prompt::EditPlan;
-use crate::storage::{read_bounded_text, replace_text_file};
+use crate::storage::{MAX_PROJECT_BYTES, read_bounded_text, replace_text_file};
 
 pub(crate) const GRAPH_FILE: &str = "sound-graph.json";
 pub(crate) const REQUEST_FILE: &str = "request.json";
@@ -18,12 +18,13 @@ pub(crate) const PENDING_PROGRESS_DIRECTORY: &str = ".edit-progress.pending";
 pub(crate) const PROGRESS_PLAN_FILE: &str = "plan.json";
 pub(crate) const PROGRESS_GRAPH_FILE: &str = "project.json";
 pub(crate) const UNDO_GRAPH_FILE: &str = "undo-sound-graph.json";
-pub(crate) const MAX_SOUND_GRAPH_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_SOUND_GRAPH_BYTES: u64 = MAX_PROJECT_BYTES as u64;
 pub(crate) const MAX_SESSION_JSON_BYTES: u64 = 64 * 1024;
 const MAX_PROGRESS_PLAN_BYTES: u64 = 64 * 1024;
 const DEFAULT_SESSION_RETENTION_DAYS: u64 = 30;
 const DEFAULT_SESSION_RETENTION_COUNT: usize = 100;
 const DEFAULT_SESSION_RETENTION_BYTES: u64 = 512 * 1024 * 1024;
+const RUNNING_SESSION_LEASE: Duration = Duration::from_secs(25 * 60);
 pub(crate) static SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
@@ -392,6 +393,34 @@ pub(crate) fn session_root() -> PathBuf {
     std::env::temp_dir().join(format!("daw-ai-gemini-tests-{}", std::process::id()))
 }
 
+pub(crate) fn session_root_for_project(project_path: &Path) -> PathBuf {
+    let root = std::env::var_os("DAW_AI_GEMINI_SESSION_DIR").filter(|path| !path.is_empty());
+    session_root_for_project_with_override(project_path, root.as_deref())
+}
+
+fn session_root_for_project_with_override(
+    project_path: &Path,
+    override_root: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(root) = override_root {
+        let project_directory = project_path.parent().unwrap_or_else(|| Path::new("."));
+        let namespace = if project_directory
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "users")
+        {
+            project_directory.file_name().unwrap_or_default()
+        } else {
+            std::ffi::OsStr::new("default")
+        };
+        return PathBuf::from(root).join(namespace);
+    }
+    project_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("gemini-sessions")
+}
+
 #[cfg(test)]
 pub(crate) fn session_summaries() -> io::Result<Vec<JsonValue>> {
     session_summaries_in(&session_root())
@@ -453,13 +482,14 @@ pub(crate) fn apply_session_retention_with(
         Err(error) => return Err(error),
     };
     let mut sessions = Vec::new();
+    let now = SystemTime::now();
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
         let metadata_path = entry.path().join(SESSION_FILE);
-        let Some(metadata) = read_bounded_text(
+        let Some(mut metadata) = read_bounded_text(
             &metadata_path,
             MAX_SESSION_JSON_BYTES,
             "Gemini session metadata",
@@ -469,12 +499,26 @@ pub(crate) fn apply_session_retention_with(
         .filter(|metadata| valid_session_metadata(&entry.path(), metadata)) else {
             continue;
         };
-        let running = metadata.get("status").and_then(JsonValue::as_str) == Some("running");
-        let updated = metadata
+        let mut running = metadata.get("status").and_then(JsonValue::as_str) == Some("running");
+        let mut updated = metadata
             .get("updatedAt")
             .and_then(JsonValue::as_u64)
             .map(|milliseconds| UNIX_EPOCH + Duration::from_millis(milliseconds))
             .unwrap_or(UNIX_EPOCH);
+        if running && now.duration_since(updated).unwrap_or_default() > RUNNING_SESSION_LEASE {
+            let object = metadata
+                .as_object_mut()
+                .expect("validated session metadata is an object");
+            object.insert("status".to_owned(), JsonValue::String("failed".to_owned()));
+            object.insert(
+                "detail".to_owned(),
+                JsonValue::String("Session abandoned after the edit worker stopped".to_owned()),
+            );
+            object.insert("updatedAt".to_owned(), unix_milliseconds().into());
+            write_replace(&metadata_path, &metadata.to_string())?;
+            running = false;
+            updated = now;
+        }
         sessions.push(RetainedSession {
             bytes: directory_bytes(&entry.path())?,
             path: entry.path(),
@@ -483,7 +527,6 @@ pub(crate) fn apply_session_retention_with(
         });
     }
     sessions.sort_by_key(|session| session.updated);
-    let now = SystemTime::now();
     let mut total_bytes = sessions.iter().map(|session| session.bytes).sum::<u64>();
 
     for session in sessions.iter_mut().filter(|session| !session.running) {
@@ -605,4 +648,35 @@ fn write_new_with(
 
 pub(crate) fn write_replace(path: &Path, source: &str) -> io::Result<()> {
     replace_text_file(path, &format!("{}\n", source.trim_end()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_session_roots_are_namespaced_per_user() {
+        let configured = std::ffi::OsStr::new("/sessions");
+        assert_eq!(
+            session_root_for_project_with_override(
+                Path::new("/state/users/user-one/sound-graph.json"),
+                Some(configured),
+            ),
+            Path::new("/sessions/user-one")
+        );
+        assert_eq!(
+            session_root_for_project_with_override(
+                Path::new("/state/users/user-two/sound-graph.json"),
+                Some(configured),
+            ),
+            Path::new("/sessions/user-two")
+        );
+        assert_eq!(
+            session_root_for_project_with_override(
+                Path::new("/state/sound-graph.json"),
+                Some(configured),
+            ),
+            Path::new("/sessions/default")
+        );
+    }
 }

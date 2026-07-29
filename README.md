@@ -46,7 +46,7 @@ cargo run -- --port 8888
 ## Studio workflow
 
 1. Drag over any part of the arrangement to set the edit region. On touch devices, swipe to pan normally or tap **Select region** before dragging a selection.
-2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `turn this section into a dubstep drop`.
+2. Enter a request such as `increase the volume`, `add a bass`, `make the chords warm and spacious`, or `build intensity into the next section`.
 3. Press **Make change**, then use the transport to hear the result. The button becomes **Interrupt** while Gemini is working.
 4. Use session history to inspect earlier states and move forward again, or download the complete arrangement with **Export WAV**.
 5. Use **Duration** in AI Mode to set the song length from 1 second to 5 minutes. Shortening a song trims arrangement content past the new endpoint, and the change can be undone.
@@ -54,7 +54,7 @@ cargo run -- --port 8888
 
 Playback and WAV exports are rendered by Surge XT as 48 kHz, 16-bit stereo audio.
 
-No login is required. DAW-AI assigns each browser a private random cookie and stores its project under `users/<cookie>/sound-graph.json` beside `DAW_AI_PROJECT_PATH` (or beside the working-directory default). Each user has independent edit jobs, history, playback, and project state. DAW-AI creates the demo graph for a new user and safely saves every accepted prompt, undo, reset, and history selection.
+No login is required. DAW-AI assigns each browser a private random cookie and stores its project under `users/<cookie>/sound-graph.json` beside `DAW_AI_PROJECT_PATH` (or beside the working-directory default). Each user has independent edit jobs, history, playback, and project state, while expensive edit and render work is bounded across the whole server. DAW-AI creates the demo graph for a new user and safely saves every accepted prompt, undo, reset, and history selection. Existing user projects are never deleted automatically to make room for a new user; once the configured hard bound is reached, new projects receive a storage-capacity error instead.
 
 For each prompt, Gemini receives the edit range and checked-in studio contract under `gemini/`, along with registered stable-ID graph tools for reads, mutations, control discovery, undo, and Surge XT rendering. Gemini receives listening renders as audio input. Listening is independent of edit scope and model-directed.
 
@@ -66,9 +66,9 @@ Gemini may render before or after edits whenever listening would help, but no se
 
 Prompted edits run as asynchronous jobs so reverse proxies never need to hold one request open while Gemini works. The browser polls short status requests, fetches each published intermediate project and the completed project, and shows the current phase, applied steps, and elapsed time. Gemini may spend up to 20 minutes on an edit; if the project changes before that edit finishes, the result is rejected instead of overwriting newer work.
 
-Every Gemini session is retained locally with request/response JSON, graph state, metadata, and rendered WAV artifacts. By default sessions live beside `DAW_AI_PROJECT_PATH` in `gemini-sessions/`, or in the working directory's `gemini-sessions/` when no project path is configured. Override this with `DAW_AI_GEMINI_SESSION_DIR`. The Debug tab lists the latest sessions by timestamp.
+Every Gemini session is retained locally with request/response JSON, graph state, metadata, and rendered WAV artifacts. By default sessions live beside each user's project in `gemini-sessions/`, or in the working directory's `gemini-sessions/` when no project path is configured. `DAW_AI_GEMINI_SESSION_DIR` overrides the base location and keeps each user's sessions in a separate child directory. The Debug tab lists the latest sessions by timestamp.
 
-Completed and failed sessions are retained for 30 days, up to 100 sessions and 512 MiB per session directory root. Under storage pressure, old WAV artifacts are pruned before old session records; running sessions are never removed. Configure the limits with `DAW_AI_GEMINI_SESSION_RETENTION_DAYS`, `DAW_AI_GEMINI_SESSION_RETENTION_COUNT`, and `DAW_AI_GEMINI_SESSION_RETENTION_BYTES`.
+Completed and failed sessions are retained for 30 days, up to 100 sessions and 512 MiB per session directory root. Under storage pressure, old WAV artifacts are pruned before old session records. A running session with no update for 25 minutes is marked failed before normal retention is applied, so a stopped worker cannot leave an immortal session record. Configure the limits with `DAW_AI_GEMINI_SESSION_RETENTION_DAYS`, `DAW_AI_GEMINI_SESSION_RETENTION_COUNT`, and `DAW_AI_GEMINI_SESSION_RETENTION_BYTES`.
 
 ## Development
 

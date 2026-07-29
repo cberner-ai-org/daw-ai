@@ -178,12 +178,23 @@ impl AudioRenderer {
         priority: AudioRenderPriority,
         render: impl FnOnce(&Project, usize, usize) -> Result<T, String>,
     ) -> Result<T, AudioRenderError> {
+        self.render_with(priority, is_cancelled, || {
+            render(project, start_sample, end_sample)
+        })
+    }
+
+    pub(crate) fn render_with<T>(
+        &self,
+        priority: AudioRenderPriority,
+        is_cancelled: &impl Fn() -> bool,
+        render: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, AudioRenderError> {
         let _permit = self.acquire(priority, is_cancelled)?;
 
         if is_cancelled() {
             return Err(AudioRenderError::Cancelled);
         }
-        render(project, start_sample, end_sample).map_err(AudioRenderError::Render)
+        render().map_err(AudioRenderError::Render)
     }
 
     #[cfg(test)]

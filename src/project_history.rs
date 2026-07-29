@@ -10,12 +10,12 @@ use crate::storage::{
     MAX_PROJECT_DOCUMENT_BYTES, ProjectStore, quarantine_invalid_file, read_bounded_text,
 };
 
-pub(crate) const MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_HISTORY_SNAPSHOTS: usize = 128;
+const MAX_HISTORY_SNAPSHOTS: usize = 10_000;
 
 #[derive(Clone)]
 pub(crate) struct ProjectHistory {
     pub(crate) snapshots: Vec<Project>,
+    parents: Vec<Option<usize>>,
     pub(crate) current: usize,
 }
 
@@ -23,18 +23,20 @@ impl ProjectHistory {
     pub(crate) fn new(project: Project) -> Self {
         Self {
             snapshots: vec![project],
+            parents: vec![None],
             current: 0,
         }
     }
 
     pub(crate) fn push(&mut self, project: Project) {
-        self.snapshots.truncate(self.current + 1);
+        let parent = self.current;
         self.snapshots.push(project);
+        self.parents.push(Some(parent));
         self.current = self.snapshots.len() - 1;
-        if self.snapshots.len() > MAX_HISTORY_SNAPSHOTS {
-            self.snapshots.remove(0);
-            self.current -= 1;
-        }
+    }
+
+    pub(crate) fn parent(&self, index: usize) -> Option<usize> {
+        self.parents.get(index).copied().flatten()
     }
 }
 
@@ -54,9 +56,28 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
     if snapshots.is_empty() || snapshots.len() > MAX_HISTORY_SNAPSHOTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "history must contain between 1 and 128 snapshots",
+            format!("history must contain between 1 and {MAX_HISTORY_SNAPSHOTS} snapshots"),
         ));
     }
+    let parents = history
+        .get("parents")
+        .and_then(serde_json::Value::as_array)
+        .filter(|parents| parents.len() == snapshots.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "history parents are required"))?
+        .iter()
+        .enumerate()
+        .map(|(index, parent)| {
+            if parent.is_null() {
+                return (index == 0).then_some(None);
+            }
+            parent
+                .as_u64()
+                .and_then(|parent| usize::try_from(parent).ok())
+                .filter(|parent| *parent < index)
+                .map(Some)
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "history parents are invalid"))?;
     let snapshots = snapshots
         .iter()
         .enumerate()
@@ -99,7 +120,11 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
             "history current does not match the saved project",
         ));
     }
-    Ok(ProjectHistory { snapshots, current })
+    Ok(ProjectHistory {
+        snapshots,
+        parents,
+        current,
+    })
 }
 
 pub(crate) fn project_document(project: &Project, history: &ProjectHistory) -> String {
@@ -117,6 +142,7 @@ fn history_value(history: &ProjectHistory) -> serde_json::Value {
     struct PersistedHistory {
         current: usize,
         snapshots: Vec<serde_json::Value>,
+        parents: Vec<Option<usize>>,
     }
 
     let snapshots = history
@@ -135,6 +161,7 @@ fn history_value(history: &ProjectHistory) -> serde_json::Value {
     serde_json::to_value(PersistedHistory {
         current: history.current,
         snapshots,
+        parents: history.parents.clone(),
     })
     .expect("project history serializes to JSON")
 }
@@ -184,18 +211,6 @@ pub(crate) fn open_project_with_history(
     Ok((store, studio, history))
 }
 
-pub(crate) fn trim_project_history(project: &Project, history: &mut ProjectHistory) {
-    let maximum = project.to_json().len() + MAX_HISTORY_BYTES;
-    while history.snapshots.len() > 1 && project_document(project, history).len() > maximum {
-        if history.current > 0 {
-            history.snapshots.remove(0);
-            history.current -= 1;
-        } else {
-            history.snapshots.pop();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +240,7 @@ mod tests {
         let loaded = load_project_history(&path, &project).expect("embedded history");
         assert_eq!(loaded.current, 1);
         assert_eq!(loaded.snapshots.len(), 2);
+        assert_eq!(loaded.parent(1), Some(0));
         assert!(
             store
                 .read_source()
@@ -256,5 +272,23 @@ mod tests {
         assert_eq!(history.current, 0);
         load_project_history(store.path(), studio.project()).expect("repaired embedded history");
         fs::remove_dir_all(root).expect("remove history test directory");
+    }
+
+    #[test]
+    fn editing_an_older_state_preserves_forward_history() {
+        let mut history = ProjectHistory::new(Project::initial());
+        let mut second = history.snapshots[0].clone();
+        second.version += 1;
+        history.push(second);
+        let forward = history.snapshots[1].to_json();
+
+        history.current = 0;
+        let mut branch = history.snapshots[0].clone();
+        branch.version += 2;
+        history.push(branch);
+
+        assert_eq!(history.snapshots.len(), 3);
+        assert_eq!(history.snapshots[1].to_json(), forward);
+        assert_eq!(history.parent(2), Some(0));
     }
 }

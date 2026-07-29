@@ -11,7 +11,7 @@ use crate::gemini::EDIT_TIMEOUT_SECONDS;
 use crate::http::{Response, valid_user_id};
 use crate::model::json_string;
 
-pub(crate) const MAX_ACTIVE_EDIT_JOBS: usize = 4;
+const MAX_ACTIVE_EDIT_JOBS: usize = 1;
 const MAX_RETAINED_EDIT_JOBS: usize = 64;
 
 pub(crate) struct EditJobs {

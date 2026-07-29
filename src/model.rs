@@ -4,7 +4,7 @@ use std::fmt::{self, Write};
 use serde::Serialize;
 
 const TRACK_LIMIT: usize = 128;
-pub(crate) const EDIT_LOG_LIMIT: usize = 256;
+pub(crate) const EDIT_LOG_LIMIT: usize = 10_000;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
 pub(crate) const PROJECT_SCHEMA_VERSION: u64 = 5;
 pub(crate) const MAX_MIDI_EVENTS_PER_CLIP: usize = 1_024;
@@ -1293,6 +1293,30 @@ impl Studio {
         if !(60..=180).contains(&bpm) {
             return Err(StudioError::InvalidSoundTool);
         }
+        let scale = f32::from(self.project.bpm) / f32::from(bpm);
+        let required_duration = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter().map(|clip| clip.end))
+            .chain(self.project.edits.iter().map(|edit| edit.end))
+            .fold(0.0_f32, f32::max)
+            * scale;
+        if !required_duration.is_finite() || required_duration > 300.0 {
+            return Err(StudioError::InvalidDuration);
+        }
+        self.project.duration = self.project.duration.max(required_duration);
+        for track in &mut self.project.tracks {
+            for clip in &mut track.clips {
+                clip.start *= scale;
+                clip.end *= scale;
+                clip.source_start *= scale;
+            }
+        }
+        for edit in &mut self.project.edits {
+            edit.start *= scale;
+            edit.end *= scale;
+        }
         self.project.bpm = bpm;
         self.project.version += 1;
         Ok(())
@@ -2218,6 +2242,33 @@ mod tests {
         assert_eq!(
             studio.create_effect(track_id, "Distortion", 0.5),
             Err(StudioError::EffectCapacity)
+        );
+    }
+
+    #[test]
+    fn tempo_changes_preserve_arrangement_beat_positions() {
+        let mut studio = Studio::from_project(Project::demo());
+        let original_bpm = studio.project().bpm;
+        let original_duration = studio.project().duration;
+        let original_clip_start = studio.project().tracks[0].clips[0].start;
+        let original_clip_end = studio.project().tracks[0].clips[0].end;
+
+        studio.set_tempo(60).expect("slower tempo");
+
+        let project = studio.project();
+        let clip = &project.tracks[0].clips[0];
+        let scale = f32::from(original_bpm) / f32::from(project.bpm);
+        assert!(project.duration >= original_duration);
+        assert!(project.duration >= clip.end);
+        assert_eq!(clip.start, original_clip_start * scale);
+        assert_eq!(clip.end, original_clip_end * scale);
+        assert_eq!(
+            clip.start * f32::from(project.bpm),
+            original_clip_start * f32::from(original_bpm)
+        );
+        assert_eq!(
+            clip.end * f32::from(project.bpm),
+            original_clip_end * f32::from(original_bpm)
         );
     }
 

@@ -29,11 +29,8 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         return Err(invalid("bpm must be between 60 and 180"));
     }
     let duration = finite_number(root, "duration")?;
-    if duration < 0.25 {
-        return Err(invalid("duration must be at least 0.25 seconds"));
-    }
-    if duration > crate::audio_analysis::MAX_WAV_SECONDS {
-        return Err(invalid("duration exceeds the RIFF/WAV export limit"));
+    if !(1.0..=300.0).contains(&duration) {
+        return Err(invalid("duration must be between 1 second and 5 minutes"));
     }
     let version = integer(root, "version")?;
     let track_values = array(root, "tracks")?;
@@ -120,6 +117,14 @@ fn parse_track(
     let id = unique_id(track, "id", ids, &context)?;
     let name = limited_string(track, "name", 1, 160)?;
     let color = limited_string(track, "color", 1, 32)?;
+    if color.len() != 7
+        || !color.starts_with('#')
+        || !color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(invalid(format!(
+            "{context} color must be a six-digit hexadecimal color"
+        )));
+    }
     let volume = range(track, "volume", 0.0, 1.5)?;
     let muted = boolean(track, "muted")?;
 
@@ -991,6 +996,30 @@ mod tests {
         let original = Project::demo();
         let parsed = parse_project(&original.to_json()).expect("valid demo graph");
         assert_eq!(parsed.to_json(), original.to_json());
+    }
+
+    #[test]
+    fn rejects_unsafe_track_colors_and_out_of_contract_durations() {
+        let mut project: JsonValue =
+            serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+        project["tracks"][0]["color"] = JsonValue::String("red;display:none".to_owned());
+        assert!(
+            parse_project(&project.to_string())
+                .expect_err("unsafe track color")
+                .to_string()
+                .contains("hexadecimal color")
+        );
+
+        project["tracks"][0]["color"] = JsonValue::String("#12abEF".to_owned());
+        project["duration"] = JsonValue::from(0.5);
+        assert!(
+            parse_project(&project.to_string())
+                .expect_err("short project")
+                .to_string()
+                .contains("between 1 second and 5 minutes")
+        );
+        project["duration"] = JsonValue::from(301);
+        assert!(parse_project(&project.to_string()).is_err());
     }
 
     #[test]

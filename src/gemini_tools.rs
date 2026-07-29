@@ -5,7 +5,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 #[cfg(test)]
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -2338,6 +2338,7 @@ pub(crate) fn prepare_instrument_audition(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn render_audio_request(request: AudioRenderRequest) -> Result<AudioRender, String> {
     render_audio_request_cancellable(request, || false)
 }
@@ -3597,7 +3598,13 @@ mod tests {
         .expect("old metadata");
         write_new(
             &running.join(SESSION_FILE),
-            r#"{"id":"running","status":"running","createdAt":1,"updatedAt":1}"#,
+            &format!(
+                r#"{{"id":"running","status":"running","createdAt":1,"updatedAt":{}}}"#,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock after epoch")
+                    .as_millis()
+            ),
         )
         .expect("running metadata");
         for session in [&old, &running] {
@@ -3629,6 +3636,46 @@ mod tests {
         assert!(running.join("loop").symlink_metadata().is_ok());
         assert!(unknown.join("keep.txt").is_file());
         assert!(malformed.join("keep.txt").is_file());
+        fs::remove_dir_all(root).expect("remove retention root");
+    }
+
+    #[test]
+    fn retention_reconciles_abandoned_running_sessions() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-abandoned-session-{}-{}",
+            std::process::id(),
+            SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let abandoned = root.join("abandoned");
+        fs::create_dir_all(&abandoned).expect("abandoned session");
+        write_new(
+            &abandoned.join(SESSION_FILE),
+            r#"{"id":"abandoned","status":"running","createdAt":1,"updatedAt":1}"#,
+        )
+        .expect("abandoned metadata");
+        write_new(&abandoned.join(GRAPH_FILE), "{}").expect("session graph marker");
+        write_new(&abandoned.join(REQUEST_FILE), "{}").expect("session request marker");
+
+        apply_session_retention_with(
+            &root,
+            SessionRetention {
+                maximum_age: Duration::from_secs(60 * 60),
+                maximum_count: 10,
+                maximum_bytes: u64::MAX,
+            },
+        )
+        .expect("retention");
+
+        let metadata: JsonValue = serde_json::from_str(
+            &fs::read_to_string(abandoned.join(SESSION_FILE)).expect("reconciled metadata"),
+        )
+        .expect("metadata JSON");
+        assert_eq!(metadata["status"], "failed");
+        assert!(
+            metadata["detail"]
+                .as_str()
+                .is_some_and(|value| value.contains("abandoned"))
+        );
         fs::remove_dir_all(root).expect("remove retention root");
     }
 
@@ -4101,7 +4148,7 @@ mod tests {
         Project::from_json(&live.project().to_json()).expect("committed graph validates");
         let clips = &live.project().tracks[0].clips;
         assert_eq!((clips[0].start, clips[0].end), (0.0, 8.0));
-        assert_eq!((clips[1].start, clips[1].end), (8.0, 32.0));
+        assert_eq!((clips[1].start, clips[1].end), (8.0, 32.0 * 112.0 / 120.0));
 
         let error = apply_agent_mutation(
             session.path(),
