@@ -12,17 +12,18 @@ use serde_json::{Map, Value as JsonValue};
 use crate::audio_analysis::{self, MAX_REGION_SECONDS};
 #[cfg(test)]
 use crate::gemini_session::{
-    EditSession, PENDING_PROGRESS_DIRECTORY, SESSION_FILE, SESSION_ID, SessionRetention,
+    EditSession, PENDING_PROGRESS_DIRECTORY, SESSION_ID, SessionRetention,
     apply_session_retention_with, session_summaries, write_new,
 };
 use crate::gemini_session::{
-    GRAPH_FILE, MAX_SESSION_JSON_BYTES, MAX_SOUND_GRAPH_BYTES, REQUEST_FILE, UNDO_GRAPH_FILE,
-    publish_progress, wait_for_progress_handoff, write_replace,
+    GRAPH_FILE, MAX_SESSION_JSON_BYTES, MAX_SOUND_GRAPH_BYTES, REQUEST_FILE, SESSION_FILE,
+    UNDO_GRAPH_FILE, UNDO_REQUEST_FILE, publish_progress, wait_for_progress_handoff, write_replace,
 };
 use crate::model::{
     MAX_LOOP_PLAYBACK_BEATS, MAX_MIDI_EVENTS_PER_CLIP, MAX_MIDI_NOTE_DURATION_BEATS,
     MAX_ONCE_PLAYBACK_BEATS, MIN_MIDI_NOTE_BEATS, MidiClipSpec, MidiNote, ModulatorSpec,
-    PROJECT_SCHEMA_VERSION, Project, Studio, StudioError, TRACK_COLOR_PALETTE,
+    PROJECT_SCHEMA_VERSION, Project, Studio, StudioError, TIMELINE_EPSILON_SECONDS,
+    TRACK_COLOR_PALETTE,
 };
 #[cfg(test)]
 use crate::prompt::EditPlan;
@@ -1406,7 +1407,8 @@ pub(crate) fn apply_agent_mutation(
     let (store, mut studio) = ProjectStore::open(graph_path)
         .map_err(|error| format!("Could not load sound-graph.json: {error}"))?;
     let original = studio.project().clone();
-    let (selection_start, selection_end) = edit_selection(session_path)?;
+    let (request_source, mut request, selection_start, selection_end) = edit_request(session_path)?;
+    let mut updated_selection = None;
     let object = arguments
         .as_object()
         .ok_or_else(|| "tool arguments must be an object".to_owned())?;
@@ -1716,7 +1718,27 @@ pub(crate) fn apply_agent_mutation(
             let bpm = required_id(object, "bpm")?
                 .try_into()
                 .map_err(|_| "bpm is out of range".to_owned())?;
+            let scale = f32::from(studio.project().bpm) / f32::from(bpm);
             studio.set_tempo(bpm).map_err(studio_error_message)?;
+            let next_start = selection_start * scale;
+            let next_end = selection_end * scale;
+            if !next_start.is_finite()
+                || !next_end.is_finite()
+                || next_end > 300.0
+                || next_end <= next_start
+            {
+                return Err(
+                    "tempo change would move the selected region outside the 300-second project limit"
+                        .to_owned(),
+                );
+            }
+            if next_end > studio.project().duration {
+                studio
+                    .set_duration(next_end)
+                    .map_err(studio_error_message)?;
+            }
+            set_json_selection(&mut request, next_start, next_end, "edit request")?;
+            updated_selection = Some((next_start, next_end));
             format!("Set tempo to {bpm} BPM")
         }
         "undo" => return undo_agent_mutation(session_path, &store, &original),
@@ -1724,40 +1746,69 @@ pub(crate) fn apply_agent_mutation(
     };
 
     let undo_path = session_path.join(UNDO_GRAPH_FILE);
+    let undo_request_path = session_path.join(UNDO_REQUEST_FILE);
+    let request_path = session_path.join(REQUEST_FILE);
+    let metadata_path = session_path.join(SESSION_FILE);
     let previous_undo = fs::read_to_string(&undo_path).ok();
+    let previous_undo_request = fs::read_to_string(&undo_request_path).ok();
+    let metadata_update = updated_selection
+        .map(|(start, end)| updated_metadata_selection(session_path, start, end))
+        .transpose()?;
     let transaction = (|| {
         write_replace(&undo_path, &original.to_json())
             .map_err(|error| format!("could not save undo snapshot: {error}"))?;
+        write_replace(&undo_request_path, &request_source)
+            .map_err(|error| format!("could not save undo selection: {error}"))?;
         store
             .save(studio.project())
             .map_err(|error| format!("Could not write sound-graph.json: {error}"))?;
+        if updated_selection.is_some() {
+            write_replace(&request_path, &request.to_string())
+                .map_err(|error| format!("could not update edit selection: {error}"))?;
+        }
+        if let Some((_, updated)) = &metadata_update {
+            write_replace(&metadata_path, updated)
+                .map_err(|error| format!("could not update session selection: {error}"))?;
+        }
         publish_progress(session_path, &plan_json(&summary), studio.project())
     })();
     if let Err(error) = transaction {
-        let graph_rollback = store
-            .save(&original)
-            .map_err(|rollback| rollback.to_string());
-        let undo_rollback = match previous_undo {
-            Some(source) => write_replace(&undo_path, source.trim_end())
+        let mut rollbacks = vec![
+            store
+                .save(&original)
                 .map_err(|rollback| rollback.to_string()),
-            None => match fs::remove_file(&undo_path) {
-                Ok(()) => Ok(()),
-                Err(rollback) if rollback.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(rollback) => Err(rollback.to_string()),
-            },
-        };
-        if let Err(rollback) = graph_rollback.and(undo_rollback) {
+            restore_optional_file(&undo_path, previous_undo.as_deref()),
+            restore_optional_file(&undo_request_path, previous_undo_request.as_deref()),
+        ];
+        if updated_selection.is_some() {
+            rollbacks.push(
+                write_replace(&request_path, &request_source)
+                    .map_err(|rollback| rollback.to_string()),
+            );
+        }
+        if let Some((original, _)) = &metadata_update {
+            rollbacks.push(
+                write_replace(&metadata_path, original).map_err(|rollback| rollback.to_string()),
+            );
+        }
+        if let Err(rollback) = combine_rollbacks(rollbacks) {
             return Err(format!(
                 "{error}; could not restore failed mutation: {rollback}"
             ));
         }
         return Err(error);
     }
+    let (response_selection_start, response_selection_end) =
+        updated_selection.unwrap_or((selection_start, selection_end));
     let mut response = serde_json::json!({
         "message": summary,
         "version": studio.project().version,
         "id": result_id,
         "channels": sound_tool_inventory(studio.project()),
+        "selection": {
+            "start": response_selection_start,
+            "end": response_selection_end
+        },
         "timing": {
             "bpm": studio.project().bpm,
             "secondsPerBeat": 60.0 / f64::from(studio.project().bpm)
@@ -1850,7 +1901,7 @@ fn mutation_display(
     None
 }
 
-fn edit_selection(session_path: &Path) -> Result<(f32, f32), String> {
+fn edit_request(session_path: &Path) -> Result<(String, JsonValue, f32, f32), String> {
     let source = read_bounded_text(
         &session_path.join(REQUEST_FILE),
         MAX_SESSION_JSON_BYTES,
@@ -1859,18 +1910,82 @@ fn edit_selection(session_path: &Path) -> Result<(f32, f32), String> {
     .map_err(|error| format!("could not read edit request: {error}"))?;
     let request: JsonValue = serde_json::from_str(&source)
         .map_err(|error| format!("edit request was invalid: {error}"))?;
-    let start = request
+    let (start, end) = json_selection(&request, "edit request")?;
+    Ok((source, request, start, end))
+}
+
+pub(crate) fn edit_selection(session_path: &Path) -> Result<(f32, f32), String> {
+    let (_, _, start, end) = edit_request(session_path)?;
+    Ok((start, end))
+}
+
+fn json_selection(value: &JsonValue, description: &str) -> Result<(f32, f32), String> {
+    let start = value
         .get("start")
         .and_then(JsonValue::as_f64)
-        .ok_or_else(|| "edit request omitted selection start".to_owned())? as f32;
-    let end = request
+        .ok_or_else(|| format!("{description} omitted selection start"))? as f32;
+    let end = value
         .get("end")
         .and_then(JsonValue::as_f64)
-        .ok_or_else(|| "edit request omitted selection end".to_owned())? as f32;
+        .ok_or_else(|| format!("{description} omitted selection end"))? as f32;
     if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
-        return Err("edit request selection is invalid".to_owned());
+        return Err(format!("{description} selection is invalid"));
     }
     Ok((start, end))
+}
+
+fn set_json_selection(
+    value: &mut JsonValue,
+    start: f32,
+    end: f32,
+    description: &str,
+) -> Result<(), String> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| format!("{description} is not an object"))?;
+    object.insert("start".to_owned(), JsonValue::from(start));
+    object.insert("end".to_owned(), JsonValue::from(end));
+    Ok(())
+}
+
+fn updated_metadata_selection(
+    session_path: &Path,
+    start: f32,
+    end: f32,
+) -> Result<(String, String), String> {
+    let source = read_bounded_text(
+        &session_path.join(SESSION_FILE),
+        MAX_SESSION_JSON_BYTES,
+        "Gemini session metadata",
+    )
+    .map_err(|error| format!("could not read session metadata: {error}"))?;
+    let mut metadata: JsonValue = serde_json::from_str(&source)
+        .map_err(|error| format!("session metadata was invalid: {error}"))?;
+    set_json_selection(&mut metadata, start, end, "session metadata")?;
+    Ok((source, metadata.to_string()))
+}
+
+fn restore_optional_file(path: &Path, source: Option<&str>) -> Result<(), String> {
+    match source {
+        Some(source) => write_replace(path, source).map_err(|error| error.to_string()),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        },
+    }
+}
+
+fn combine_rollbacks(rollbacks: Vec<Result<(), String>>) -> Result<(), String> {
+    let errors = rollbacks
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 fn validate_clip_selection(
@@ -1878,7 +1993,9 @@ fn validate_clip_selection(
     selection_start: f32,
     selection_end: f32,
 ) -> Result<(), String> {
-    if spec.start < selection_start || spec.end > selection_end {
+    if spec.start + TIMELINE_EPSILON_SECONDS < selection_start
+        || spec.end > selection_end + TIMELINE_EPSILON_SECONDS
+    {
         return Err(format!(
             "MIDI clip must stay within the selected region ({selection_start}-{selection_end}s)"
         ));
@@ -2175,6 +2292,9 @@ fn undo_agent_mutation(
     current: &Project,
 ) -> Result<String, String> {
     let undo_path = session_path.join(UNDO_GRAPH_FILE);
+    let undo_request_path = session_path.join(UNDO_REQUEST_FILE);
+    let request_path = session_path.join(REQUEST_FILE);
+    let metadata_path = session_path.join(SESSION_FILE);
     let source = read_bounded_text(&undo_path, MAX_SOUND_GRAPH_BYTES, "Gemini undo snapshot")
         .map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -2186,23 +2306,60 @@ fn undo_agent_mutation(
     let mut restored = Project::from_json(&source)
         .map_err(|error| format!("undo snapshot is invalid: {error}"))?;
     restored.version = current.version.saturating_add(1);
+    let current_request =
+        read_bounded_text(&request_path, MAX_SESSION_JSON_BYTES, "Gemini edit request")
+            .map_err(|error| format!("could not read edit request: {error}"))?;
+    let undo_request = match read_bounded_text(
+        &undo_request_path,
+        MAX_SESSION_JSON_BYTES,
+        "Gemini undo request",
+    ) {
+        Ok(source) => Some(source),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("could not read undo selection: {error}")),
+    };
+    let restored_request = undo_request.as_deref().unwrap_or(&current_request);
+    let restored_request_value: JsonValue = serde_json::from_str(restored_request)
+        .map_err(|error| format!("undo selection is invalid: {error}"))?;
+    let (restored_start, restored_end) = json_selection(&restored_request_value, "undo selection")?;
+    let metadata_update = updated_metadata_selection(session_path, restored_start, restored_end)?;
     let summary = "Undid the previous graph mutation";
     let transaction = (|| {
         store
             .save(&restored)
             .map_err(|error| format!("could not restore undo snapshot: {error}"))?;
+        write_replace(&request_path, restored_request)
+            .map_err(|error| format!("could not restore edit selection: {error}"))?;
+        write_replace(&metadata_path, &metadata_update.1)
+            .map_err(|error| format!("could not restore session selection: {error}"))?;
         fs::remove_file(&undo_path)
             .map_err(|error| format!("could not consume undo snapshot: {error}"))?;
+        if undo_request.is_some() {
+            fs::remove_file(&undo_request_path)
+                .map_err(|error| format!("could not consume undo selection: {error}"))?;
+        }
         publish_progress(session_path, &plan_json(summary), &restored)
     })();
     if let Err(error) = transaction {
-        let graph_rollback = store.save(current).map_err(|rollback| rollback.to_string());
-        let undo_rollback = if undo_path.exists() {
-            Ok(())
-        } else {
-            write_replace(&undo_path, source.trim_end()).map_err(|rollback| rollback.to_string())
-        };
-        if let Err(rollback) = graph_rollback.and(undo_rollback) {
+        let mut rollbacks = vec![
+            store.save(current).map_err(|rollback| rollback.to_string()),
+            write_replace(&request_path, &current_request).map_err(|rollback| rollback.to_string()),
+            write_replace(&metadata_path, &metadata_update.0)
+                .map_err(|rollback| rollback.to_string()),
+        ];
+        if !undo_path.exists() {
+            rollbacks
+                .push(write_replace(&undo_path, &source).map_err(|rollback| rollback.to_string()));
+        }
+        if let Some(undo_request) = &undo_request {
+            if !undo_request_path.exists() {
+                rollbacks.push(
+                    write_replace(&undo_request_path, undo_request)
+                        .map_err(|rollback| rollback.to_string()),
+                );
+            }
+        }
+        if let Err(rollback) = combine_rollbacks(rollbacks) {
             return Err(format!(
                 "{error}; could not restore failed undo: {rollback}"
             ));
@@ -4068,6 +4225,10 @@ mod tests {
     fn failed_progress_publication_rolls_back_graph_and_undo_snapshot() {
         let original = Project::demo();
         let session = EditSession::create(&original, "change tempo", 0.0, 4.0).expect("session");
+        let request_before =
+            fs::read_to_string(session.path().join(REQUEST_FILE)).expect("request before failure");
+        let metadata_before =
+            fs::read_to_string(session.path().join(SESSION_FILE)).expect("metadata before failure");
         let mut prior_undo = Studio::from_project(original.clone());
         prior_undo.set_tempo(90).expect("prior undo state");
         write_replace(
@@ -4092,6 +4253,15 @@ mod tests {
             fs::read_to_string(session.path().join(UNDO_GRAPH_FILE)).expect("restored undo"),
             undo_before
         );
+        assert_eq!(
+            fs::read_to_string(session.path().join(REQUEST_FILE)).expect("restored request"),
+            request_before
+        );
+        assert_eq!(
+            fs::read_to_string(session.path().join(SESSION_FILE)).expect("restored metadata"),
+            metadata_before
+        );
+        assert!(!session.path().join(UNDO_REQUEST_FILE).exists());
 
         fs::create_dir(session.path().join(PENDING_PROGRESS_DIRECTORY))
             .expect("blocked undo handoff");
@@ -4109,15 +4279,61 @@ mod tests {
     }
 
     #[test]
+    fn tempo_mutations_move_the_active_selection_and_undo_it_atomically() {
+        let mut original = Project::initial();
+        original.bpm = 120;
+        original.duration = 64.0;
+        let track_id = original.tracks[0].id;
+        let session =
+            EditSession::create(&original, "move selected material", 8.0, 16.0).expect("session");
+
+        apply_agent_mutation(session.path(), "set_tempo", &serde_json::json!({"bpm":60}))
+            .expect("slower tempo");
+        let (_, slower) = session.take_update().unwrap().expect("tempo update");
+        assert_eq!(slower.bpm, 60);
+        assert_eq!(edit_selection(session.path()).unwrap(), (16.0, 32.0));
+        let metadata: JsonValue =
+            serde_json::from_str(&fs::read_to_string(session.path().join(SESSION_FILE)).unwrap())
+                .expect("session metadata");
+        assert_eq!(metadata["start"], 16.0);
+        assert_eq!(metadata["end"], 32.0);
+
+        apply_agent_mutation(session.path(), "undo", &serde_json::json!({})).expect("undo tempo");
+        session.take_update().unwrap().expect("undo update");
+        assert_eq!(edit_selection(session.path()).unwrap(), (8.0, 16.0));
+
+        apply_agent_mutation(session.path(), "set_tempo", &serde_json::json!({"bpm":60}))
+            .expect("slower tempo again");
+        session.take_update().unwrap().expect("second tempo update");
+        apply_agent_mutation(
+            session.path(),
+            "add_midi_clip",
+            &serde_json::json!({
+                "trackId":track_id,
+                "label":"Moved phrase",
+                "startBeat":16,
+                "durationBeats":16,
+                "playback":{"mode":"once"},
+                "events":[{"time":0,"duration":1,"pitch":60,"velocity":0.8}]
+            }),
+        )
+        .expect("MIDI mutation in rescaled selection");
+        let (_, project) = session.take_update().unwrap().expect("MIDI update");
+        let clip = project.tracks[0].clips.last().expect("new clip");
+        assert_eq!((clip.start, clip.end), (16.0, 32.0));
+    }
+
+    #[test]
     fn committed_graph_metadata_is_synchronized_before_the_next_mutation() {
         let session =
             EditSession::create(&Project::demo(), "two edits", 0.0, 8.0).expect("edit session");
         apply_agent_mutation(session.path(), "set_tempo", &serde_json::json!({"bpm":120}))
             .expect("first mutation");
         let (plan, submitted) = session.take_update().unwrap().expect("first update");
+        let selection_end = 8.0 * 112.0 / 120.0;
 
         let mut live = Studio::from_project(Project::demo());
-        live.replace_graph(submitted, 0.0, 8.0, "two edits", plan)
+        live.replace_graph(submitted, 0.0, selection_end, "two edits", plan)
             .expect("server commit metadata");
         session
             .synchronize_project(live.project())
@@ -4128,7 +4344,8 @@ mod tests {
             "update_midi_clip",
             &serde_json::json!({
                 "trackId":1,"clipId":11,"label":"Updated drums","startBeat":0,
-                "durationBeats":16,"playback":{"mode":"loop","lengthBeats":4},"events":[
+                "durationBeats":16.0 * 112.0 / 120.0,
+                "playback":{"mode":"loop","lengthBeats":4},"events":[
                     {"time":0,"duration":0.25,"pitch":36,"velocity":0.9}
                 ]
             }),
@@ -4138,7 +4355,7 @@ mod tests {
         live.replace_graph(
             submitted,
             0.0,
-            8.0,
+            selection_end,
             "two edits",
             EditPlan {
                 summary: "Updated drums".to_owned(),
@@ -4147,8 +4364,10 @@ mod tests {
         .expect("second server commit has no ID collision");
         Project::from_json(&live.project().to_json()).expect("committed graph validates");
         let clips = &live.project().tracks[0].clips;
-        assert_eq!((clips[0].start, clips[0].end), (0.0, 8.0));
-        assert_eq!((clips[1].start, clips[1].end), (8.0, 32.0 * 112.0 / 120.0));
+        assert_eq!(clips[0].start, 0.0);
+        assert!((clips[0].end - selection_end).abs() < 0.000_01);
+        assert!((clips[1].start - 8.0 * 112.0 / 120.0).abs() < 0.000_01);
+        assert!((clips[1].end - 32.0 * 112.0 / 120.0).abs() < 0.000_01);
 
         let error = apply_agent_mutation(
             session.path(),
@@ -4168,7 +4387,12 @@ mod tests {
         )
         .expect("selection-scoped MIDI deletion");
         let (_, deleted) = session.take_update().unwrap().expect("delete update");
-        assert!(deleted.tracks[0].clips.iter().all(|clip| clip.start >= 8.0));
+        assert!(
+            deleted.tracks[0]
+                .clips
+                .iter()
+                .all(|clip| clip.start + TIMELINE_EPSILON_SECONDS >= selection_end)
+        );
     }
 
     #[test]

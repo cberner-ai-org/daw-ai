@@ -12,6 +12,7 @@ pub(crate) const MIN_MIDI_NOTE_BEATS: f32 = 0.0625;
 pub(crate) const MAX_LOOP_PLAYBACK_BEATS: f32 = 16.0;
 pub(crate) const MAX_ONCE_PLAYBACK_BEATS: f32 = 256.0;
 pub(crate) const MAX_MIDI_NOTE_DURATION_BEATS: f32 = 16.0;
+pub(crate) const TIMELINE_EPSILON_SECONDS: f32 = 0.000_01;
 pub(crate) const SURGE_ENGINE: &str = "Surge XT";
 pub(crate) const SURGE_PRESETS: &[&str] = &["Init"];
 pub(crate) const TRACK_COLOR_PALETTE: &[&str] = &[
@@ -719,6 +720,25 @@ impl Default for Studio {
     }
 }
 
+fn validate_edit_for_duration(
+    duration: f32,
+    start: f32,
+    end: f32,
+    prompt: &str,
+) -> Result<(), StudioError> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err(StudioError::EmptyPrompt);
+    }
+    if prompt.chars().count() > MAX_PROMPT_CHARACTERS {
+        return Err(StudioError::InvalidPrompt);
+    }
+    if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start || end > duration {
+        return Err(StudioError::InvalidSelection);
+    }
+    Ok(())
+}
+
 impl Studio {
     #[must_use]
     pub fn new() -> Self {
@@ -759,22 +779,7 @@ impl Studio {
     }
 
     pub fn validate_edit(&self, start: f32, end: f32, prompt: &str) -> Result<(), StudioError> {
-        let prompt = prompt.trim();
-        if prompt.is_empty() {
-            return Err(StudioError::EmptyPrompt);
-        }
-        if prompt.chars().count() > MAX_PROMPT_CHARACTERS {
-            return Err(StudioError::InvalidPrompt);
-        }
-        if !start.is_finite()
-            || !end.is_finite()
-            || start < 0.0
-            || end <= start
-            || end > self.project.duration
-        {
-            return Err(StudioError::InvalidSelection);
-        }
-        Ok(())
+        validate_edit_for_duration(self.project.duration, start, end, prompt)
     }
 
     pub fn set_duration(&mut self, duration: f32) -> Result<(), StudioError> {
@@ -807,8 +812,15 @@ impl Studio {
         prompt: &str,
         plan: crate::prompt::EditPlan,
     ) -> Result<String, StudioError> {
-        self.validate_edit(start, end, prompt)?;
+        validate_edit_for_duration(project.duration, start, end, prompt)?;
+        let marker_scale = f32::from(self.project.bpm) / f32::from(project.bpm);
         project.edits = self.project.edits.clone();
+        if marker_scale != 1.0 {
+            for edit in &mut project.edits {
+                edit.start *= marker_scale;
+                edit.end *= marker_scale;
+            }
+        }
         project.edit_operations = self.project.edit_operations.clone();
         project.version = self.project.version;
         let next_id = project
@@ -1044,16 +1056,18 @@ impl Studio {
             .position(|clip| clip.id == clip_id)
             .ok_or(StudioError::UnknownSoundTool)?;
         let original = project.tracks[track_index].clips.remove(clip_index);
-        if original.end <= selection_start || original.start >= selection_end {
+        if original.end <= selection_start + TIMELINE_EPSILON_SECONDS
+            || original.start >= selection_end - TIMELINE_EPSILON_SECONDS
+        {
             return Err(StudioError::InvalidSoundTool);
         }
         let mut retained = Vec::with_capacity(2);
-        if original.start < selection_start {
+        if original.start + TIMELINE_EPSILON_SECONDS < selection_start {
             let mut left = original.clone();
             left.end = selection_start;
             retained.push(left);
         }
-        if original.end > selection_end {
+        if original.end > selection_end + TIMELINE_EPSILON_SECONDS {
             let mut right = original;
             if !retained.is_empty() {
                 right.id = self.take_id();
@@ -1141,8 +1155,8 @@ impl Studio {
             &spec.notes,
             self.project.duration,
         )?;
-        if spec.start < selection_start
-            || spec.end > selection_end
+        if spec.start + TIMELINE_EPSILON_SECONDS < selection_start
+            || spec.end > selection_end + TIMELINE_EPSILON_SECONDS
             || selection_end <= selection_start
         {
             return Err(StudioError::InvalidSoundTool);
@@ -1159,10 +1173,14 @@ impl Studio {
             .position(|clip| clip.id == clip_id)
             .ok_or(StudioError::UnknownSoundTool)?;
         let original = project.tracks[track_index].clips.remove(clip_index);
-        if original.end <= selection_start || original.start >= selection_end {
+        if original.end <= selection_start + TIMELINE_EPSILON_SECONDS
+            || original.start >= selection_end - TIMELINE_EPSILON_SECONDS
+        {
             return Err(StudioError::InvalidSoundTool);
         }
-        if original.end <= spec.start || original.start >= spec.end {
+        if original.end <= spec.start + TIMELINE_EPSILON_SECONDS
+            || original.start >= spec.end - TIMELINE_EPSILON_SECONDS
+        {
             return Err(StudioError::InvalidSoundTool);
         }
         let events = spec
@@ -1178,7 +1196,7 @@ impl Studio {
             })
             .collect();
         let mut replacements = Vec::with_capacity(3);
-        if original.start < spec.start {
+        if original.start + TIMELINE_EPSILON_SECONDS < spec.start {
             let mut left = original.clone();
             left.id = self.take_id();
             left.end = spec.start;
@@ -1195,7 +1213,7 @@ impl Studio {
             loop_beats: spec.loop_beats,
             events,
         });
-        if original.end > spec.end {
+        if original.end > spec.end + TIMELINE_EPSILON_SECONDS {
             let mut right = original;
             right.id = self.take_id();
             right.start = spec.end;
@@ -2269,6 +2287,52 @@ mod tests {
         assert_eq!(
             clip.end * f32::from(project.bpm),
             original_clip_end * f32::from(original_bpm)
+        );
+    }
+
+    #[test]
+    fn replacing_a_tempo_changed_graph_keeps_all_edit_markers_on_the_new_timeline() {
+        let mut project = Project::initial();
+        project.bpm = 120;
+        project.duration = 64.0;
+        project.edits.push(Edit {
+            id: 100,
+            start: 40.0,
+            end: 64.0,
+            prompt: "earlier edit".to_owned(),
+            summary: "Earlier edit".to_owned(),
+        });
+        let mut studio = Studio::from_project(project);
+        let mut incoming = studio.clone();
+        incoming.set_tempo(60).expect("slower graph");
+
+        studio
+            .replace_graph(
+                incoming.project().clone(),
+                80.0,
+                128.0,
+                "tempo edit",
+                crate::prompt::EditPlan {
+                    summary: "Slowed the arrangement".to_owned(),
+                },
+            )
+            .expect("replace tempo graph");
+
+        assert_eq!(studio.project().duration, 128.0);
+        assert_eq!(studio.project().edits.len(), 2);
+        assert_eq!(
+            (
+                studio.project().edits[0].start,
+                studio.project().edits[0].end
+            ),
+            (80.0, 128.0)
+        );
+        assert_eq!(
+            (
+                studio.project().edits[1].start,
+                studio.project().edits[1].end
+            ),
+            (80.0, 128.0)
         );
     }
 
