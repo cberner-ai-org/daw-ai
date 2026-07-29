@@ -1,18 +1,21 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::hash::{BuildHasher, Hash, Hasher};
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use crate::gemini::EDIT_TIMEOUT_SECONDS;
-use crate::http::{Response, valid_user_id};
+use crate::http::Response;
 use crate::model::json_string;
 
 const MAX_ACTIVE_EDIT_JOBS: usize = 1;
 const MAX_RETAINED_EDIT_JOBS: usize = 64;
+
+#[derive(Debug)]
+pub(crate) enum EditJobCreateError {
+    Capacity,
+    Entropy(getrandom::Error),
+}
 
 pub(crate) struct EditJobs {
     next_id: AtomicU64,
@@ -64,7 +67,7 @@ impl EditJobs {
         &self,
         poll_after_ms: u64,
         requested_operation_id: Option<&str>,
-    ) -> Result<(u64, String, bool), ()> {
+    ) -> Result<(u64, String, bool), EditJobCreateError> {
         let mut jobs = self.lock();
         if let Some(operation_id) = requested_operation_id {
             if let Some((id, job)) = jobs
@@ -76,7 +79,7 @@ impl EditJobs {
         }
         let active_jobs = jobs.values().filter(|job| job.worker_active).count();
         if active_jobs >= MAX_ACTIVE_EDIT_JOBS {
-            return Err(());
+            return Err(EditJobCreateError::Capacity);
         }
         while jobs.len() >= MAX_RETAINED_EDIT_JOBS {
             let Some(id) = jobs.iter().find_map(|(id, job)| {
@@ -86,14 +89,15 @@ impl EditJobs {
                 )
                 .then_some(*id)
             }) else {
-                return Err(());
+                return Err(EditJobCreateError::Capacity);
             };
             jobs.remove(&id);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let operation_id = requested_operation_id
-            .map(str::to_owned)
-            .unwrap_or_else(|| new_operation_id(id));
+        let operation_id = requested_operation_id.map(str::to_owned).map_or_else(
+            || new_operation_id().map_err(EditJobCreateError::Entropy),
+            Ok,
+        )?;
         jobs.insert(
             id,
             EditJob {
@@ -233,46 +237,14 @@ impl EditJobs {
     }
 }
 
-pub(crate) fn new_operation_id(id: u64) -> String {
+pub(crate) fn new_operation_id() -> Result<String, getrandom::Error> {
     let mut random = [0_u8; 16];
-    if File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut random))
-        .is_ok()
-    {
-        let mut token = String::with_capacity(32);
-        for byte in random {
-            write!(token, "{byte:02x}").expect("writing to a string cannot fail");
-        }
-        return token;
+    getrandom::fill(&mut random)?;
+    let mut token = String::with_capacity(32);
+    for byte in random {
+        write!(token, "{byte:02x}").expect("writing to a string cannot fail");
     }
-    if let Ok(uuid) = fs::read_to_string("/proc/sys/kernel/random/uuid") {
-        let token = uuid
-            .bytes()
-            .filter(|byte| byte.is_ascii_hexdigit())
-            .map(char::from)
-            .collect::<String>();
-        if valid_user_id(&token) {
-            return token;
-        }
-    }
-    fallback_operation_id(id)
-}
-
-pub(crate) fn fallback_operation_id(id: u64) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let hash = |domain: u8| {
-        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-        domain.hash(&mut hasher);
-        nanos.hash(&mut hasher);
-        std::process::id().hash(&mut hasher);
-        std::thread::current().id().hash(&mut hasher);
-        id.hash(&mut hasher);
-        hasher.finish()
-    };
-    format!("{:016x}{:016x}", hash(0), hash(1))
+    Ok(token)
 }
 
 pub(crate) fn accepted_edit_job_json(id: u64, operation_id: &str, poll_after_ms: u64) -> String {

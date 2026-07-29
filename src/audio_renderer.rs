@@ -97,7 +97,7 @@ impl AudioRenderer {
     fn acquire(
         &self,
         priority: AudioRenderPriority,
-        is_cancelled: &impl Fn() -> bool,
+        is_cancelled: &(impl Fn() -> bool + ?Sized),
     ) -> Result<AudioRenderPermit<'_>, AudioRenderError> {
         if is_cancelled() {
             return Err(AudioRenderError::Cancelled);
@@ -148,7 +148,7 @@ impl AudioRenderer {
         project: &Project,
         start_sample: usize,
         end_sample: usize,
-        is_cancelled: &impl Fn() -> bool,
+        is_cancelled: &(impl Fn() -> bool + ?Sized),
     ) -> Result<audio_analysis::AudioRegion, AudioRenderError> {
         self.stream_region_with(
             project,
@@ -165,7 +165,7 @@ impl AudioRenderer {
         project: &Project,
         start_sample: usize,
         end_sample: usize,
-        is_cancelled: &impl Fn() -> bool,
+        is_cancelled: &(impl Fn() -> bool + ?Sized),
     ) -> Result<Vec<(u64, audio_analysis::AudioRegion)>, AudioRenderError> {
         self.stream_region_with(
             project,
@@ -182,7 +182,7 @@ impl AudioRenderer {
         project: &Project,
         start_sample: usize,
         end_sample: usize,
-        is_cancelled: &impl Fn() -> bool,
+        is_cancelled: &(impl Fn() -> bool + ?Sized),
         priority: AudioRenderPriority,
         render: impl FnOnce(&Project, usize, usize) -> Result<T, String>,
     ) -> Result<T, AudioRenderError> {
@@ -194,7 +194,7 @@ impl AudioRenderer {
     pub(crate) fn render_with<T>(
         &self,
         priority: AudioRenderPriority,
-        is_cancelled: &impl Fn() -> bool,
+        is_cancelled: &(impl Fn() -> bool + ?Sized),
         render: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, AudioRenderError> {
         let _permit = self.acquire(priority, is_cancelled)?;

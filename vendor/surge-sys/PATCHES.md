@@ -3,6 +3,9 @@
 This is `surge-sys` from the official `surge-synthesizer/surge-rs` repository at
 commit `7bfeafc76d1c57860a177e9e076bed7ec764009a`.
 
+DAW-AI uses the patched `git2` 0.21 build dependency with only HTTPS transport
+enabled.
+
 DAW-AI exports every CMake `-D` definition to the bridge compilation. Upstream
 only exported definitions beginning with `SURGE`, so the bridge and engine saw
 different feature macros and compiled incompatible C++ class layouts.

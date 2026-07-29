@@ -9,7 +9,6 @@ The project is a small Rust server with a responsive browser client. Surge XT re
 Prerequisites:
 
 - Rust 1.85 or newer
-- `curl`
 - A [Gemini API key](https://ai.google.dev/gemini-api/docs/api-key)
 - `just` (optional, but recommended)
 
@@ -84,4 +83,4 @@ The server binds only to `127.0.0.1`, requires no web authentication, and embeds
 
 ### Dependency policy
 
-Third-party packages are reserved for complex, standards-sensitive boundaries or charter-mandated sound engines. `serde_json` handles JSON parsing and string escaping for Gemini and persisted project data. DAW-AI's own source code is MIT-licensed. The official alpha `surge-rs` binding builds and statically links the complete Surge XT engine; because Surge XT and its binding are GPL-3.0-or-later, distributions of the combined binary must comply with GPL-3.0-or-later. Domain-specific sound-graph validation and serialization remain in the project, while the narrow HTTP server, form decoder, temporary-file handling, CLI parser, browser harness, and `curl`-backed outbound HTTPS boundary continue to use platform tools and APIs.
+Third-party packages are reserved for complex, standards-sensitive boundaries or charter-mandated sound engines. Axum, Hyper, and Tokio provide HTTP parsing, connection management, and streaming primitives; the server applies admission, timeout, and shutdown policy. Libcurl owns cancellable HTTPS, while focused crates provide FFT, URL, JSON, and operating-system randomness primitives. DAW-AI's own source code is MIT-licensed. The official alpha `surge-rs` binding builds and statically links the complete Surge XT engine; because Surge XT and its binding are GPL-3.0-or-later, distributions of the combined binary must comply with GPL-3.0-or-later. Domain-specific sound-graph validation and serialization, durable project-file replacement, WAV rendering, the CLI, and the browser harness remain in the project.

@@ -1749,8 +1749,10 @@ pub(crate) fn apply_agent_mutation(
     let undo_request_path = session_path.join(UNDO_REQUEST_FILE);
     let request_path = session_path.join(REQUEST_FILE);
     let metadata_path = session_path.join(SESSION_FILE);
-    let previous_undo = fs::read_to_string(&undo_path).ok();
-    let previous_undo_request = fs::read_to_string(&undo_request_path).ok();
+    let previous_undo =
+        read_bounded_text(&undo_path, MAX_SOUND_GRAPH_BYTES, "undo sound graph").ok();
+    let previous_undo_request =
+        read_bounded_text(&undo_request_path, MAX_SESSION_JSON_BYTES, "undo request").ok();
     let metadata_update = updated_selection
         .map(|(start, end)| updated_metadata_selection(session_path, start, end))
         .transpose()?;
@@ -2751,7 +2753,7 @@ fn selected_channel_labels(project: &Project, track_ids: &[u64]) -> String {
         .join(", ")
 }
 
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64_audio(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -2772,10 +2774,6 @@ fn base64(bytes: &[u8]) -> String {
         });
     }
     output
-}
-
-pub(crate) fn base64_audio(bytes: &[u8]) -> String {
-    base64(bytes)
 }
 
 fn sound_tool_inventory(project: &Project) -> Vec<JsonValue> {
@@ -2831,6 +2829,14 @@ fn studio_error_message(error: StudioError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_base64_uses_standard_padding() {
+        assert_eq!(base64_audio(b""), "");
+        assert_eq!(base64_audio(b"f"), "Zg==");
+        assert_eq!(base64_audio(b"fo"), "Zm8=");
+        assert_eq!(base64_audio(b"foo"), "Zm9v");
+    }
 
     fn project_with_effect(name: &str) -> Project {
         let mut project = Project::demo();

@@ -1,5 +1,3 @@
-use std::f32::consts::PI;
-
 use crate::model::{Clip, ClipEvent, Project, Track};
 
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
@@ -693,59 +691,15 @@ fn frame_count(sample_count: usize) -> usize {
 }
 
 fn frame_power(samples: &[f32], offset: usize) -> Vec<f32> {
-    let mut real = vec![0.0; FFT_SIZE];
-    let mut imaginary = vec![0.0; FFT_SIZE];
-    for (index, value) in real.iter_mut().enumerate() {
-        let window = 0.5 - 0.5 * (2.0 * PI * index as f32 / (FFT_SIZE - 1) as f32).cos();
-        *value = samples.get(offset + index).copied().unwrap_or(0.0) * window;
-    }
-    fft(&mut real, &mut imaginary);
-    real.into_iter()
-        .zip(imaginary)
-        .take(FFT_SIZE / 2 + 1)
-        .map(|(real, imaginary)| (real * real + imaginary * imaginary) / FFT_SIZE as f32)
-        .collect()
-}
-
-fn fft(real: &mut [f32], imaginary: &mut [f32]) {
-    let length = real.len();
-    let mut reversed = 0;
-    for index in 1..length {
-        let mut bit = length >> 1;
-        while reversed & bit != 0 {
-            reversed ^= bit;
-            bit >>= 1;
-        }
-        reversed ^= bit;
-        if index < reversed {
-            real.swap(index, reversed);
-            imaginary.swap(index, reversed);
-        }
-    }
-    let mut size = 2;
-    while size <= length {
-        let angle = -2.0 * PI / size as f32;
-        for start in (0..length).step_by(size) {
-            for offset in 0..size / 2 {
-                let phase = angle * offset as f32;
-                let cosine = phase.cos();
-                let sine = phase.sin();
-                let even = start + offset;
-                let odd = even + size / 2;
-                let odd_real = real[odd] * cosine - imaginary[odd] * sine;
-                let odd_imaginary = real[odd] * sine + imaginary[odd] * cosine;
-                real[odd] = real[even] - odd_real;
-                imaginary[odd] = imaginary[even] - odd_imaginary;
-                real[even] += odd_real;
-                imaginary[even] += odd_imaginary;
-            }
-        }
-        size *= 2;
-    }
+    crate::spectrum::power_512(
+        (0..FFT_SIZE).map(|index| samples.get(offset + index).copied().unwrap_or(0.0)),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::f32::consts::PI;
+
     use super::*;
 
     fn render_region(
