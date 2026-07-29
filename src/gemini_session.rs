@@ -428,6 +428,8 @@ pub(crate) fn session_summaries() -> io::Result<Vec<JsonValue>> {
 }
 
 pub(crate) fn session_summaries_in(root: &Path) -> io::Result<Vec<JsonValue>> {
+    // Visible session state must always reflect lease reconciliation and retention.
+    apply_session_retention(root)?;
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -654,6 +656,40 @@ pub(crate) fn write_replace(path: &Path, source: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_reconciles_an_abandoned_running_session() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-listed-abandoned-session-{}-{}",
+            std::process::id(),
+            SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let abandoned = root.join("abandoned");
+        fs::create_dir_all(&abandoned).expect("abandoned session");
+        write_new(
+            &abandoned.join(SESSION_FILE),
+            r#"{"id":"abandoned","status":"running","createdAt":1,"updatedAt":1}"#,
+        )
+        .expect("abandoned metadata");
+        write_new(&abandoned.join(GRAPH_FILE), "{}").expect("session graph marker");
+        write_new(&abandoned.join(REQUEST_FILE), "{}").expect("session request marker");
+
+        let sessions = session_summaries_in(&root).expect("reconciled session summaries");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["status"], "failed");
+        assert!(
+            sessions[0]["detail"]
+                .as_str()
+                .is_some_and(|value| value.contains("abandoned"))
+        );
+        let saved: JsonValue = serde_json::from_str(
+            &fs::read_to_string(abandoned.join(SESSION_FILE)).expect("saved session metadata"),
+        )
+        .expect("saved session JSON");
+        assert_eq!(saved["status"], "failed");
+        fs::remove_dir_all(root).expect("remove session test directory");
+    }
 
     #[test]
     fn configured_session_roots_are_namespaced_per_user() {
