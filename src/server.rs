@@ -48,6 +48,14 @@ const SPECTRUM_RENDER_CHUNK_SAMPLES: usize = SPECTRUM_FRAME_SAMPLES * 60;
 const GEMINI_POLL_INTERVAL_MS: u64 = 1_000;
 #[cfg(debug_assertions)]
 const TEST_AI_POLL_INTERVAL_MS: u64 = 25;
+
+#[derive(Clone, Copy)]
+enum PlaybackPacing {
+    RealTime,
+    #[cfg(test)]
+    Unpaced,
+}
+
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
@@ -143,6 +151,7 @@ fn serve_connection(stream: &mut TcpStream, router: &Router) -> io::Result<()> {
                     stream,
                     || stream_disconnected(&cancellation_stream),
                     new_user_cookie.as_deref(),
+                    PlaybackPacing::RealTime,
                 );
             }
             if request.path.starts_with("/api/track-spectrum/") {
@@ -1013,6 +1022,7 @@ impl Router {
         #[cfg(debug_assertions)]
         let ai = match std::env::var("DAW_AI_TEST_AI") {
             Ok(value) if value == "deterministic" => Ai::Deterministic(Duration::from_secs(2)),
+            Ok(value) if value == "deterministic-fast" => Ai::Deterministic(Duration::ZERO),
             _ => Ai::Gemini,
         };
         #[cfg(not(debug_assertions))]
@@ -1345,7 +1355,13 @@ impl Router {
 
     #[cfg(test)]
     fn write_playback_stream(&self, request: &Request, output: &mut impl Write) -> io::Result<()> {
-        self.write_playback_stream_with_cancel(request, output, || false, None)
+        self.write_playback_stream_with_cancel(
+            request,
+            output,
+            || false,
+            None,
+            PlaybackPacing::Unpaced,
+        )
     }
 
     fn write_playback_stream_with_cancel(
@@ -1354,6 +1370,7 @@ impl Router {
         output: &mut impl Write,
         is_cancelled: impl Fn() -> bool,
         set_cookie: Option<&str>,
+        pacing: PlaybackPacing,
     ) -> io::Result<()> {
         let Some(public_host) = request.public_host() else {
             return Response::json(400, error_json("invalid host")).write(output);
@@ -1450,13 +1467,15 @@ impl Router {
         while remaining > 0 {
             let next_region_samples = remaining.min(PLAYBACK_CHUNK_SAMPLES);
             let generated_samples = cursor - stream_start_sample + next_region_samples;
-            if !wait_for_playback_window(
-                generated_samples,
-                AUDIO_STREAM_LOOKAHEAD_SAMPLES,
-                audio_analysis::SAMPLE_RATE,
-                stream_started,
-                &is_cancelled,
-            ) {
+            if matches!(pacing, PlaybackPacing::RealTime)
+                && !wait_for_playback_window(
+                    generated_samples,
+                    AUDIO_STREAM_LOOKAHEAD_SAMPLES,
+                    audio_analysis::SAMPLE_RATE,
+                    stream_started,
+                    &is_cancelled,
+                )
+            {
                 eprintln!(
                     "audio_stream id={stream_id} outcome=cancelled version={version} bytes_written={bytes_written}"
                 );
@@ -2974,8 +2993,9 @@ mod tests {
     fn streams_one_continuous_wav_through_the_reusable_media_endpoint() {
         let router = Router::demo();
         let mut project = router.lock_studio().project().clone();
-        project.duration = 32.123_13;
+        project.duration = audio_analysis::MAX_REGION_SECONDS + 0.125;
         project.bpm = 113;
+        project.tracks.truncate(1);
         *router.lock_studio() = Studio::from_project(project);
         let access = router.handle(&audio_request("/api/audio-access"));
         assert_eq!(access.status, 200);
@@ -3032,6 +3052,7 @@ mod tests {
                 &mut cookie_stream,
                 || false,
                 Some("daw_ai_user=0123456789abcdef0123456789abcdef; Path=/"),
+                PlaybackPacing::RealTime,
             )
             .expect("cookie-bearing WAV stream");
         let cookie_head_end = find_bytes(&cookie_stream, b"\r\n\r\n").expect("cookie head") + 4;
