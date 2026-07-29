@@ -69,24 +69,25 @@ that the model uses.
 
 #### Modulator / Automation
 Generates time-varying control values—such as envelopes, LFOs, or arbitrary curves—which can control any Instrument or Effect parameter.
-My also be tempo sync'ed, or configured to trigger off a MIDI note event
+May also be tempo sync'ed, or configured to trigger off a MIDI note event
 
 
 #### Routing
 
-The MIDI clips uses key zones, where each event is tagged with the instrument that it goes to.
+MIDI clips uses key zones, where each event is tagged with the instrument that it goes to.
 
 One or more MIDI clips may be used in the arrangement.
 
 Instruments, effects, and modulators can be connected into a sound graph.
 
-Each MIDI clip connects to one or more Instruments.
+A MIDI clip may contain notes routed to different Instruments
 
 Effect routing is a DAG composed of serial effect chains, parallel sends, and summing buses.
 The implementation maps this to Surge XT’s fixed Scene A/Scene B insert, send, and global-effect topology.
 Arbitrary routing cycles are not required.
 
-Modulators connect to one or more parameters. The implementation should map this to Surge's modulation system.
+Modulators form a many-to-many graph and connect to controlable parameters. Cycles in the graph are not supported.
+The implementation should map to Surge's modulation system.
 
 The final output of all Instruments (w/ optional Effect chain) is mixed together
 
