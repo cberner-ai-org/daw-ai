@@ -39,6 +39,15 @@ enum EditJobState {
     Failed { status: u16, error: String },
 }
 
+impl EditJob {
+    fn is_active(&self) -> bool {
+        matches!(
+            &self.state,
+            EditJobState::Queued | EditJobState::Running { .. }
+        )
+    }
+}
+
 impl EditJobs {
     pub(crate) fn new() -> Self {
         Self {
@@ -114,6 +123,9 @@ impl EditJobs {
 
     pub(crate) fn set_running(&self, id: u64, phase: &'static str, detail: impl Into<String>) {
         if let Some(job) = self.lock().get_mut(&id) {
+            if !job.is_active() {
+                return;
+            }
             job.state = EditJobState::Running {
                 phase,
                 detail: detail.into(),
@@ -123,6 +135,9 @@ impl EditJobs {
 
     pub(crate) fn publish_update(&self, id: u64, project_version: u64, summary: &str) {
         if let Some(job) = self.lock().get_mut(&id) {
+            if !job.is_active() {
+                return;
+            }
             job.applied_steps += 1;
             job.project_version = Some(project_version);
             job.state = EditJobState::Running {
@@ -134,6 +149,9 @@ impl EditJobs {
 
     pub(crate) fn finalize_updates(&self, id: u64, project_version: u64) {
         if let Some(job) = self.lock().get_mut(&id) {
+            if !job.is_active() {
+                return;
+            }
             job.project_version = Some(project_version);
             job.state = EditJobState::Running {
                 phase: "finalizing",
@@ -144,7 +162,7 @@ impl EditJobs {
 
     pub(crate) fn complete(&self, id: u64, message: String) {
         if let Some(job) = self.lock().get_mut(&id) {
-            if job.interrupted {
+            if !job.is_active() {
                 return;
             }
             job.finished_at = Some(Instant::now());
@@ -155,7 +173,7 @@ impl EditJobs {
 
     pub(crate) fn fail(&self, id: u64, status: u16, error: String) {
         if let Some(job) = self.lock().get_mut(&id) {
-            if job.interrupted {
+            if !job.is_active() {
                 return;
             }
             job.finished_at = Some(Instant::now());

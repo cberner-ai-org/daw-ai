@@ -2864,6 +2864,55 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_gemini_render_keeps_the_job_terminal() {
+        let router = Router::demo();
+        router.audio_renderer.occupy_for_test();
+        let (job_id, _, _) = router
+            .edit_jobs
+            .create(TEST_AI_POLL_INTERVAL_MS, Some("render-interrupt"))
+            .expect("edit job");
+        let cancellation = router.edit_jobs.cancellation(job_id);
+        let request = crate::gemini_tools::AudioRenderRequest {
+            project: Project::demo(),
+            track_ids: Vec::new(),
+            start: 0.0,
+            end: 1.0,
+            description: "interrupt test".to_owned(),
+            require_audible_output: false,
+        };
+        let worker_router = router.clone();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = worker_router.render_gemini_audio(
+                job_id,
+                request,
+                &cancellation,
+                Instant::now() + Duration::from_secs(1),
+            );
+            completed.send(result).expect("completion receiver");
+        });
+        router
+            .audio_renderer
+            .wait_until_queued_for_test(AudioRenderPriority::Foreground);
+
+        assert!(router.edit_jobs.interrupt(job_id));
+        router.audio_renderer.wake_waiters();
+        let error = completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("interruption must cancel the queued render")
+            .expect_err("interrupted render must not run");
+        assert_eq!(error, "audio render interrupted");
+        let response = router.edit_jobs.response(job_id).expect("interrupted job");
+        let body: serde_json::Value =
+            serde_json::from_str(&response.body).expect("interrupted job JSON");
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["errorStatus"], 409);
+
+        router.audio_renderer.release_for_test();
+        worker.join().expect("queued render worker");
+    }
+
+    #[test]
     fn panicking_render_releases_the_render_queue() {
         let renderer = AudioRenderer::default();
         let project = Project::demo();
@@ -3221,11 +3270,17 @@ mod tests {
         jobs.set_running(id, "editing", "working");
         assert!(jobs.interrupt(id));
         assert!(cancellation.load(Ordering::SeqCst));
+        jobs.set_running(id, "rendering", "too late");
+        jobs.publish_update(id, 2, "too late");
+        jobs.finalize_updates(id, 3);
         jobs.complete(id, "too late".to_owned());
+        jobs.fail(id, 500, "too late".to_owned());
         let response = jobs.response(id).expect("interrupted response");
         let body: serde_json::Value = serde_json::from_str(&response.body).expect("job JSON");
         assert_eq!(body["status"], "failed");
         assert_eq!(body["errorStatus"], 409);
+        assert_eq!(body["appliedSteps"], 0);
+        assert_eq!(body["projectVersion"], serde_json::Value::Null);
         assert!(jobs.is_interrupted(id));
         assert!(jobs.create(100, None).is_err());
         jobs.worker_finished(id);
