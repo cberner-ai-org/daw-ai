@@ -364,6 +364,7 @@ struct EditRequest {
     prompt: String,
     start: f32,
     end: f32,
+    deadline: Instant,
     project: crate::model::Project,
     batch_parameter_tools: bool,
     slim_prompt: bool,
@@ -911,6 +912,7 @@ impl Router {
             prompt: prompt.to_owned(),
             start,
             end,
+            deadline: Instant::now() + Duration::from_secs(EDIT_TIMEOUT_SECONDS),
             project,
             batch_parameter_tools,
             slim_prompt,
@@ -1238,6 +1240,7 @@ impl Router {
         let mut published_update = false;
         let cancellation = self.edit_jobs.cancellation(job_id);
         let render_cancellation = Arc::clone(&cancellation);
+        let deadline = edit.deadline;
         let completed = GeminiPlanner::interpret_with_updates(
             &self.gemini_session_root(),
             &edit.prompt,
@@ -1247,32 +1250,9 @@ impl Router {
             edit.batch_parameter_tools,
             edit.slim_prompt,
             edit.dynamic_tools,
+            deadline,
             cancellation,
-            |request| {
-                self.edit_jobs.set_running(
-                    job_id,
-                    "rendering",
-                    "Rendering the current sound graph with Surge XT",
-                );
-                let cancelled = || render_cancellation.load(Ordering::SeqCst);
-                let result = self
-                    .audio_renderer
-                    .render_with(AudioRenderPriority::Foreground, &cancelled, || {
-                        render_audio_request_cancellable(request, || {
-                            render_cancellation.load(Ordering::SeqCst)
-                        })
-                    })
-                    .map_err(|error| match error {
-                        AudioRenderError::Render(error) => error,
-                        AudioRenderError::Cancelled => "audio render interrupted".to_owned(),
-                    });
-                self.edit_jobs.set_running(
-                    job_id,
-                    "planning",
-                    "Gemini is listening to the backend audio render",
-                );
-                result
-            },
+            |request| self.render_gemini_audio(job_id, request, &render_cancellation, deadline),
             |graph_edit| {
                 self.commit_gemini_update(
                     job_id,
@@ -1298,6 +1278,39 @@ impl Router {
         )
         .map_err(planner_failure)?;
         Ok(completed.plan.summary)
+    }
+
+    fn render_gemini_audio(
+        &self,
+        job_id: u64,
+        request: crate::gemini_tools::AudioRenderRequest,
+        cancellation: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<crate::gemini_tools::AudioRender, String> {
+        self.edit_jobs.set_running(
+            job_id,
+            "rendering",
+            "Rendering the current sound graph with Surge XT",
+        );
+        let cancelled = || cancellation.load(Ordering::SeqCst) || Instant::now() >= deadline;
+        let result = self
+            .audio_renderer
+            .render_with(AudioRenderPriority::Foreground, &cancelled, || {
+                render_audio_request_cancellable(request, &cancelled)
+            })
+            .map_err(|error| match error {
+                AudioRenderError::Render(error) => error,
+                AudioRenderError::Cancelled if cancellation.load(Ordering::SeqCst) => {
+                    "audio render interrupted".to_owned()
+                }
+                AudioRenderError::Cancelled => "audio render deadline expired".to_owned(),
+            });
+        self.edit_jobs.set_running(
+            job_id,
+            "planning",
+            "Gemini is listening to the backend audio render",
+        );
+        result
     }
 
     #[cfg(debug_assertions)]
@@ -2803,6 +2816,51 @@ mod tests {
             second.join().expect("cancelled stream thread"),
             Err(AudioRenderError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn queued_gemini_render_stops_at_the_edit_deadline() {
+        let router = Router::demo();
+        router.audio_renderer.occupy_for_test();
+        let (job_id, _, _) = router
+            .edit_jobs
+            .create(TEST_AI_POLL_INTERVAL_MS, Some("render-deadline"))
+            .expect("edit job");
+        let cancellation = router.edit_jobs.cancellation(job_id);
+        let request = crate::gemini_tools::AudioRenderRequest {
+            project: Project::demo(),
+            track_ids: Vec::new(),
+            start: 0.0,
+            end: 1.0,
+            description: "deadline test".to_owned(),
+            require_audible_output: false,
+        };
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let worker_router = router.clone();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result =
+                worker_router.render_gemini_audio(job_id, request, &cancellation, deadline);
+            completed.send(result).expect("completion receiver");
+        });
+        router
+            .audio_renderer
+            .wait_until_queued_for_test(AudioRenderPriority::Foreground);
+
+        let error = completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline must cancel the queued render")
+            .expect_err("queued render must not run");
+        assert_eq!(error, "audio render deadline expired");
+        assert_eq!(
+            router
+                .audio_renderer
+                .queued_for_test(AudioRenderPriority::Foreground),
+            0
+        );
+
+        router.audio_renderer.release_for_test();
+        worker.join().expect("queued render worker");
     }
 
     #[test]

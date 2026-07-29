@@ -31,6 +31,7 @@ const DEFAULT_INTERACTIONS_ENDPOINT: &str =
     "https://generativelanguage.googleapis.com/v1beta/interactions";
 const SYSTEMD_CREDENTIAL_NAME: &str = "gemini-api-key";
 pub(crate) const EDIT_TIMEOUT_SECONDS: u64 = 20 * 60;
+#[cfg(test)]
 const EDIT_TIMEOUT: Duration = Duration::from_secs(EDIT_TIMEOUT_SECONDS);
 const TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(1),
@@ -167,6 +168,7 @@ impl GeminiPlanner {
         batch_parameter_tools: bool,
         slim_prompt: bool,
         dynamic_tools: bool,
+        deadline: Instant,
         cancellation: Arc<AtomicBool>,
         mut render_audio: impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
         mut on_update: impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -192,6 +194,7 @@ impl GeminiPlanner {
             batch_parameter_tools,
             slim_prompt,
             dynamic_tools,
+            deadline,
             cancellation,
             &mut render_audio,
             &mut on_update,
@@ -221,6 +224,7 @@ fn run_session(
     batch_parameter_tools: bool,
     slim_prompt: bool,
     dynamic_tools: bool,
+    deadline: Instant,
     cancellation: Arc<AtomicBool>,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -236,6 +240,7 @@ fn run_session(
         batch_parameter_tools,
         slim_prompt,
         dynamic_tools,
+        deadline,
         render_audio,
         on_update,
         &|| cancellation.load(Ordering::SeqCst),
@@ -274,6 +279,7 @@ fn run_session_with_transport(
         false,
         false,
         false,
+        Instant::now() + EDIT_TIMEOUT,
         render_audio,
         on_update,
         is_cancelled,
@@ -290,6 +296,7 @@ fn run_session_with_transport_options(
     batch_parameter_tools: bool,
     slim_prompt: bool,
     dynamic_tools: bool,
+    deadline: Instant,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     is_cancelled: &impl Fn() -> bool,
@@ -306,8 +313,8 @@ fn run_session_with_transport_options(
         if is_cancelled() {
             return Err(PlannerError::Interrupted);
         }
-        let remaining = EDIT_TIMEOUT
-            .checked_sub(started.elapsed())
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
             .ok_or(PlannerError::TimedOut)?;
         sequence += 1;
         let tools = if dynamic_tools {
@@ -1265,6 +1272,7 @@ mod tests {
             false,
             false,
             true,
+            Instant::now() + EDIT_TIMEOUT,
             &mut render_audio_request,
             &mut |edit| Ok(edit.project),
             &|| false,
@@ -1314,6 +1322,7 @@ mod tests {
             false,
             false,
             false,
+            Instant::now() + EDIT_TIMEOUT,
             &mut render_audio_request,
             &mut |edit| Ok(edit.project),
             &|| false,
