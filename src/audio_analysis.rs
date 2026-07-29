@@ -418,7 +418,14 @@ fn render_track(
     while output_frame < frame_count {
         let block_start = start_sample + output_frame;
         let count = crate::surge::BLOCK_SIZE.min(frame_count - output_frame);
-        for event in scheduled_midi_events_through(&midi, &mut event_index, block_start) {
+        let final_block = output_frame + count == frame_count;
+        for event in scheduled_midi_events_for_block(
+            &midi,
+            &mut event_index,
+            block_start,
+            count,
+            final_block,
+        ) {
             if event.note_on {
                 engine.play_note(event.pitch, event.velocity, event.note_id);
             } else {
@@ -444,13 +451,21 @@ struct ScheduledMidiEvent {
     note_on: bool,
 }
 
-fn scheduled_midi_events_through<'a>(
+fn scheduled_midi_events_for_block<'a>(
     midi: &'a [ScheduledMidiEvent],
     event_index: &mut usize,
     block_start: usize,
+    block_count: usize,
+    final_block: bool,
 ) -> &'a [ScheduledMidiEvent] {
+    // Surge accepts MIDI only at block boundaries. Quantize forward except at the render boundary.
+    let dispatch_through = if final_block {
+        block_start + block_count.saturating_sub(1)
+    } else {
+        block_start
+    };
     let start = *event_index;
-    *event_index += midi[start..].partition_point(|event| event.sample <= block_start);
+    *event_index += midi[start..].partition_point(|event| event.sample <= dispatch_through);
     &midi[start..*event_index]
 }
 
@@ -1078,11 +1093,64 @@ mod tests {
         ];
         let mut event_index = 0;
 
-        let dispatched = scheduled_midi_events_through(&midi, &mut event_index, block_start);
+        let dispatched = scheduled_midi_events_for_block(
+            &midi,
+            &mut event_index,
+            block_start,
+            crate::surge::BLOCK_SIZE,
+            false,
+        );
 
         assert_eq!(dispatched.len(), 1);
         assert_eq!(dispatched[0].note_id, 1);
         assert_eq!(event_index, 1);
+    }
+
+    #[test]
+    fn final_render_block_dispatches_events_inside_the_copied_window() {
+        let block_start = crate::surge::BLOCK_SIZE;
+        let block_count = 2;
+        let midi = [
+            ScheduledMidiEvent {
+                sample: block_start,
+                note_id: 1,
+                pitch: 60,
+                velocity: 1.0,
+                note_on: true,
+            },
+            ScheduledMidiEvent {
+                sample: block_start + block_count - 1,
+                note_id: 2,
+                pitch: 62,
+                velocity: 1.0,
+                note_on: true,
+            },
+            ScheduledMidiEvent {
+                sample: block_start + block_count,
+                note_id: 3,
+                pitch: 64,
+                velocity: 1.0,
+                note_on: true,
+            },
+        ];
+        let mut event_index = 0;
+
+        let dispatched = scheduled_midi_events_for_block(
+            &midi,
+            &mut event_index,
+            block_start,
+            block_count,
+            true,
+        );
+
+        assert_eq!(
+            dispatched
+                .iter()
+                .map(|event| event.note_id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(event_index, 2);
     }
 
     #[test]
