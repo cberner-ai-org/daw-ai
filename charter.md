@@ -52,7 +52,7 @@ The MIDI clips are built into DAW AI, but everything else: Instrument, Effects, 
 those implementations in Surge XT. DAW AI adds only a minimal layer on top to expose them to Gemini, persist settings...etc.
 
 #### MIDI Clip
-Contains notes, including their timing, duration, pitch, and velocity. Each note is tagged with the instrument key that it is routed to.
+Contains notes, including their timing, duration, pitch, and velocity.
 
 #### Instrument:
 Produces sound from MIDI events.
@@ -74,7 +74,9 @@ May also be tempo sync'ed, or configured to trigger off a MIDI note event
 
 #### Routing
 
-MIDI clips uses key zones, where each event is tagged with the instrument that it goes to.
+MIDI clips uses key zones, where ranges of notes are configured to route to an instrument instance.
+Multiple key zones, routing to different instruments, per MIDI clip are supported. Multiple zones may route
+to the same instrument, and zones may overlap.
 
 One or more MIDI clips may be used in the arrangement.
 
