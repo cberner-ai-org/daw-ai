@@ -129,7 +129,12 @@ impl Request {
         self.method == "POST"
             && (matches!(
                 self.path.as_str(),
-                "/api/edits" | "/api/duration" | "/api/logs" | "/api/undo" | "/api/reset"
+                "/api/edits"
+                    | "/api/duration"
+                    | "/api/mix"
+                    | "/api/logs"
+                    | "/api/undo"
+                    | "/api/reset"
             ) || self.path.starts_with("/api/edits/"))
     }
 

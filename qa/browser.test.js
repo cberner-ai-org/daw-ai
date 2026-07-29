@@ -385,6 +385,29 @@ async function run() {
       0,
       "track labels must show only the user-facing name",
     );
+    assert.equal(
+      await evaluate(cdp, startupPage.sessionId, "document.querySelectorAll('.track-mute').length"),
+      3,
+      "each track must have a mute button",
+    );
+    await evaluate(cdp, startupPage.sessionId, "document.querySelector('.track-mute').click()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        startupPage.sessionId,
+        "document.querySelector('.track-mute').getAttribute('aria-pressed') === 'true'",
+      ),
+      "track mute control",
+    );
+    await evaluate(cdp, startupPage.sessionId, "document.querySelector('.track-mute').click()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        startupPage.sessionId,
+        "document.querySelector('.track-mute').getAttribute('aria-pressed') === 'false'",
+      ),
+      "track unmute control",
+    );
     await cdp.send("Target.closeTarget", { targetId: startupPage.targetId });
     const playbackPriorityPage = await openPageWithScript(cdp, appUrl, `(() => {
       const originalFetch = window.fetch;
