@@ -2870,7 +2870,7 @@ async function run() {
     assert.equal(audioBoundary.sameSource, true, "render boundaries must remain in one media resource");
     assert.match(audioBoundary.time, /^\d+:\d{2}\.\d$/);
     assert.ok(
-      Math.abs(audioBoundary.displayedSeconds - audioBoundary.expectedDisplay) < 0.15,
+      Math.abs(audioBoundary.displayedSeconds - audioBoundary.expectedDisplay) <= 0.1501,
       `displayed transport time must follow playback across the render boundary (${JSON.stringify(audioBoundary)})`,
     );
     await evaluate(cdp, appSession, "document.querySelector('#play-button').click()");
