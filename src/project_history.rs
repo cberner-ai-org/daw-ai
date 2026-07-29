@@ -122,14 +122,26 @@ impl ProjectHistory {
         });
         self.parents.push(Some(parent));
         self.current = next;
-        if project_document(project, self).len() as u64 > maximum_document_bytes {
+        let maximum_persisted_bytes = match self.maximum_persisted_bytes(project) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.snapshots.pop();
+                self.parents.pop();
+                self.snapshots[parent] = previous_current;
+                self.current = parent;
+                return Err(error);
+            }
+        };
+        if maximum_persisted_bytes as u64 > maximum_document_bytes {
             self.snapshots.pop();
             self.parents.pop();
             self.snapshots[parent] = previous_current;
             self.current = parent;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("project history exceeds the {maximum_document_bytes}-byte document limit"),
+                format!(
+                    "project history can exceed the {maximum_document_bytes}-byte document limit after checkout"
+                ),
             ));
         }
         Ok(())
@@ -204,17 +216,25 @@ impl ProjectHistory {
                 .take()
                 .expect("checked history snapshot delta exists");
             let target_source = apply_snapshot_delta(&base_source, &delta)?;
-            drop(delta);
             validate_snapshot_source(&self.snapshots[target_index], &target_source)?;
             let suffix_start = base_source
                 .len()
                 .checked_sub(suffix)
                 .filter(|suffix_start| prefix <= *suffix_start)
                 .ok_or_else(|| invalid_data("project history snapshot delta is out of bounds"))?;
+            let reverse_replacement = &base_source[prefix..suffix_start];
+            if serialized_string_bytes(reverse_replacement) != delta.reverse_replacement_bytes {
+                return Err(invalid_data(
+                    "project history reverse delta size is invalid",
+                ));
+            }
+            let forward_replacement_bytes = serialized_string_bytes(&delta.replacement);
+            drop(delta);
             let reverse_delta = SnapshotDelta {
                 prefix,
                 suffix,
-                replacement: base_source[prefix..suffix_start].to_owned(),
+                reverse_replacement_bytes: forward_replacement_bytes,
+                replacement: reverse_replacement.to_owned(),
             };
             self.snapshots[base_index].base = Some(target_index);
             self.snapshots[base_index].delta = Some(reverse_delta);
@@ -237,6 +257,74 @@ impl ProjectHistory {
             .filter_map(|snapshot| snapshot.delta.as_ref())
             .map(|delta| delta.replacement.len())
             .sum()
+    }
+
+    fn maximum_persisted_bytes(&self, project: &Project) -> io::Result<usize> {
+        let mut children = vec![Vec::new(); self.snapshots.len()];
+        for (index, snapshot) in self.snapshots.iter().enumerate() {
+            if let Some(base) = snapshot.base {
+                children
+                    .get_mut(base)
+                    .ok_or_else(|| invalid_data("project history snapshot base is invalid"))?
+                    .push(index);
+            }
+        }
+        let current_bytes = project_document(project, self).len();
+        let mut root_bytes = vec![None; self.snapshots.len()];
+        root_bytes[self.current] = Some(current_bytes as i128);
+        let mut pending = vec![self.current];
+        let mut maximum = current_bytes as i128;
+        while let Some(base_index) = pending.pop() {
+            let base_bytes = root_bytes[base_index]
+                .ok_or_else(|| invalid_data("project history snapshot is disconnected"))?;
+            for &target_index in &children[base_index] {
+                let base = &self.snapshots[base_index];
+                let target = &self.snapshots[target_index];
+                let delta = target
+                    .delta
+                    .as_ref()
+                    .ok_or_else(|| invalid_data("project history snapshot delta is missing"))?;
+                let replacement_bytes = serialized_string_bytes(&delta.replacement);
+                let index_bytes =
+                    decimal_bytes(target_index) as i128 - decimal_bytes(base_index) as i128;
+                let next_bytes = base_bytes + target.source_bytes as i128
+                    - base.source_bytes as i128
+                    + delta.reverse_replacement_bytes as i128
+                    - replacement_bytes as i128
+                    + decimal_bytes(replacement_bytes) as i128
+                    - decimal_bytes(delta.reverse_replacement_bytes) as i128
+                    + index_bytes * 2;
+                if next_bytes <= 0 {
+                    return Err(invalid_data("project history document size is invalid"));
+                }
+                root_bytes[target_index] = Some(next_bytes);
+                maximum = maximum.max(next_bytes);
+                pending.push(target_index);
+            }
+        }
+        if root_bytes.iter().any(Option::is_none) {
+            return Err(invalid_data("project history snapshot is disconnected"));
+        }
+        usize::try_from(maximum)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(self.navigation_metadata_reserve(project)))
+            .ok_or_else(|| invalid_data("project history document size is invalid"))
+    }
+
+    fn navigation_metadata_reserve(&self, project: &Project) -> usize {
+        const MAX_VERSION_BYTES: usize = 20;
+        const MAX_EDIT_COUNT_BYTES: usize = 5;
+
+        MAX_VERSION_BYTES.saturating_sub(decimal_bytes_u64(project.version))
+            + self
+                .snapshots
+                .iter()
+                .map(|snapshot| {
+                    MAX_VERSION_BYTES.saturating_sub(decimal_bytes_u64(snapshot.entry.version))
+                        + MAX_EDIT_COUNT_BYTES
+                            .saturating_sub(decimal_bytes(snapshot.entry.edit_count))
+                })
+                .sum::<usize>()
     }
 }
 
@@ -288,7 +376,7 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
         .get("encoding")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| invalid_data("history encoding is required"))?;
-    if encoding != "delta-tree-v2" {
+    if encoding != "delta-tree-v3" {
         return Err(invalid_data("history encoding is unsupported"));
     }
     let snapshots = snapshot_values
@@ -307,6 +395,11 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
         current,
     };
     loaded.update_current_metadata(project);
+    if loaded.maximum_persisted_bytes(project)? as u64 > MAX_PROJECT_DOCUMENT_BYTES {
+        return Err(invalid_data(
+            "project history can exceed the document limit after checkout",
+        ));
+    }
     Ok(loaded)
 }
 
@@ -330,7 +423,7 @@ fn history_value(history: &ProjectHistory) -> serde_json::Value {
     }
 
     serde_json::to_value(PersistedHistory {
-        encoding: "delta-tree-v2",
+        encoding: "delta-tree-v3",
         current: history.current,
         snapshots: history.snapshots.clone(),
         parents: history.parents.clone(),
@@ -343,6 +436,7 @@ struct SnapshotDelta {
     prefix: usize,
     suffix: usize,
     replacement: String,
+    reverse_replacement_bytes: usize,
 }
 
 fn snapshot_delta(base: &str, target: &str) -> SnapshotDelta {
@@ -370,7 +464,27 @@ fn snapshot_delta(base: &str, target: &str) -> SnapshotDelta {
         prefix,
         suffix,
         replacement: target[prefix..target.len() - suffix].to_owned(),
+        reverse_replacement_bytes: serialized_string_bytes(&base[prefix..base.len() - suffix]),
     }
+}
+
+fn serialized_string_bytes(value: &str) -> usize {
+    serde_json::to_string(value)
+        .expect("a project source slice serializes as a JSON string")
+        .len()
+}
+
+fn decimal_bytes(value: usize) -> usize {
+    decimal_bytes_u64(value as u64)
+}
+
+fn decimal_bytes_u64(mut value: u64) -> usize {
+    let mut bytes = 1;
+    while value >= 10 {
+        value /= 10;
+        bytes += 1;
+    }
+    bytes
 }
 
 fn apply_snapshot_delta(base: &str, delta: &SnapshotDelta) -> io::Result<String> {
@@ -487,6 +601,18 @@ fn validate_compact_snapshots(snapshots: &[CompactSnapshot], current: usize) -> 
                 "project history snapshot delta length is invalid",
             ));
         }
+        let reverse_replacement_bytes = base
+            .source_bytes
+            .checked_sub(delta.prefix)
+            .and_then(|bytes| bytes.checked_sub(delta.suffix))
+            .ok_or_else(|| invalid_data("project history snapshot delta is out of bounds"))?;
+        if !(reverse_replacement_bytes + 2..=reverse_replacement_bytes * 2 + 2)
+            .contains(&delta.reverse_replacement_bytes)
+        {
+            return Err(invalid_data(
+                "project history reverse delta size is invalid",
+            ));
+        }
         let mut cursor = index;
         for _ in 0..snapshots.len() {
             if cursor == current {
@@ -529,6 +655,11 @@ pub(crate) fn save_project_state(
     project: &Project,
     history: &ProjectHistory,
 ) -> io::Result<()> {
+    if history.maximum_persisted_bytes(project)? as u64 > MAX_PROJECT_DOCUMENT_BYTES {
+        return Err(invalid_data(
+            "project history can exceed the document limit after checkout",
+        ));
+    }
     store.save_source(&project_document(project, history))
 }
 
@@ -587,6 +718,21 @@ mod tests {
         Project::from_json(&project.to_json()).expect("large valid project")
     }
 
+    fn escape_heavy_project(edit_count: usize) -> Project {
+        let mut project = Project::demo();
+        let prompt = "\\".repeat(crate::model::MAX_PROMPT_CHARACTERS);
+        for index in 0..edit_count {
+            project.edits.push(crate::model::Edit {
+                id: 20_000 + index as u64,
+                start: 0.0,
+                end: 1.0,
+                prompt: prompt.clone(),
+                summary: "Escape-heavy history fixture".to_owned(),
+            });
+        }
+        Project::from_json(&project.to_json()).expect("escape-heavy valid project")
+    }
+
     #[test]
     fn project_and_history_publish_as_one_revision() {
         let root = std::env::temp_dir().join(format!(
@@ -626,7 +772,7 @@ mod tests {
             store
                 .read_source()
                 .expect("project document")
-                .contains("\"encoding\":\"delta-tree-v2\"")
+                .contains("\"encoding\":\"delta-tree-v3\"")
         );
         fs::remove_dir_all(root).expect("remove state test directory");
     }
@@ -765,6 +911,50 @@ mod tests {
     }
 
     #[test]
+    fn history_rejects_an_orientation_that_checkout_cannot_persist() {
+        let initial = Project::initial();
+        let large = escape_heavy_project(3_500);
+        let mut unbounded = ProjectHistory::new(initial.clone());
+        unbounded
+            .push_with_limits(&initial, &large, 2, u64::MAX)
+            .expect("construct near-limit history fixture");
+        let current_bytes = project_document(&large, &unbounded).len() as u64;
+        assert!(current_bytes < MAX_PROJECT_DOCUMENT_BYTES);
+        let metadata_reserve = unbounded.navigation_metadata_reserve(&large);
+        let maximum_bytes = unbounded
+            .maximum_persisted_bytes(&large)
+            .expect("maximum persisted size");
+        assert!(maximum_bytes as u64 > MAX_PROJECT_DOCUMENT_BYTES);
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-root-independent-history-{}-{}",
+            std::process::id(),
+            crate::storage::unique_test_id()
+        ));
+        fs::create_dir(&root).expect("root-independent history test directory");
+        let (store, _) =
+            ProjectStore::open(root.join("sound-graph.json")).expect("history test store");
+        let error = save_project_state(&store, &large, &unbounded)
+            .expect_err("common save must reject an unsafe retained root");
+        assert!(error.to_string().contains("after checkout"));
+
+        let (rerooted, restored) = unbounded
+            .checkout(0, &large)
+            .expect("materialize oversized orientation");
+        let rerooted_bytes = project_document(&restored, &rerooted).len();
+        assert_eq!(maximum_bytes - metadata_reserve, rerooted_bytes);
+        assert!(rerooted_bytes as u64 > MAX_PROJECT_DOCUMENT_BYTES);
+
+        let mut bounded = ProjectHistory::new(initial.clone());
+        let error = bounded
+            .push(&initial, &large)
+            .expect_err("unselectable history must be rejected");
+        assert!(error.to_string().contains("after checkout"));
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded.current, 0);
+        fs::remove_dir_all(root).expect("remove root-independent history test directory");
+    }
+
+    #[test]
     fn compact_history_does_not_duplicate_large_unchanged_graphs() {
         let project = large_project(512);
         let mut next = project.clone();
@@ -822,13 +1012,13 @@ mod tests {
     }
 
     #[test]
-    fn non_current_history_encoding_is_rejected() {
+    fn previous_history_encoding_is_rejected() {
         let current = Project::demo();
         let history = ProjectHistory::new(current.clone());
         let mut document =
             serde_json::from_str::<serde_json::Value>(&project_document(&current, &history))
                 .expect("current project document");
-        document["history"]["encoding"] = "delta-v1".into();
+        document["history"]["encoding"] = "delta-tree-v2".into();
         let root = std::env::temp_dir().join(format!(
             "daw-ai-unsupported-history-{}-{}",
             std::process::id(),
