@@ -408,11 +408,7 @@ fn render_track(
         if onset >= start && onset < region_end {
             event_onsets.push(onset as f32);
         }
-        let note_id = occurrence
-            .event
-            .id
-            .wrapping_mul(1_000_003)
-            .wrapping_add(sequence as u64);
+        let note_id = host_note_id(sequence)?;
         midi.push(ScheduledMidiEvent {
             sample: midi_event_sample(onset),
             note_id,
@@ -475,9 +471,16 @@ fn render_track(
     Ok(())
 }
 
+fn host_note_id(sequence: usize) -> Result<i32, String> {
+    i32::try_from(sequence)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| "audio region contains too many MIDI note occurrences".to_owned())
+}
+
 struct ScheduledMidiEvent {
     sample: usize,
-    note_id: u64,
+    note_id: i32,
     pitch: u8,
     velocity: f32,
     note_on: bool,
@@ -1174,6 +1177,13 @@ mod tests {
             80_000 * SAMPLE_RATE as usize + SAMPLE_RATE as usize / 1_000
         );
         assert_ne!(precise, playback_start_sample(onset as f32));
+    }
+
+    #[test]
+    fn host_note_ids_are_local_checked_integers() {
+        assert_eq!(host_note_id(0), Ok(1));
+        assert_eq!(host_note_id(i32::MAX as usize - 1), Ok(i32::MAX));
+        assert!(host_note_id(i32::MAX as usize).is_err());
     }
 
     #[test]

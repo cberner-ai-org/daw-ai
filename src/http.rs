@@ -81,6 +81,7 @@ impl Request {
                 self.path.as_str(),
                 "/api/edits"
                     | "/api/duration"
+                    | "/api/history"
                     | "/api/mix"
                     | "/api/logs"
                     | "/api/undo"

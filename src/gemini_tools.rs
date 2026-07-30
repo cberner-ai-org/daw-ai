@@ -17,11 +17,11 @@ use crate::gemini_session::{
 };
 use crate::gemini_session::{
     GRAPH_FILE, MAX_SESSION_JSON_BYTES, MAX_SOUND_GRAPH_BYTES, REQUEST_FILE, SESSION_FILE,
-    UNDO_GRAPH_FILE, UNDO_REQUEST_FILE, progress_path, publish_progress, wait_for_progress_handoff,
-    write_new, write_replace,
+    UNDO_GRAPH_FILE, UNDO_REQUEST_FILE, ensure_progress_handoff_consumed, progress_path,
+    publish_progress, write_new, write_replace,
 };
 use crate::model::{
-    MAX_LOOP_PLAYBACK_BEATS, MAX_MIDI_EVENTS_PER_CLIP, MAX_MIDI_NOTE_DURATION_BEATS,
+    CLIP_LIMIT, MAX_LOOP_PLAYBACK_BEATS, MAX_MIDI_EVENTS_PER_CLIP, MAX_MIDI_NOTE_DURATION_BEATS,
     MAX_ONCE_PLAYBACK_BEATS, MIN_MIDI_NOTE_BEATS, MidiClipSpec, MidiNote, ModulatorSpec,
     PROJECT_SCHEMA_VERSION, Project, Studio, StudioError, TIMELINE_EPSILON_SECONDS,
     TRACK_COLOR_PALETTE, Track,
@@ -1551,7 +1551,7 @@ pub(crate) fn apply_agent_mutation(
     name: &str,
     arguments: &JsonValue,
 ) -> Result<String, String> {
-    wait_for_progress_handoff(session_path);
+    ensure_progress_handoff_consumed(session_path)?;
     let graph_path = session_path.join(GRAPH_FILE);
     let (store, mut studio) = ProjectStore::open(graph_path)
         .map_err(|error| format!("Could not load sound-graph.json: {error}"))?;
@@ -3765,6 +3765,9 @@ fn studio_error_message(error: StudioError) -> String {
         StudioError::EffectCapacity => {
             "effect chain full: Surge XT supports at most 8 enabled serial effects".to_owned()
         }
+        StudioError::ClipCapacity => {
+            format!("sound graph supports at most {CLIP_LIMIT} MIDI clips")
+        }
     }
 }
 
@@ -5693,6 +5696,22 @@ mod tests {
             fs::read_to_string(session.path().join(UNDO_GRAPH_FILE)).expect("undo after failure"),
             undo_before
         );
+    }
+
+    #[test]
+    fn rejects_a_mutation_until_prior_progress_is_consumed() {
+        let original = Project::demo();
+        let session = EditSession::create(&original, "change tempo", 0.0, 4.0).expect("session");
+        apply_agent_mutation(session.path(), "set_tempo", &serde_json::json!({"bpm":130}))
+            .expect("first mutation");
+
+        let error =
+            apply_agent_mutation(session.path(), "set_tempo", &serde_json::json!({"bpm":140}))
+                .expect_err("unconsumed mutation progress");
+
+        assert_eq!(error, "previous Gemini edit progress has not been consumed");
+        let (_, updated) = session.take_update().unwrap().expect("first progress");
+        assert_eq!(updated.bpm, 130);
     }
 
     #[test]

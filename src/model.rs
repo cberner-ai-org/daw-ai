@@ -3,8 +3,9 @@ use std::fmt::{self, Write};
 
 use serde::Serialize;
 
-const TRACK_LIMIT: usize = 128;
-const KEY_ZONE_LIMIT: usize = 2_048;
+pub(crate) const TRACK_LIMIT: usize = 128;
+pub(crate) const KEY_ZONE_LIMIT: usize = 2_048;
+pub(crate) const CLIP_LIMIT: usize = 2_048;
 pub(crate) const EDIT_LOG_LIMIT: usize = 10_000;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
 pub(crate) const PROJECT_SCHEMA_VERSION: u64 = 6;
@@ -784,6 +785,7 @@ pub enum StudioError {
     UnknownSoundTool,
     InvalidSoundTool,
     EffectCapacity,
+    ClipCapacity,
 }
 
 #[derive(Clone)]
@@ -1263,13 +1265,18 @@ impl Studio {
         {
             return Err(StudioError::InvalidSoundTool);
         }
+        let retain_left = original.start + TIMELINE_EPSILON_SECONDS < selection_start;
+        let retain_right = original.end > selection_end + TIMELINE_EPSILON_SECONDS;
+        if project.clips.len() + usize::from(retain_left) + usize::from(retain_right) > CLIP_LIMIT {
+            return Err(StudioError::ClipCapacity);
+        }
         let mut retained = Vec::with_capacity(2);
-        if original.start + TIMELINE_EPSILON_SECONDS < selection_start {
+        if retain_left {
             let mut left = original.clone();
             left.end = selection_start;
             retained.push(left);
         }
-        if original.end > selection_end + TIMELINE_EPSILON_SECONDS {
+        if retain_right {
             let mut right = original;
             if !retained.is_empty() {
                 self.rekey_clip(&mut right);
@@ -1296,6 +1303,9 @@ impl Studio {
             &spec.notes,
             self.project.duration,
         )?;
+        if self.project.clips.len() >= CLIP_LIMIT {
+            return Err(StudioError::ClipCapacity);
+        }
         let clip_id = self.take_id();
         let events = spec
             .notes
@@ -1366,6 +1376,13 @@ impl Studio {
         {
             return Err(StudioError::InvalidSoundTool);
         }
+        let retain_left = original.start + TIMELINE_EPSILON_SECONDS < spec.start;
+        let retain_right = original.end > spec.end + TIMELINE_EPSILON_SECONDS;
+        if project.clips.len() + 1 + usize::from(retain_left) + usize::from(retain_right)
+            > CLIP_LIMIT
+        {
+            return Err(StudioError::ClipCapacity);
+        }
         let events = spec
             .notes
             .iter()
@@ -1379,7 +1396,7 @@ impl Studio {
             })
             .collect();
         let mut replacements = Vec::with_capacity(3);
-        if original.start + TIMELINE_EPSILON_SECONDS < spec.start {
+        if retain_left {
             let mut left = original.clone();
             self.rekey_clip(&mut left);
             left.end = spec.start;
@@ -1396,7 +1413,7 @@ impl Studio {
             loop_beats: spec.loop_beats,
             events,
         });
-        if original.end > spec.end + TIMELINE_EPSILON_SECONDS {
+        if retain_right {
             let mut right = original;
             self.rekey_clip(&mut right);
             right.start = spec.end;
@@ -2438,6 +2455,44 @@ mod tests {
         );
         Project::from_json(&replaced.project().to_json())
             .expect("replaced clip fragments validate");
+    }
+
+    #[test]
+    fn midi_clip_capacity_is_enforced_before_mutation() {
+        let mut project = Project::demo();
+        let mut filler = project.clips[0].clone();
+        filler.events.clear();
+        while project.clips.len() < CLIP_LIMIT {
+            filler.id = 1_000_000 + project.clips.len() as u64;
+            project.clips.push(filler.clone());
+        }
+        let mut studio = Studio::from_project(project);
+        let version = studio.project.version;
+        let next_id = studio.next_id;
+        let clip = MidiClipSpec {
+            label: "Capacity check".to_owned(),
+            start: 8.0,
+            end: 16.0,
+            playback_mode: "loop".to_owned(),
+            loop_beats: 4.0,
+            notes: Vec::new(),
+        };
+
+        assert_eq!(
+            studio.create_midi_clip(&clip),
+            Err(StudioError::ClipCapacity)
+        );
+        assert_eq!(
+            studio.delete_midi_clip(11, 8.0, 16.0),
+            Err(StudioError::ClipCapacity)
+        );
+        assert_eq!(
+            studio.replace_midi_clip(11, &clip, 0.0, 32.0),
+            Err(StudioError::ClipCapacity)
+        );
+        assert_eq!(studio.project.clips.len(), CLIP_LIMIT);
+        assert_eq!(studio.project.version, version);
+        assert_eq!(studio.next_id, next_id);
     }
 
     #[test]
