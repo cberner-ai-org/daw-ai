@@ -41,12 +41,10 @@ impl RackRoutingIndex {
         }
     }
 
-    fn track_receives_clip_pitch(&self, track: &Track, clip: &Clip, pitch: u8) -> bool {
-        clip.allows_track(track.id)
-            && self
-                .pitches_by_instrument
-                .get(&track.instrument.id)
-                .is_some_and(|pitches| pitches[usize::from(pitch)])
+    fn track_receives_pitch(&self, track: &Track, pitch: u8) -> bool {
+        self.pitches_by_instrument
+            .get(&track.instrument.id)
+            .is_some_and(|pitches| pitches[usize::from(pitch)])
     }
 }
 
@@ -531,7 +529,7 @@ fn clip_events_in_window<'a>(
     let mut occurrences = Vec::new();
     for cycle in first_cycle..=last_cycle {
         for event in &clip.events {
-            if !routing.track_receives_clip_pitch(track, clip, event.pitch) {
+            if !routing.track_receives_pitch(track, event.pitch) {
                 continue;
             }
             let time = f64::from(clip.source_start)
@@ -598,7 +596,7 @@ fn maximum_voice_lifetime(project: &Project, track: &Track, routing: &RackRoutin
         .flat_map(|clip| {
             clip.events
                 .iter()
-                .filter(|event| routing.track_receives_clip_pitch(track, clip, event.pitch))
+                .filter(|event| routing.track_receives_pitch(track, event.pitch))
         })
         .map(|event| event.duration * beat_duration + 8.0)
         .fold(0.0_f32, f32::max)
@@ -863,7 +861,6 @@ mod tests {
             end: 1.0,
             source_start: 0.0,
             style: "generated".to_owned(),
-            legacy_track_id: None,
             playback_mode: "once".to_owned(),
             loop_beats: 1.0,
             events: vec![crate::model::ClipEvent {
@@ -898,32 +895,6 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(first[0].event.pitch, 60);
         assert_eq!(second[0].event.pitch, 60);
-    }
-
-    #[test]
-    fn migrated_track_clips_do_not_cross_trigger_overlapping_zones() {
-        let mut source: serde_json::Value =
-            serde_json::from_str(&crate::project_file::schema_five_demo_source_for_test())
-                .expect("schema five project");
-        for track in source["tracks"].as_array_mut().expect("schema five tracks") {
-            for clip in track["clips"].as_array_mut().expect("track clips") {
-                for event in clip["events"].as_array_mut().expect("clip events") {
-                    event["pitch"] = serde_json::Value::from(60);
-                }
-            }
-        }
-        let project = Project::from_json(&source.to_string()).expect("migrated project");
-        let routing = RackRoutingIndex::new(&project);
-        for (owner_index, clip) in project.clips.iter().enumerate() {
-            for (track_index, track) in project.tracks.iter().enumerate() {
-                let events = clip_events_in_window(&project, track, &routing, clip, 0.0, 2.0);
-                assert_eq!(
-                    events.is_empty(),
-                    owner_index != track_index,
-                    "clip {owner_index} routing to track {track_index}"
-                );
-            }
-        }
     }
 
     #[test]

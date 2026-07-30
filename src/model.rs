@@ -76,8 +76,6 @@ pub struct Clip {
     pub end: f32,
     pub source_start: f32,
     pub style: String,
-    // Schema v5 clips were track-owned; keep that destination while they use the shared Rack.
-    pub legacy_track_id: Option<u64>,
     pub playback_mode: String,
     pub loop_beats: f32,
     pub events: Vec<ClipEvent>,
@@ -313,12 +311,11 @@ impl Project {
         highest
     }
 
-    pub(crate) fn track_receives_clip_pitch(&self, clip: &Clip, track: &Track, pitch: u8) -> bool {
-        clip.allows_track(track.id)
-            && self.key_zones.iter().any(|zone| {
-                zone.instrument_id == track.instrument.id
-                    && (zone.low_note..=zone.high_note).contains(&pitch)
-            })
+    pub(crate) fn track_receives_pitch(&self, track: &Track, pitch: u8) -> bool {
+        self.key_zones.iter().any(|zone| {
+            zone.instrument_id == track.instrument.id
+                && (zone.low_note..=zone.high_note).contains(&pitch)
+        })
     }
 
     #[must_use]
@@ -682,11 +679,6 @@ impl Track {
 }
 
 impl Clip {
-    pub(crate) fn allows_track(&self, track_id: u64) -> bool {
-        self.legacy_track_id
-            .is_none_or(|legacy_track_id| legacy_track_id == track_id)
-    }
-
     fn write_json(&self, output: &mut String) {
         write!(
             output,
@@ -702,10 +694,6 @@ impl Clip {
             json_string(&self.style)
         )
         .expect("writing to a string cannot fail");
-        if let Some(track_id) = self.legacy_track_id {
-            write!(output, ",\"legacyTrackId\":{track_id}")
-                .expect("writing to a string cannot fail");
-        }
         write!(
             output,
             ",\"playback\":{{\"mode\":{},\"lengthBeats\":{}}},\"events\":[",
@@ -1245,9 +1233,6 @@ impl Studio {
         self.project
             .key_zones
             .retain(|zone| zone.instrument_id != instrument_id);
-        self.project
-            .clips
-            .retain(|clip| clip.legacy_track_id != Some(track_id));
         for track in &mut self.project.tracks {
             track
                 .modulators
@@ -1331,7 +1316,6 @@ impl Studio {
             end: spec.end,
             source_start: spec.start,
             style: "generated".to_owned(),
-            legacy_track_id: None,
             playback_mode: spec.playback_mode.clone(),
             loop_beats: spec.loop_beats,
             events,
@@ -1382,7 +1366,6 @@ impl Studio {
         {
             return Err(StudioError::InvalidSoundTool);
         }
-        let legacy_track_id = original.legacy_track_id;
         let events = spec
             .notes
             .iter()
@@ -1409,7 +1392,6 @@ impl Studio {
             end: spec.end,
             source_start: spec.start,
             style: "generated".to_owned(),
-            legacy_track_id,
             playback_mode: spec.playback_mode.clone(),
             loop_beats: spec.loop_beats,
             events,
@@ -1672,8 +1654,10 @@ impl Studio {
 
     pub fn reset(&mut self) {
         let version = self.project.version + 1;
+        let edit_operations = std::mem::take(&mut self.project.edit_operations);
         self.project = Project::initial();
         self.project.version = version;
+        self.project.edit_operations = edit_operations;
     }
 
     fn take_id(&mut self) -> u64 {
@@ -2236,7 +2220,6 @@ fn demo_clip(id: u64, label: &str, role: DemoPart) -> Clip {
         end: 32.0,
         source_start: 0.0,
         style: "foundation".to_owned(),
-        legacy_track_id: None,
         playback_mode: "loop".to_owned(),
         loop_beats: 4.0,
         events: pattern_events(id, role),

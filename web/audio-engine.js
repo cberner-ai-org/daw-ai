@@ -3,6 +3,7 @@
 
   const AUDIO_RETRY_DELAYS_MS = [250, 500, 1000];
   const SPECTRUM_WINDOW_SECONDS = 64;
+  const SPECTRUM_RETRY_DELAY_MS = 1000;
   const AUDIO_SEEK_DEBOUNCE_MS = 200;
 
   window.createDawAiAudioEngine = ({
@@ -291,7 +292,10 @@
             `/api/track-spectrum/${encodeURIComponent(this.streamToken)}/${project.version}/${Math.round(start * 1000)}`,
             { cache: "default", signal: this.spectrumAbortController.signal },
           );
-          if (response.status === 409) return false;
+          if (response.status === 409) {
+            this.spectrumRetryAfter = Date.now() + SPECTRUM_RETRY_DELAY_MS;
+            return false;
+          }
           if (!response.ok) throw new Error(`Track spectrum render failed with HTTP ${response.status}.`);
           const decoded = this.decodeSpectrum(await response.arrayBuffer());
           if (generation !== this.spectrumLoadGeneration || project.version !== this.project?.version) return false;
@@ -311,7 +315,7 @@
           return { start: decoded.start, duration: decoded.duration };
         } catch (error) {
           if (error?.name !== "AbortError" && project.version === this.project?.version) {
-            this.spectrumRetryAfter = Date.now() + 1000;
+            this.spectrumRetryAfter = Date.now() + SPECTRUM_RETRY_DELAY_MS;
             reportClientIssue("warning", error, "loading track analyzers");
           }
           return null;

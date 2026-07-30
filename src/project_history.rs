@@ -332,10 +332,6 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
     let source = read_bounded_text(path, MAX_PROJECT_DOCUMENT_BYTES, "project history")?;
     let value: serde_json::Value = serde_json::from_str(&source)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let schema_version = value
-        .get("schemaVersion")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| invalid_data("project schema version is required"))?;
     let Some(history) = value.get("history") else {
         return Ok(ProjectHistory::new(project.clone()));
     };
@@ -392,12 +388,7 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
         })
         .collect::<io::Result<Vec<_>>>()?;
     validate_compact_snapshots(&snapshots, current)?;
-    let snapshots = if schema_version == crate::project_file::PREVIOUS_PROJECT_SCHEMA_VERSION {
-        migrate_schema_five_history(&source, snapshots, current, project)?
-    } else {
-        validate_snapshot_source(&snapshots[current], &history_source(project))?;
-        snapshots
-    };
+    validate_snapshot_source(&snapshots[current], &history_source(project))?;
     let mut loaded = ProjectHistory {
         snapshots,
         parents,
@@ -410,147 +401,6 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
         ));
     }
     Ok(loaded)
-}
-
-fn migrate_schema_five_history(
-    document: &str,
-    snapshots: Vec<CompactSnapshot>,
-    current: usize,
-    project: &Project,
-) -> io::Result<Vec<CompactSnapshot>> {
-    struct MigrationFrame {
-        index: usize,
-        next_child: usize,
-        reverse_legacy: Option<SnapshotDelta>,
-        reverse_migrated: Option<SnapshotDelta>,
-    }
-
-    let mut legacy_source = legacy_history_source(document)?;
-    validate_snapshot_source(&snapshots[current], &legacy_source)?;
-    let migrated_current = Project::from_json(&legacy_source)
-        .map_err(|error| invalid_data(format!("schemaVersion 5 history is invalid: {error}")))?;
-    let mut migrated_source = history_source(&migrated_current);
-    if migrated_source != history_source(project) {
-        return Err(invalid_data(
-            "schemaVersion 5 history current snapshot does not match the migrated project",
-        ));
-    }
-
-    let mut children = vec![Vec::new(); snapshots.len()];
-    for (index, snapshot) in snapshots.iter().enumerate() {
-        if let Some(base) = snapshot.base {
-            children[base].push(index);
-        }
-    }
-    let original = snapshots;
-    let mut migrated = original.clone();
-    migrated[current].base = None;
-    migrated[current].delta = None;
-    migrated[current].source_bytes = migrated_source.len();
-    migrated[current].checksum = source_checksum(&migrated_source);
-
-    let mut frames = vec![MigrationFrame {
-        index: current,
-        next_child: 0,
-        reverse_legacy: None,
-        reverse_migrated: None,
-    }];
-    while !frames.is_empty() {
-        let child = {
-            let frame = frames.last_mut().expect("migration frame exists");
-            let child = children[frame.index].get(frame.next_child).copied();
-            frame.next_child += usize::from(child.is_some());
-            child
-        };
-        if let Some(child) = child {
-            let delta = original[child]
-                .delta
-                .as_ref()
-                .ok_or_else(|| invalid_data("project history snapshot delta is missing"))?;
-            validate_reverse_replacement(&legacy_source, delta)?;
-            let target_legacy = apply_snapshot_delta(&legacy_source, delta)?;
-            validate_snapshot_source(&original[child], &target_legacy)?;
-            let target_project = Project::from_json(&target_legacy).map_err(|error| {
-                invalid_data(format!("schemaVersion 5 history is invalid: {error}"))
-            })?;
-            let target_migrated = history_source(&target_project);
-            if target_migrated.len() > MAX_PROJECT_BYTES {
-                return Err(invalid_data(
-                    "migrated project history snapshot exceeds the graph limit",
-                ));
-            }
-
-            migrated[child].source_bytes = target_migrated.len();
-            migrated[child].checksum = source_checksum(&target_migrated);
-            migrated[child].delta = Some(snapshot_delta(&migrated_source, &target_migrated));
-            let reverse_legacy = snapshot_delta(&target_legacy, &legacy_source);
-            let reverse_migrated = snapshot_delta(&target_migrated, &migrated_source);
-            legacy_source = target_legacy;
-            migrated_source = target_migrated;
-            frames.push(MigrationFrame {
-                index: child,
-                next_child: 0,
-                reverse_legacy: Some(reverse_legacy),
-                reverse_migrated: Some(reverse_migrated),
-            });
-            continue;
-        }
-
-        let frame = frames.pop().expect("migration frame exists");
-        let (Some(reverse_legacy), Some(reverse_migrated)) =
-            (frame.reverse_legacy, frame.reverse_migrated)
-        else {
-            continue;
-        };
-        legacy_source = apply_snapshot_delta(&legacy_source, &reverse_legacy)?;
-        migrated_source = apply_snapshot_delta(&migrated_source, &reverse_migrated)?;
-        let parent = frames
-            .last()
-            .map(|frame| frame.index)
-            .ok_or_else(|| invalid_data("project history snapshot is disconnected"))?;
-        validate_snapshot_source(&original[parent], &legacy_source)?;
-        validate_snapshot_source(&migrated[parent], &migrated_source)?;
-    }
-
-    validate_compact_snapshots(&migrated, current)?;
-    Ok(migrated)
-}
-
-fn legacy_history_source(document: &str) -> io::Result<String> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct SchemaFiveDocument {
-        schema_version: u64,
-        name: Box<serde_json::value::RawValue>,
-        bpm: Box<serde_json::value::RawValue>,
-        duration: Box<serde_json::value::RawValue>,
-        #[serde(rename = "version")]
-        _version: Box<serde_json::value::RawValue>,
-        tracks: Box<serde_json::value::RawValue>,
-        edits: Box<serde_json::value::RawValue>,
-        #[serde(rename = "editOperations")]
-        _edit_operations: Box<serde_json::value::RawValue>,
-    }
-
-    let legacy = serde_json::from_str::<SchemaFiveDocument>(document)
-        .map_err(|error| invalid_data(format!("schemaVersion 5 history is invalid: {error}")))?;
-    if legacy.schema_version != crate::project_file::PREVIOUS_PROJECT_SCHEMA_VERSION {
-        return Err(invalid_data(
-            "project history does not contain a schemaVersion 5 project",
-        ));
-    }
-    Ok(format!(
-        concat!(
-            "{{\"schemaVersion\":{},\"name\":{},\"bpm\":{},\"duration\":{},",
-            "\"version\":1,\"tracks\":{},\"edits\":{},\"editOperations\":[]}}"
-        ),
-        legacy.schema_version,
-        legacy.name.get(),
-        legacy.bpm.get(),
-        legacy.duration.get(),
-        legacy.tracks.get(),
-        legacy.edits.get()
-    ))
 }
 
 pub(crate) fn project_document(project: &Project, history: &ProjectHistory) -> String {
@@ -658,24 +508,6 @@ fn apply_snapshot_delta(base: &str, delta: &SnapshotDelta) -> io::Result<String>
     snapshot.push_str(&delta.replacement);
     snapshot.push_str(&base[suffix_start..]);
     Ok(snapshot)
-}
-
-fn validate_reverse_replacement(base: &str, delta: &SnapshotDelta) -> io::Result<()> {
-    let suffix_start = base
-        .len()
-        .checked_sub(delta.suffix)
-        .filter(|suffix_start| delta.prefix <= *suffix_start)
-        .filter(|suffix_start| {
-            base.is_char_boundary(delta.prefix) && base.is_char_boundary(*suffix_start)
-        })
-        .ok_or_else(|| invalid_data("project history snapshot delta is out of bounds"))?;
-    if serialized_string_bytes(&base[delta.prefix..suffix_start]) != delta.reverse_replacement_bytes
-    {
-        return Err(invalid_data(
-            "project history reverse delta size is invalid",
-        ));
-    }
-    Ok(())
 }
 
 fn history_project(project: &Project) -> Project {
@@ -969,128 +801,6 @@ mod tests {
         assert_eq!(history.current, 0);
         load_project_history(store.path(), studio.project()).expect("repaired embedded history");
         fs::remove_dir_all(root).expect("remove history test directory");
-    }
-
-    #[test]
-    fn schema_five_project_is_migrated_before_persisting_history() {
-        let root = std::env::temp_dir().join(format!(
-            "daw-ai-schema-five-migration-{}-{}",
-            std::process::id(),
-            crate::storage::unique_test_id()
-        ));
-        fs::create_dir(&root).expect("migration test directory");
-        let path = root.join("sound-graph.json");
-        fs::write(
-            &path,
-            crate::project_file::schema_five_demo_source_for_test(),
-        )
-        .expect("schema five project");
-
-        let (store, studio, history) = open_project_with_history(path).expect("migrated project");
-
-        assert_eq!(studio.project().clips.len(), 3);
-        assert!(!studio.project().key_zones.is_empty());
-        assert_eq!(history.len(), 1);
-        let persisted: serde_json::Value =
-            serde_json::from_str(&store.read_source().expect("persisted project"))
-                .expect("persisted project JSON");
-        assert_eq!(
-            persisted["schemaVersion"],
-            crate::model::PROJECT_SCHEMA_VERSION
-        );
-        assert!(persisted.get("instrumentRack").is_some());
-        assert!(persisted.get("history").is_some());
-        fs::remove_dir_all(root).expect("remove migration test directory");
-    }
-
-    #[test]
-    fn schema_five_project_preserves_embedded_history() {
-        let root = std::env::temp_dir().join(format!(
-            "daw-ai-schema-five-history-migration-{}-{}",
-            std::process::id(),
-            crate::storage::unique_test_id()
-        ));
-        fs::create_dir(&root).expect("migration test directory");
-        let path = root.join("sound-graph.json");
-
-        let initial_graph = crate::project_file::schema_five_demo_source_for_test();
-        let mut current_value: serde_json::Value =
-            serde_json::from_str(&initial_graph).expect("schema five project");
-        current_value["name"] = serde_json::Value::String("History current".to_owned());
-        current_value["version"] = serde_json::Value::from(2);
-        let current_graph = current_value.to_string();
-        let initial_source = legacy_history_source(&initial_graph).expect("initial history source");
-        let current_source = legacy_history_source(&current_graph).expect("current history source");
-        let snapshots = vec![
-            CompactSnapshot {
-                base: Some(1),
-                delta: Some(snapshot_delta(&current_source, &initial_source)),
-                source_bytes: initial_source.len(),
-                checksum: source_checksum(&initial_source),
-                entry: HistoryEntry {
-                    version: 1,
-                    edit_count: 0,
-                    summary: "Initial project".to_owned(),
-                    source: "Project".to_owned(),
-                    prompt: None,
-                    start: None,
-                    end: None,
-                },
-            },
-            CompactSnapshot {
-                base: None,
-                delta: None,
-                source_bytes: current_source.len(),
-                checksum: source_checksum(&current_source),
-                entry: HistoryEntry {
-                    version: 2,
-                    edit_count: 0,
-                    summary: "Manual project change".to_owned(),
-                    source: "Manual".to_owned(),
-                    prompt: None,
-                    start: None,
-                    end: None,
-                },
-            },
-        ];
-        let history = serde_json::json!({
-            "encoding": "delta-tree-v3",
-            "current": 1,
-            "snapshots": snapshots,
-            "parents": [null, 0]
-        });
-        let mut document = current_graph;
-        assert_eq!(document.pop(), Some('}'));
-        document.push_str(",\"history\":");
-        document.push_str(&history.to_string());
-        document.push_str("}\n");
-        fs::write(&path, document).expect("schema five project history");
-
-        let expected_initial =
-            Project::from_json(&initial_graph).expect("expected migrated initial project");
-        let (store, studio, history) =
-            open_project_with_history(path).expect("migrated project history");
-
-        assert_eq!(history.len(), 2);
-        assert_eq!(history.current, 1);
-        assert_eq!(history.parent(1), Some(0));
-        let restored = history
-            .clone()
-            .checkout(0, studio.project())
-            .expect("migrated initial history")
-            .1;
-        assert_eq!(restored.to_json(), expected_initial.to_json());
-        let reloaded = load_project_history(store.path(), studio.project())
-            .expect("persisted migrated history");
-        assert_eq!(reloaded.len(), 2);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &store.read_source().expect("persisted project")
-            )
-            .expect("persisted project JSON")["schemaVersion"],
-            crate::model::PROJECT_SCHEMA_VERSION
-        );
-        fs::remove_dir_all(root).expect("remove migration test directory");
     }
 
     #[test]
