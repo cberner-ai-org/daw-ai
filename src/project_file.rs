@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -43,7 +43,6 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     }
 
     let mut ids = HashSet::new();
-    let mut event_ids = HashSet::new();
     let tracks = track_values
         .iter()
         .enumerate()
@@ -85,7 +84,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     }
     let clips = clip_values
         .iter()
-        .map(|value| parse_clip(value, duration, &mut ids, &mut event_ids))
+        .map(|value| parse_clip(value, duration, &mut ids))
         .collect::<Result<Vec<_>, _>>()?;
     let edit_values = array(root, "edits")?;
     if edit_values.len() > MAX_EDITS {
@@ -116,11 +115,8 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     {
         return Err(invalid("edit operation records must be unique"));
     }
-    if !ids.is_disjoint(&event_ids) {
-        return Err(invalid(
-            "MIDI event IDs must not collide with sound graph object IDs",
-        ));
-    }
+    let mut clips = clips;
+    migrate_legacy_clip_event_ids(&mut clips, &ids)?;
 
     Ok(Project {
         name,
@@ -634,7 +630,6 @@ fn parse_clip(
     value: &JsonValue,
     project_duration: f32,
     ids: &mut HashSet<u64>,
-    event_ids: &mut HashSet<u64>,
 ) -> Result<Clip, ProjectFileError> {
     let clip = object(value, "MIDI clip")?;
     let id = unique_id(clip, "id", ids, "MIDI clip")?;
@@ -679,9 +674,10 @@ fn parse_clip(
             "MIDI clips support at most {MAX_MIDI_EVENTS_PER_CLIP} events"
         )));
     }
+    let mut event_ids = HashSet::new();
     let events = event_values
         .iter()
-        .map(|value| parse_clip_event(value, loop_beats, event_ids))
+        .map(|value| parse_clip_event(value, loop_beats, &mut event_ids))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Clip {
         id,
@@ -694,6 +690,51 @@ fn parse_clip(
         loop_beats,
         events,
     })
+}
+
+fn migrate_legacy_clip_event_ids(
+    clips: &mut [Clip],
+    object_ids: &HashSet<u64>,
+) -> Result<(), ProjectFileError> {
+    let reserved_ids = clips
+        .iter()
+        .flat_map(|clip| clip.events.iter().map(|event| event.id))
+        .collect::<HashSet<_>>();
+    if !object_ids.is_disjoint(&reserved_ids) {
+        return Err(invalid(
+            "MIDI event IDs must not collide with sound graph object IDs",
+        ));
+    }
+
+    let mut seen = HashMap::with_capacity(reserved_ids.len());
+    let mut next_id = 1;
+    for event in clips.iter_mut().flat_map(|clip| &mut clip.events) {
+        let signature = (
+            event.time.to_bits(),
+            event.duration.to_bits(),
+            event.pitch,
+            event.velocity.to_bits(),
+        );
+        let Some(previous) = seen.get(&event.id) else {
+            seen.insert(event.id, signature);
+            continue;
+        };
+        if *previous != signature {
+            return Err(invalid(format!("duplicate sound graph ID: {}", event.id)));
+        }
+        while next_id <= MAX_SAFE_INTEGER
+            && (object_ids.contains(&next_id) || reserved_ids.contains(&next_id))
+        {
+            next_id += 1;
+        }
+        if next_id > MAX_SAFE_INTEGER {
+            return Err(invalid("MIDI event ID namespace is exhausted"));
+        }
+        event.id = next_id;
+        seen.insert(next_id, signature);
+        next_id += 1;
+    }
+    Ok(())
 }
 
 fn parse_clip_event(
@@ -1050,6 +1091,32 @@ mod tests {
         let error = parse_project(&project.to_string()).expect_err("duplicate MIDI event ID");
 
         assert!(error.to_string().contains("duplicate sound graph ID"));
+    }
+
+    #[test]
+    fn migrates_legacy_split_clip_event_ids() {
+        let mut project: JsonValue =
+            serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+        let mut right = project["clips"][0].clone();
+        project["clips"][0]["end"] = JsonValue::from(8.0);
+        right["id"] = JsonValue::from(999_999);
+        right["start"] = JsonValue::from(16.0);
+        project["clips"]
+            .as_array_mut()
+            .expect("project clips")
+            .push(right);
+
+        let migrated = parse_project(&project.to_string()).expect("legacy split project");
+        let left = &migrated.clips[0];
+        let right = migrated.clips.last().expect("right clip fragment");
+
+        assert!(
+            left.events
+                .iter()
+                .zip(&right.events)
+                .all(|(left, right)| left.id != right.id)
+        );
+        parse_project(&migrated.to_json()).expect("migrated project round trip");
     }
 
     #[test]
