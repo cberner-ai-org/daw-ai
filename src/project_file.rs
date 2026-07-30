@@ -14,16 +14,20 @@ const MAX_CLIPS: usize = 2_048;
 const MAX_KEY_ZONES: usize = 2_048;
 const MAX_EDITS: usize = 10_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const PREVIOUS_PROJECT_SCHEMA_VERSION: u64 = 5;
 
 type Object = Map<String, JsonValue>;
 
 pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
-    let value: JsonValue =
+    let mut value: JsonValue =
         serde_json::from_str(source).map_err(|error| invalid(format!("invalid JSON: {error}")))?;
-    let root = object(&value, "sound graph")?;
-    if integer(root, "schemaVersion")? != PROJECT_SCHEMA_VERSION {
-        return Err(invalid("schemaVersion is unsupported"));
+    let schema_version = integer(object(&value, "sound graph")?, "schemaVersion")?;
+    match schema_version {
+        PROJECT_SCHEMA_VERSION => {}
+        PREVIOUS_PROJECT_SCHEMA_VERSION => migrate_schema_five(&mut value)?,
+        _ => return Err(invalid("schemaVersion is unsupported")),
     }
+    let root = object(&value, "sound graph")?;
     let name = limited_string(root, "name", 1, 160)?;
     let bpm = integer(root, "bpm")?;
     if !(60..=180).contains(&bpm) {
@@ -133,6 +137,211 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         edits,
         edit_operations,
     })
+}
+
+fn migrate_schema_five(value: &mut JsonValue) -> Result<(), ProjectFileError> {
+    let mut used_ids = HashSet::new();
+    collect_ids(value, &mut used_ids);
+    let mut next_id = used_ids
+        .iter()
+        .copied()
+        .max()
+        .filter(|id| *id < MAX_SAFE_INTEGER)
+        .map_or(1, |id| id + 1);
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| invalid("sound graph must be an object"))?;
+    let tracks = root
+        .get_mut("tracks")
+        .and_then(JsonValue::as_array_mut)
+        .ok_or_else(|| invalid("tracks must be an array"))?;
+    let mut clips = Vec::new();
+    let mut instrument_pitches = Vec::with_capacity(tracks.len());
+    for (index, track_value) in tracks.iter_mut().enumerate() {
+        let context = format!("track {}", index + 1);
+        let track = track_value
+            .as_object_mut()
+            .ok_or_else(|| invalid(format!("{context} must be an object")))?;
+        let instrument = track
+            .get("instrument")
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| invalid("instrument must be an object"))?;
+        let instrument_id = integer(instrument, "id")?;
+        migrate_schema_five_routing(track, instrument_id)?;
+        let track_clips = match track.remove("clips") {
+            Some(JsonValue::Array(clips)) => clips,
+            _ => return Err(invalid(format!("{context} clips must be an array"))),
+        };
+        let mut pitches = [false; 128];
+        for clip in &track_clips {
+            if let Some(events) = clip.get("events").and_then(JsonValue::as_array) {
+                for pitch in events
+                    .iter()
+                    .filter_map(|event| event.get("pitch"))
+                    .filter_map(JsonValue::as_u64)
+                    .filter(|pitch| *pitch <= 127)
+                {
+                    pitches[pitch as usize] = true;
+                }
+            }
+        }
+        clips.extend(track_clips);
+        instrument_pitches.push((instrument_id, pitches));
+    }
+    if instrument_pitches.len() == 1 && !instrument_pitches[0].1.iter().any(|used| *used) {
+        instrument_pitches[0].1.fill(true);
+    }
+
+    let mut zone_specs = instrument_pitches
+        .iter()
+        .flat_map(|(instrument_id, pitches)| {
+            pitch_runs(pitches)
+                .into_iter()
+                .map(|(low_note, high_note)| (*instrument_id, low_note, high_note))
+        })
+        .collect::<Vec<_>>();
+    if zone_specs.len() > MAX_KEY_ZONES {
+        zone_specs = instrument_pitches
+            .iter()
+            .filter_map(|(instrument_id, pitches)| {
+                let low_note = pitches.iter().position(|used| *used)? as u8;
+                let high_note = pitches.iter().rposition(|used| *used)? as u8;
+                Some((*instrument_id, low_note, high_note))
+            })
+            .collect();
+    }
+    let key_zones = zone_specs
+        .into_iter()
+        .map(|(instrument_id, low_note, high_note)| {
+            Ok(serde_json::json!({
+                "id": allocate_migration_id(&mut used_ids, &mut next_id)?,
+                "lowNote": low_note,
+                "highNote": high_note,
+                "instrumentId": instrument_id
+            }))
+        })
+        .collect::<Result<Vec<_>, ProjectFileError>>()?;
+    root.insert(
+        "instrumentRack".to_owned(),
+        serde_json::json!({"type": "instrumentRack", "keyZones": key_zones}),
+    );
+    root.insert("clips".to_owned(), JsonValue::Array(clips));
+    root.insert(
+        "schemaVersion".to_owned(),
+        JsonValue::from(PROJECT_SCHEMA_VERSION),
+    );
+    Ok(())
+}
+
+fn migrate_schema_five_routing(
+    track: &mut Object,
+    instrument_id: u64,
+) -> Result<(), ProjectFileError> {
+    let routing = track
+        .get_mut("routing")
+        .and_then(JsonValue::as_object_mut)
+        .ok_or_else(|| invalid("routing must be an object"))?;
+    let audio = routing
+        .get_mut("audio")
+        .and_then(JsonValue::as_array_mut)
+        .ok_or_else(|| invalid("routing audio must be an array"))?;
+    if audio.first().and_then(JsonValue::as_str) != Some("clips") {
+        return Err(invalid(
+            "schemaVersion 5 routing audio must start with clips",
+        ));
+    }
+    audio.remove(0);
+
+    let edges = routing
+        .get_mut("edges")
+        .and_then(JsonValue::as_array_mut)
+        .ok_or_else(|| invalid("routing edges must be an array"))?;
+    let instrument = format!("instrument:{instrument_id}");
+    let midi_edge = edges
+        .iter()
+        .position(|edge| {
+            edge.get("source").and_then(JsonValue::as_str) == Some("clips")
+                && edge.get("target").and_then(JsonValue::as_str) == Some(instrument.as_str())
+                && edge.get("type").and_then(JsonValue::as_str) == Some("midi")
+        })
+        .ok_or_else(|| invalid("schemaVersion 5 routing MIDI edge is missing"))?;
+    edges.remove(midi_edge);
+    for edge in edges {
+        let Some(source) = edge.as_object_mut().and_then(|edge| edge.get_mut("source")) else {
+            continue;
+        };
+        let Some(original) = source.as_str() else {
+            continue;
+        };
+        let migrated = if original == "clips" {
+            Some(format!("rack:instrument:{instrument_id}"))
+        } else {
+            original
+                .strip_suffix(":clips")
+                .filter(|prefix| prefix.starts_with("track:"))
+                .map(|prefix| format!("{prefix}:rack"))
+        };
+        if let Some(migrated) = migrated {
+            *source = JsonValue::String(migrated);
+        }
+    }
+    Ok(())
+}
+
+fn pitch_runs(pitches: &[bool; 128]) -> Vec<(u8, u8)> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (pitch, used) in pitches.iter().copied().chain([false]).enumerate() {
+        match (start, used) {
+            (None, true) => start = Some(pitch as u8),
+            (Some(low_note), false) => {
+                runs.push((low_note, (pitch - 1) as u8));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    runs
+}
+
+fn collect_ids(value: &JsonValue, ids: &mut HashSet<u64>) {
+    match value {
+        JsonValue::Object(object) => {
+            if let Some(id) = object.get("id").and_then(JsonValue::as_u64) {
+                ids.insert(id);
+            }
+            for value in object.values() {
+                collect_ids(value, ids);
+            }
+        }
+        JsonValue::Array(values) => {
+            for value in values {
+                collect_ids(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn allocate_migration_id(
+    used_ids: &mut HashSet<u64>,
+    next_id: &mut u64,
+) -> Result<u64, ProjectFileError> {
+    let start = *next_id;
+    loop {
+        let candidate = *next_id;
+        *next_id = if candidate == MAX_SAFE_INTEGER {
+            1
+        } else {
+            candidate + 1
+        };
+        if candidate > 0 && used_ids.insert(candidate) {
+            return Ok(candidate);
+        }
+        if *next_id == start {
+            return Err(invalid("could not allocate a migrated key zone ID"));
+        }
+    }
 }
 
 fn parse_track(
@@ -1015,6 +1224,76 @@ fn invalid(message: impl Into<String>) -> ProjectFileError {
 }
 
 #[cfg(test)]
+pub(crate) fn schema_five_demo_source_for_test() -> String {
+    let mut value: JsonValue =
+        serde_json::from_str(&Project::demo().to_json()).expect("demo project JSON");
+    let root = value.as_object_mut().expect("demo project object");
+    let clips = match root.remove("clips") {
+        Some(JsonValue::Array(clips)) => clips,
+        _ => panic!("demo project clips"),
+    };
+    root.remove("instrumentRack")
+        .expect("demo project instrument rack");
+    let tracks = root
+        .get_mut("tracks")
+        .and_then(JsonValue::as_array_mut)
+        .expect("demo project tracks");
+    assert_eq!(tracks.len(), clips.len());
+    for (track_value, clip) in tracks.iter_mut().zip(clips) {
+        let track = track_value.as_object_mut().expect("demo track object");
+        let instrument_id = track["instrument"]["id"]
+            .as_u64()
+            .expect("demo instrument ID");
+        track.insert("clips".to_owned(), JsonValue::Array(vec![clip]));
+        let routing = track
+            .get_mut("routing")
+            .and_then(JsonValue::as_object_mut)
+            .expect("demo track routing");
+        routing
+            .get_mut("audio")
+            .and_then(JsonValue::as_array_mut)
+            .expect("demo audio chain")
+            .insert(0, JsonValue::String("clips".to_owned()));
+        let edges = routing
+            .get_mut("edges")
+            .and_then(JsonValue::as_array_mut)
+            .expect("demo routing edges");
+        for edge in edges.iter_mut() {
+            let Some(source) = edge.as_object_mut().and_then(|edge| edge.get_mut("source")) else {
+                continue;
+            };
+            let Some(original) = source.as_str() else {
+                continue;
+            };
+            let migrated = if original == format!("rack:instrument:{instrument_id}") {
+                Some("clips".to_owned())
+            } else {
+                original
+                    .strip_suffix(":rack")
+                    .filter(|prefix| prefix.starts_with("track:"))
+                    .map(|prefix| format!("{prefix}:clips"))
+            };
+            if let Some(migrated) = migrated {
+                *source = JsonValue::String(migrated);
+            }
+        }
+        edges.insert(
+            0,
+            serde_json::json!({
+                "source": "clips",
+                "target": format!("instrument:{instrument_id}"),
+                "type": "midi"
+            }),
+        );
+    }
+    root.insert(
+        "schemaVersion".to_owned(),
+        JsonValue::from(PREVIOUS_PROJECT_SCHEMA_VERSION),
+    );
+    value.to_string()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1042,6 +1321,52 @@ mod tests {
         let original = Project::demo();
         let parsed = parse_project(&original.to_json()).expect("valid demo graph");
         assert_eq!(parsed.to_json(), original.to_json());
+    }
+
+    #[test]
+    fn migrates_schema_five_track_clips_into_the_project_rack() {
+        let migrated = parse_project(&schema_five_demo_source_for_test())
+            .expect("migrated schema five project");
+
+        assert_eq!(migrated.tracks.len(), 3);
+        assert_eq!(migrated.clips.len(), 3);
+        for (track, clip) in migrated.tracks.iter().zip(&migrated.clips) {
+            assert!(clip.events.iter().all(|event| {
+                migrated.key_zones.iter().any(|zone| {
+                    zone.instrument_id == track.instrument.id
+                        && zone.low_note <= event.pitch
+                        && event.pitch <= zone.high_note
+                })
+            }));
+        }
+        let serialized: JsonValue =
+            serde_json::from_str(&migrated.to_json()).expect("migrated project JSON");
+        assert_eq!(serialized["schemaVersion"], PROJECT_SCHEMA_VERSION);
+        assert!(serialized.get("instrumentRack").is_some());
+        assert!(serialized.get("clips").is_some());
+        assert!(
+            serialized["tracks"]
+                .as_array()
+                .expect("migrated tracks")
+                .iter()
+                .all(|track| track.get("clips").is_none())
+        );
+        parse_project(&migrated.to_json()).expect("round-trip migrated project");
+
+        let mut empty: JsonValue = serde_json::from_str(&schema_five_demo_source_for_test())
+            .expect("schema five project JSON");
+        empty["tracks"]
+            .as_array_mut()
+            .expect("schema five tracks")
+            .truncate(1);
+        empty["tracks"][0]["clips"] = JsonValue::Array(Vec::new());
+        let empty = parse_project(&empty.to_string()).expect("migrated empty project");
+        assert!(empty.clips.is_empty());
+        assert_eq!(empty.key_zones.len(), 1);
+        assert_eq!(
+            (empty.key_zones[0].low_note, empty.key_zones[0].high_note),
+            (0, 127)
+        );
     }
 
     #[test]
@@ -1238,6 +1563,12 @@ mod tests {
         assert!(parse_project(&project.to_string()).is_err());
 
         project["schemaVersion"] = JsonValue::from(3);
+        assert!(parse_project(&project.to_string()).is_err());
+
+        project["schemaVersion"] = JsonValue::from(4);
+        assert!(parse_project(&project.to_string()).is_err());
+
+        project["schemaVersion"] = JsonValue::from(7);
         assert!(parse_project(&project.to_string()).is_err());
     }
 
