@@ -230,19 +230,13 @@ impl fmt::Display for ProjectFileError {
 
 impl Project {
     pub(crate) fn initial() -> Self {
-        let track = empty_track(1);
         Self {
             name: "Untitled Project".to_owned(),
             bpm: 120,
             duration: 32.0,
             version: 1,
-            key_zones: vec![KeyZone {
-                id: tool_id(1, 2),
-                low_note: 0,
-                high_note: 127,
-                instrument_id: track.instrument.id,
-            }],
-            tracks: vec![track],
+            key_zones: Vec::new(),
+            tracks: vec![empty_track(1)],
             clips: Vec::new(),
             edits: Vec::new(),
             edit_operations: Vec::new(),
@@ -2354,8 +2348,7 @@ mod tests {
         assert_eq!(track.name, "Empty Track");
         assert_eq!(track.instrument.preset, "Init");
         assert!(project.clips.is_empty());
-        assert_eq!(project.key_zones.len(), 1);
-        assert_eq!(project.key_zones[0].instrument_id, track.instrument.id);
+        assert!(project.key_zones.is_empty());
         assert!(track.effects.is_empty());
         assert!(track.modulators.is_empty());
         assert!(track.routing.effect_order.is_empty());
