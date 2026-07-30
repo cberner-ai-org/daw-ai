@@ -138,11 +138,21 @@ async fn serve_http(
     shutdown: impl Future<Output = ()> + Send,
     config: HttpServerConfig,
 ) -> io::Result<()> {
+    let connection_limiter = Limiter::new(config.max_connections);
+    serve_http_with_limiter(listener, router, shutdown, config, connection_limiter).await
+}
+
+async fn serve_http_with_limiter(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown: impl Future<Output = ()> + Send,
+    config: HttpServerConfig,
+    connection_limiter: Arc<Limiter>,
+) -> io::Result<()> {
     let state = HttpState {
         router,
         body_limits: config.body_limits,
     };
-    let connection_limiter = Limiter::new(config.max_connections);
     let mut connection_tasks = tokio::task::JoinSet::new();
     let (connection_shutdown, _) = tokio::sync::watch::channel(false);
     tokio::pin!(shutdown);
@@ -3418,7 +3428,8 @@ mod tests {
             .expect("test listener");
         let address = listener.local_addr().expect("test address");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve_http(
+        let connection_limiter = Limiter::new(1);
+        let server = tokio::spawn(serve_http_with_limiter(
             listener,
             Router::demo(),
             async move {
@@ -3433,6 +3444,7 @@ mod tests {
                 },
                 shutdown_grace_timeout: Duration::from_millis(75),
             },
+            Arc::clone(&connection_limiter),
         ));
 
         let mut missing_headers = tokio::net::TcpStream::connect(address)
@@ -3448,6 +3460,7 @@ mod tests {
             read_test_connection(&mut missing_headers).await.is_empty(),
             "an incomplete header cannot receive an HTTP response"
         );
+        wait_for_test_capacity(&connection_limiter).await;
 
         let mut missing_body = tokio::net::TcpStream::connect(address)
             .await
@@ -3464,6 +3477,7 @@ mod tests {
         assert!(body_overload.starts_with("HTTP/1.1 503"));
         let timed_out = read_test_connection(&mut missing_body).await;
         assert!(timed_out.starts_with("HTTP/1.1 408"));
+        wait_for_test_capacity(&connection_limiter).await;
 
         let mut health = tokio::net::TcpStream::connect(address)
             .await
@@ -3554,6 +3568,20 @@ mod tests {
             .expect("HTTP connection timed out")
             .expect("read HTTP connection");
         String::from_utf8(response).expect("ASCII HTTP response")
+    }
+
+    async fn wait_for_test_capacity(limiter: &Arc<Limiter>) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(permit) = limiter.acquire() {
+                    drop(permit);
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HTTP connection capacity was not released");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
