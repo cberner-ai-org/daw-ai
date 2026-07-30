@@ -143,7 +143,14 @@ impl AudioRenderer {
             end_sample,
             is_cancelled,
             AudioRenderPriority::Foreground,
-            audio_analysis::render_project_sample_range,
+            |project, start_sample, end_sample| {
+                audio_analysis::render_project_sample_range_cancellable(
+                    project,
+                    start_sample,
+                    end_sample,
+                    &mut || is_cancelled(),
+                )
+            },
         )
     }
 
@@ -160,7 +167,14 @@ impl AudioRenderer {
             end_sample,
             is_cancelled,
             AudioRenderPriority::Background,
-            audio_analysis::render_project_stems_sample_range,
+            |project, start_sample, end_sample| {
+                audio_analysis::render_project_stems_sample_range_cancellable(
+                    project,
+                    start_sample,
+                    end_sample,
+                    &mut || is_cancelled(),
+                )
+            },
         )
     }
 
@@ -189,7 +203,12 @@ impl AudioRenderer {
         if is_cancelled() {
             return Err(AudioRenderError::Cancelled);
         }
-        render().map_err(AudioRenderError::Render)
+        let rendered = render();
+        if is_cancelled() {
+            Err(AudioRenderError::Cancelled)
+        } else {
+            rendered.map_err(AudioRenderError::Render)
+        }
     }
 
     #[cfg(test)]
@@ -255,5 +274,22 @@ mod tests {
 
         assert!(matches!(result, Ok(Err(AudioRenderError::Cancelled))));
         assert_eq!(renderer.queued_for_test(AudioRenderPriority::Foreground), 0);
+    }
+
+    #[test]
+    fn cancellation_during_render_is_not_reported_as_a_render_failure() {
+        let renderer = AudioRenderer::default();
+        let cancelled = AtomicBool::new(false);
+
+        let result = renderer.render_with(
+            AudioRenderPriority::Foreground,
+            &|| cancelled.load(Ordering::SeqCst),
+            || {
+                cancelled.store(true, Ordering::SeqCst);
+                Err::<(), _>("audio render interrupted".to_owned())
+            },
+        );
+
+        assert!(matches!(result, Err(AudioRenderError::Cancelled)));
     }
 }

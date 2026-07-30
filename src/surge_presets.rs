@@ -78,7 +78,7 @@ fn catalog_for_root(root: &Path) -> Arc<Vec<Preset>> {
     }
 
     let mut presets = Vec::new();
-    collect_presets(root, root, &mut presets);
+    collect_presets(root, &mut presets);
     presets.sort_by(|left, right| {
         left.category
             .cmp(&right.category)
@@ -175,39 +175,50 @@ fn factory_root() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_dir())
 }
 
-fn collect_presets(root: &Path, directory: &Path, presets: &mut Vec<Preset>) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_presets(root, &path, presets);
-            continue;
-        }
-        if path.extension().and_then(|extension| extension.to_str()) != Some("fxp") {
-            continue;
-        }
-        let Ok(relative) = path.strip_prefix(root) else {
+fn collect_presets(root: &Path, presets: &mut Vec<Preset>) {
+    let mut directories = vec![root.to_owned()];
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
             continue;
         };
-        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let category = relative
-            .parent()
-            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
-            .filter(|category| !category.is_empty())
-            .unwrap_or_else(|| "Uncategorized".to_owned());
-        if category == "FX" && name == "Aggero" {
-            continue;
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if !file_type.is_file()
+                || path.extension().and_then(|extension| extension.to_str()) != Some("fxp")
+            {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let category = relative
+                .parent()
+                .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+                .filter(|category| !category.is_empty())
+                .unwrap_or_else(|| "Uncategorized".to_owned());
+            if category == "FX" && name == "Aggero" {
+                continue;
+            }
+            presets.push(Preset {
+                id: format!("{FACTORY_PREFIX}{category}/{name}"),
+                category,
+                name: name.to_owned(),
+                path,
+            });
         }
-        presets.push(Preset {
-            id: format!("{FACTORY_PREFIX}{category}/{name}"),
-            category,
-            name: name.to_owned(),
-            path,
-        });
     }
 }
 
@@ -225,6 +236,8 @@ mod tests {
         let pads = root.join("Pads");
         fs::create_dir_all(&pads).expect("preset fixture directory");
         fs::write(pads.join("Cached.fxp"), b"fixture").expect("preset fixture");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, root.join("loop")).expect("preset fixture symlink loop");
 
         let first = catalog_for_root(&root);
         let second = catalog_for_root(&root);

@@ -679,10 +679,9 @@ fn parse_clip(
             "MIDI clips support at most {MAX_MIDI_EVENTS_PER_CLIP} events"
         )));
     }
-    let mut clip_event_ids = HashSet::new();
     let events = event_values
         .iter()
-        .map(|value| parse_clip_event(value, loop_beats, &mut clip_event_ids, event_ids))
+        .map(|value| parse_clip_event(value, loop_beats, event_ids))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Clip {
         id,
@@ -700,12 +699,10 @@ fn parse_clip(
 fn parse_clip_event(
     value: &JsonValue,
     loop_beats: f32,
-    clip_event_ids: &mut HashSet<u64>,
     event_ids: &mut HashSet<u64>,
 ) -> Result<ClipEvent, ProjectFileError> {
     let event = object(value, "MIDI event")?;
-    let id = unique_id(event, "id", clip_event_ids, "MIDI event")?;
-    event_ids.insert(id);
+    let id = unique_id(event, "id", event_ids, "MIDI event")?;
     let kind = limited_string(event, "type", 1, 32)?;
     if kind != "note" {
         return Err(invalid("MIDI event type must be note"));
@@ -1042,6 +1039,17 @@ mod tests {
         let original = Project::demo();
         let parsed = parse_project(&original.to_json()).expect("valid demo graph");
         assert_eq!(parsed.to_json(), original.to_json());
+    }
+
+    #[test]
+    fn rejects_duplicate_midi_event_ids_across_clips() {
+        let mut project: JsonValue =
+            serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
+        project["clips"][1]["events"][0]["id"] = project["clips"][0]["events"][0]["id"].clone();
+
+        let error = parse_project(&project.to_string()).expect_err("duplicate MIDI event ID");
+
+        assert!(error.to_string().contains("duplicate sound graph ID"));
     }
 
     #[test]

@@ -436,7 +436,8 @@ pub(crate) fn session_summaries_in(root: &Path) -> io::Result<Vec<JsonValue>> {
         let Some(entry) = tolerate_missing(entry)? else {
             continue;
         };
-        let path = entry.path().join(SESSION_FILE);
+        let session_path = entry.path();
+        let path = session_path.join(SESSION_FILE);
         if !path.is_file() {
             continue;
         }
@@ -448,6 +449,9 @@ pub(crate) fn session_summaries_in(root: &Path) -> io::Result<Vec<JsonValue>> {
         let Ok(value) = serde_json::from_str::<JsonValue>(&source) else {
             continue;
         };
+        if !valid_session_metadata(&session_path, &value) {
+            continue;
+        }
         sessions.push(value);
     }
     sessions.sort_by_key(|session| {
@@ -504,10 +508,27 @@ pub(crate) fn apply_session_retention_with(
             continue;
         };
         let mut running = metadata.get("status").and_then(JsonValue::as_str) == Some("running");
+        let now_milliseconds = unix_milliseconds_at(now);
+        let mut metadata_changed = false;
+        for field in ["createdAt", "updatedAt"] {
+            let time = metadata
+                .get(field)
+                .and_then(JsonValue::as_u64)
+                .and_then(|milliseconds| {
+                    UNIX_EPOCH.checked_add(Duration::from_millis(milliseconds))
+                });
+            if time.is_none_or(|time| time > now) {
+                metadata
+                    .as_object_mut()
+                    .expect("validated session metadata is an object")
+                    .insert(field.to_owned(), now_milliseconds.into());
+                metadata_changed = true;
+            }
+        }
         let mut updated = metadata
             .get("updatedAt")
             .and_then(JsonValue::as_u64)
-            .map(|milliseconds| UNIX_EPOCH + Duration::from_millis(milliseconds))
+            .and_then(|milliseconds| UNIX_EPOCH.checked_add(Duration::from_millis(milliseconds)))
             .unwrap_or(UNIX_EPOCH);
         if running && now.duration_since(updated).unwrap_or_default() > RUNNING_SESSION_LEASE {
             let object = metadata
@@ -518,10 +539,13 @@ pub(crate) fn apply_session_retention_with(
                 "detail".to_owned(),
                 JsonValue::String("Session abandoned after the edit worker stopped".to_owned()),
             );
-            object.insert("updatedAt".to_owned(), unix_milliseconds().into());
-            write_replace(&metadata_path, &metadata.to_string())?;
+            object.insert("updatedAt".to_owned(), now_milliseconds.into());
             running = false;
             updated = now;
+            metadata_changed = true;
+        }
+        if metadata_changed {
+            write_replace(&metadata_path, &metadata.to_string())?;
         }
         sessions.push(RetainedSession {
             bytes: directory_bytes(&entry.path())?,
@@ -642,8 +666,11 @@ fn configured_u64(name: &str, default: u64) -> u64 {
 }
 
 fn unix_milliseconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    unix_milliseconds_at(SystemTime::now())
+}
+
+fn unix_milliseconds_at(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .try_into()
@@ -773,6 +800,46 @@ mod tests {
         )
         .expect("saved session JSON");
         assert_eq!(saved["status"], "failed");
+        fs::remove_dir_all(root).expect("remove session test directory");
+    }
+
+    #[test]
+    fn retention_normalizes_future_session_timestamps() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-future-session-{}-{}",
+            std::process::id(),
+            SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let future = root.join("future");
+        fs::create_dir_all(&future).expect("future session");
+        write_new(
+            &future.join(SESSION_FILE),
+            &serde_json::json!({
+                "id":"future",
+                "status":"completed",
+                "createdAt":u64::MAX,
+                "updatedAt":u64::MAX
+            })
+            .to_string(),
+        )
+        .expect("future metadata");
+        write_new(&future.join(GRAPH_FILE), "{}").expect("session graph marker");
+        write_new(&future.join(REQUEST_FILE), "{}").expect("session request marker");
+
+        let sessions = session_summaries_in(&root).expect("normalized session summaries");
+        let now = unix_milliseconds();
+
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions[0]["createdAt"]
+                .as_u64()
+                .is_some_and(|value| value <= now)
+        );
+        assert!(
+            sessions[0]["updatedAt"]
+                .as_u64()
+                .is_some_and(|value| value <= now)
+        );
         fs::remove_dir_all(root).expect("remove session test directory");
     }
 
