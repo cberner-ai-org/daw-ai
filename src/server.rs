@@ -2339,6 +2339,7 @@ const fn studio_error_message(error: StudioError) -> &'static str {
         StudioError::UnknownSoundTool => "sound tool not found",
         StudioError::InvalidSoundTool => "invalid sound tool setting",
         StudioError::EffectCapacity => "Surge XT effect chain is full",
+        StudioError::ClipCapacity => "MIDI clip limit reached",
     }
 }
 
@@ -2632,6 +2633,17 @@ mod tests {
                 .status,
             422
         );
+    }
+
+    #[test]
+    fn history_checkout_requires_a_trusted_origin() {
+        let router = Router::demo();
+        let mut hostile = request("POST", "/api/history", "index=0");
+        hostile
+            .headers
+            .insert("origin".to_owned(), "http://attacker.invalid".to_owned());
+
+        assert_eq!(router.handle(&hostile).status, 403);
     }
 
     #[test]

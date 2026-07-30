@@ -1,18 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde_json::{Map, Value as JsonValue};
 
 use crate::model::{
-    Clip, ClipEvent, Edit, EditOperation, Effect, Instrument, KeyZone, MAX_MIDI_EVENTS_PER_CLIP,
-    MAX_PROMPT_CHARACTERS, MIN_MIDI_NOTE_BEATS, Modulator, PROJECT_SCHEMA_VERSION, Project,
-    ProjectFileError, Routing, SURGE_ENGINE, Track, valid_operation_id, valid_surge_preset,
+    CLIP_LIMIT, Clip, ClipEvent, EDIT_LOG_LIMIT, Edit, EditOperation, Effect, Instrument,
+    KEY_ZONE_LIMIT, KeyZone, MAX_MIDI_EVENTS_PER_CLIP, MAX_PROMPT_CHARACTERS, MIN_MIDI_NOTE_BEATS,
+    Modulator, PROJECT_SCHEMA_VERSION, Project, ProjectFileError, Routing, SURGE_ENGINE,
+    TRACK_LIMIT, Track, valid_operation_id, valid_surge_preset,
 };
 
-const MAX_TRACKS: usize = 128;
 const MAX_TOOLS_PER_TRACK: usize = 256;
-const MAX_CLIPS: usize = 2_048;
-const MAX_KEY_ZONES: usize = 2_048;
-const MAX_EDITS: usize = 10_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 type Object = Map<String, JsonValue>;
@@ -36,9 +33,9 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     }
     let version = integer(root, "version")?;
     let track_values = array(root, "tracks")?;
-    if track_values.is_empty() || track_values.len() > MAX_TRACKS {
+    if track_values.is_empty() || track_values.len() > TRACK_LIMIT {
         return Err(invalid(format!(
-            "tracks must contain between 1 and {MAX_TRACKS} entries"
+            "tracks must contain between 1 and {TRACK_LIMIT} entries"
         )));
     }
 
@@ -66,9 +63,9 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     let rack = object(field(root, "instrumentRack")?, "instrument rack")?;
     expect_type(rack, "instrumentRack")?;
     let zone_values = array(rack, "keyZones")?;
-    if zone_values.len() > MAX_KEY_ZONES {
+    if zone_values.len() > KEY_ZONE_LIMIT {
         return Err(invalid(format!(
-            "instrument rack supports at most {MAX_KEY_ZONES} key zones"
+            "instrument rack supports at most {KEY_ZONE_LIMIT} key zones"
         )));
     }
     let key_zones = zone_values
@@ -77,9 +74,9 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .map(|(index, value)| parse_key_zone(value, index, &instrument_ids, &mut ids))
         .collect::<Result<Vec<_>, _>>()?;
     let clip_values = array(root, "clips")?;
-    if clip_values.len() > MAX_CLIPS {
+    if clip_values.len() > CLIP_LIMIT {
         return Err(invalid(format!(
-            "sound graph supports at most {MAX_CLIPS} MIDI clips"
+            "sound graph supports at most {CLIP_LIMIT} MIDI clips"
         )));
     }
     let clips = clip_values
@@ -87,9 +84,9 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .map(|value| parse_clip(value, duration, &mut ids))
         .collect::<Result<Vec<_>, _>>()?;
     let edit_values = array(root, "edits")?;
-    if edit_values.len() > MAX_EDITS {
+    if edit_values.len() > EDIT_LOG_LIMIT {
         return Err(invalid(format!(
-            "edits supports at most {MAX_EDITS} entries"
+            "edits supports at most {EDIT_LOG_LIMIT} entries"
         )));
     }
     let edits = edit_values
@@ -98,9 +95,9 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .map(|(index, value)| parse_edit(value, index, duration, &mut ids))
         .collect::<Result<Vec<_>, _>>()?;
     let operation_values = array(root, "editOperations")?;
-    if operation_values.len() > MAX_EDITS {
+    if operation_values.len() > EDIT_LOG_LIMIT {
         return Err(invalid(format!(
-            "editOperations supports at most {MAX_EDITS} entries"
+            "editOperations supports at most {EDIT_LOG_LIMIT} entries"
         )));
     }
     let edit_operations = operation_values
@@ -115,9 +112,6 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     {
         return Err(invalid("edit operation records must be unique"));
     }
-    let mut clips = clips;
-    migrate_legacy_clip_event_ids(&mut clips, &ids)?;
-
     Ok(Project {
         name,
         bpm: bpm as u16,
@@ -295,7 +289,9 @@ fn parse_effect(
             continue;
         }
         if !native_parameters.contains_key(parameter) {
-            continue;
+            return Err(invalid(format!(
+                "effect parameter {parameter} is unavailable"
+            )));
         }
         let value = value
             .as_f64()
@@ -314,18 +310,16 @@ fn parse_effect(
         .ok_or_else(|| invalid("effect overrides must be an array"))?;
     let parameter_overrides = override_values
         .iter()
-        .filter_map(|value| {
+        .map(|value| {
             let parameter = value
                 .as_str()
-                .ok_or_else(|| invalid("effect overrides must be strings"));
-            let parameter = match parameter {
-                Ok(name) => name,
-                Err(error) => return Some(Err(error)),
-            };
+                .ok_or_else(|| invalid("effect overrides must be strings"))?;
             if parameter != "mix" && !serialized_parameters.contains_key(parameter) {
-                return None;
+                return Err(invalid(format!(
+                    "effect override {parameter} is unavailable"
+                )));
             }
-            Some(Ok(parameter.to_owned()))
+            Ok(parameter.to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
     let extra_parameters = serialized_parameters;
@@ -674,10 +668,9 @@ fn parse_clip(
             "MIDI clips support at most {MAX_MIDI_EVENTS_PER_CLIP} events"
         )));
     }
-    let mut event_ids = HashSet::new();
     let events = event_values
         .iter()
-        .map(|value| parse_clip_event(value, loop_beats, &mut event_ids))
+        .map(|value| parse_clip_event(value, loop_beats, ids))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Clip {
         id,
@@ -692,58 +685,13 @@ fn parse_clip(
     })
 }
 
-fn migrate_legacy_clip_event_ids(
-    clips: &mut [Clip],
-    object_ids: &HashSet<u64>,
-) -> Result<(), ProjectFileError> {
-    let reserved_ids = clips
-        .iter()
-        .flat_map(|clip| clip.events.iter().map(|event| event.id))
-        .collect::<HashSet<_>>();
-    if !object_ids.is_disjoint(&reserved_ids) {
-        return Err(invalid(
-            "MIDI event IDs must not collide with sound graph object IDs",
-        ));
-    }
-
-    let mut seen = HashMap::with_capacity(reserved_ids.len());
-    let mut next_id = 1;
-    for event in clips.iter_mut().flat_map(|clip| &mut clip.events) {
-        let signature = (
-            event.time.to_bits(),
-            event.duration.to_bits(),
-            event.pitch,
-            event.velocity.to_bits(),
-        );
-        let Some(previous) = seen.get(&event.id) else {
-            seen.insert(event.id, signature);
-            continue;
-        };
-        if *previous != signature {
-            return Err(invalid(format!("duplicate sound graph ID: {}", event.id)));
-        }
-        while next_id <= MAX_SAFE_INTEGER
-            && (object_ids.contains(&next_id) || reserved_ids.contains(&next_id))
-        {
-            next_id += 1;
-        }
-        if next_id > MAX_SAFE_INTEGER {
-            return Err(invalid("MIDI event ID namespace is exhausted"));
-        }
-        event.id = next_id;
-        seen.insert(next_id, signature);
-        next_id += 1;
-    }
-    Ok(())
-}
-
 fn parse_clip_event(
     value: &JsonValue,
     loop_beats: f32,
-    event_ids: &mut HashSet<u64>,
+    ids: &mut HashSet<u64>,
 ) -> Result<ClipEvent, ProjectFileError> {
     let event = object(value, "MIDI event")?;
-    let id = unique_id(event, "id", event_ids, "MIDI event")?;
+    let id = unique_id(event, "id", ids, "MIDI event")?;
     let kind = limited_string(event, "type", 1, 32)?;
     if kind != "note" {
         return Err(invalid("MIDI event type must be note"));
@@ -802,9 +750,9 @@ fn parse_edit_operation(
         return Err(invalid(format!("{context} ID is invalid")));
     }
     let applied_steps = integer(operation, "appliedSteps")?;
-    if applied_steps == 0 || applied_steps > MAX_EDITS as u64 {
+    if applied_steps == 0 || applied_steps > EDIT_LOG_LIMIT as u64 {
         return Err(invalid(format!(
-            "{context} appliedSteps must be between 1 and {MAX_EDITS}"
+            "{context} appliedSteps must be between 1 and {EDIT_LOG_LIMIT}"
         )));
     }
     let project_version = integer(operation, "projectVersion")?;
@@ -1094,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_split_clip_event_ids() {
+    fn rejects_duplicate_midi_event_ids_in_split_clips() {
         let mut project: JsonValue =
             serde_json::from_str(&Project::demo().to_json()).expect("demo JSON");
         let mut right = project["clips"][0].clone();
@@ -1106,17 +1054,8 @@ mod tests {
             .expect("project clips")
             .push(right);
 
-        let migrated = parse_project(&project.to_string()).expect("legacy split project");
-        let left = &migrated.clips[0];
-        let right = migrated.clips.last().expect("right clip fragment");
-
-        assert!(
-            left.events
-                .iter()
-                .zip(&right.events)
-                .all(|(left, right)| left.id != right.id)
-        );
-        parse_project(&migrated.to_json()).expect("migrated project round trip");
+        let error = parse_project(&project.to_string()).expect_err("duplicate MIDI event IDs");
+        assert!(error.to_string().contains("duplicate sound graph ID"));
     }
 
     #[test]
@@ -1190,6 +1129,38 @@ mod tests {
         project["tracks"][0]["instrument"]["nativeOverrides"] = serde_json::json!({"999999": 0.5});
         let error = parse_project(&project.to_string()).expect_err("unknown native parameter");
         assert!(error.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn rejects_unknown_effect_parameters_and_overrides() {
+        let project = project_with_eq();
+        let mut unknown_parameter: JsonValue =
+            serde_json::from_str(&project.to_json()).expect("effect project JSON");
+        unknown_parameter["tracks"][1]["effects"][0]["parameters"]
+            .as_object_mut()
+            .expect("effect parameters")
+            .insert("removedParameter".to_owned(), JsonValue::from(0.5));
+        let error =
+            parse_project(&unknown_parameter.to_string()).expect_err("unknown effect parameter");
+        assert!(
+            error
+                .to_string()
+                .contains("removedParameter is unavailable")
+        );
+
+        let mut unknown_override: JsonValue =
+            serde_json::from_str(&project.to_json()).expect("effect project JSON");
+        unknown_override["tracks"][1]["effects"][0]["overrides"]
+            .as_array_mut()
+            .expect("effect overrides")
+            .push(JsonValue::String("removedParameter".to_owned()));
+        let error =
+            parse_project(&unknown_override.to_string()).expect_err("unknown effect override");
+        assert!(
+            error
+                .to_string()
+                .contains("removedParameter is unavailable")
+        );
     }
 
     #[test]

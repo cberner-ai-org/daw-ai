@@ -315,10 +315,12 @@ impl Drop for EditSession {
     }
 }
 
-pub(crate) fn wait_for_progress_handoff(session_path: &Path) {
+pub(crate) fn ensure_progress_handoff_consumed(session_path: &Path) -> Result<(), String> {
     let path = progress_path(session_path);
-    while path.exists() {
-        std::thread::sleep(Duration::from_millis(10));
+    match path.symlink_metadata() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err("previous Gemini edit progress has not been consumed".to_owned()),
+        Err(error) => Err(format!("could not inspect Gemini edit progress: {error}")),
     }
 }
 

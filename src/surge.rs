@@ -239,13 +239,13 @@ impl Engine {
         Err(format!("Not a Surge XT modulation target: {target}"))
     }
 
-    pub(crate) fn play_note(&mut self, key: u8, velocity: f32, note_id: u64) {
+    pub(crate) fn play_note(&mut self, key: u8, velocity: f32, note_id: i32) {
         self.synth.play_note(
             0,
             key.min(127) as i8,
             (velocity.clamp(0.0, 1.0) * 127.0).round() as i8,
             0,
-            note_id as i32,
+            note_id,
             0,
         );
     }
@@ -277,9 +277,8 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn release_note(&mut self, key: u8, note_id: u64) {
-        self.synth
-            .release_note(0, key.min(127) as i8, 0, note_id as i32);
+    pub(crate) fn release_note(&mut self, key: u8, note_id: i32) {
+        self.synth.release_note(0, key.min(127) as i8, 0, note_id);
     }
 
     pub(crate) fn set_parameter(&mut self, graph_name: &str, value: f32) -> Result<(), String> {
@@ -1008,7 +1007,7 @@ mod tests {
     fn probe_factory_preset_in_isolated_process() {
         fn render_probe(engine: &mut Engine) -> Vec<f32> {
             for (note_id, pitch) in [36, 60, 84].into_iter().enumerate() {
-                engine.play_note(pitch, 0.7, note_id as u64 + 1);
+                engine.play_note(pitch, 0.7, note_id as i32 + 1);
             }
             (0..256)
                 .flat_map(|_| engine.process()[0])
