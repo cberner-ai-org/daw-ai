@@ -193,10 +193,6 @@ fn migrate_schema_five(value: &mut JsonValue) -> Result<(), ProjectFileError> {
         }
         instrument_pitches.push((instrument_id, pitches));
     }
-    if instrument_pitches.len() == 1 && !instrument_pitches[0].1.iter().any(|used| *used) {
-        instrument_pitches[0].1.fill(true);
-    }
-
     let mut zone_specs = instrument_pitches
         .iter()
         .flat_map(|(instrument_id, pitches)| {
@@ -1379,11 +1375,7 @@ mod tests {
         empty["tracks"][0]["clips"] = JsonValue::Array(Vec::new());
         let empty = parse_project(&empty.to_string()).expect("migrated empty project");
         assert!(empty.clips.is_empty());
-        assert_eq!(empty.key_zones.len(), 1);
-        assert_eq!(
-            (empty.key_zones[0].low_note, empty.key_zones[0].high_note),
-            (0, 127)
-        );
+        assert!(empty.key_zones.is_empty());
 
         let mut overlapping: JsonValue = serde_json::from_str(&schema_five_demo_source_for_test())
             .expect("schema five project JSON");
