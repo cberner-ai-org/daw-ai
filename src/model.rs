@@ -4,9 +4,10 @@ use std::fmt::{self, Write};
 use serde::Serialize;
 
 const TRACK_LIMIT: usize = 128;
+const KEY_ZONE_LIMIT: usize = 2_048;
 pub(crate) const EDIT_LOG_LIMIT: usize = 10_000;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
-pub(crate) const PROJECT_SCHEMA_VERSION: u64 = 5;
+pub(crate) const PROJECT_SCHEMA_VERSION: u64 = 6;
 pub(crate) const MAX_MIDI_EVENTS_PER_CLIP: usize = 1_024;
 pub(crate) const MIN_MIDI_NOTE_BEATS: f32 = 0.0625;
 pub(crate) const MAX_LOOP_PLAYBACK_BEATS: f32 = 16.0;
@@ -80,6 +81,14 @@ pub struct Clip {
     pub events: Vec<ClipEvent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyZone {
+    pub id: u64,
+    pub low_note: u8,
+    pub high_note: u8,
+    pub instrument_id: u64,
+}
+
 pub(crate) struct ModulatorSpec<'a> {
     pub target: &'a str,
     pub shape: &'a str,
@@ -131,7 +140,6 @@ pub struct Track {
     pub effects: Vec<Effect>,
     pub modulators: Vec<Modulator>,
     pub routing: Routing,
-    pub clips: Vec<Clip>,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +188,8 @@ pub struct Project {
     pub duration: f32,
     pub version: u64,
     pub tracks: Vec<Track>,
+    pub key_zones: Vec<KeyZone>,
+    pub clips: Vec<Clip>,
     pub edits: Vec<Edit>,
     pub edit_operations: Vec<EditOperation>,
 }
@@ -218,12 +228,20 @@ impl fmt::Display for ProjectFileError {
 
 impl Project {
     pub(crate) fn initial() -> Self {
+        let track = empty_track(1);
         Self {
             name: "Untitled Project".to_owned(),
             bpm: 120,
             duration: 32.0,
             version: 1,
-            tracks: vec![empty_track(1)],
+            key_zones: vec![KeyZone {
+                id: tool_id(1, 2),
+                low_note: 0,
+                high_note: 127,
+                instrument_id: track.instrument.id,
+            }],
+            tracks: vec![track],
+            clips: Vec::new(),
             edits: Vec::new(),
             edit_operations: Vec::new(),
         }
@@ -231,16 +249,42 @@ impl Project {
 
     #[must_use]
     pub fn demo() -> Self {
+        let tracks = vec![
+            demo_track(1, DemoPart::Drums, "Pulse Kit", "#ffb86b"),
+            demo_track(2, DemoPart::Bass, "Soft Current", "#74e0bc"),
+            demo_track(3, DemoPart::Chords, "Glass Chords", "#8ca9ff"),
+        ];
         Self {
             name: "Neon First Light".to_owned(),
             bpm: 112,
             duration: 32.0,
             version: 1,
-            tracks: vec![
-                demo_track(1, DemoPart::Drums, "Pulse Kit", "#ffb86b"),
-                demo_track(2, DemoPart::Bass, "Soft Current", "#74e0bc"),
-                demo_track(3, DemoPart::Chords, "Glass Chords", "#8ca9ff"),
+            key_zones: vec![
+                KeyZone {
+                    id: 102,
+                    low_note: 24,
+                    high_note: 47,
+                    instrument_id: tracks[0].instrument.id,
+                },
+                KeyZone {
+                    id: 202,
+                    low_note: 48,
+                    high_note: 59,
+                    instrument_id: tracks[1].instrument.id,
+                },
+                KeyZone {
+                    id: 302,
+                    low_note: 60,
+                    high_note: 127,
+                    instrument_id: tracks[2].instrument.id,
+                },
             ],
+            clips: vec![
+                demo_clip(11, "Pocket beat", DemoPart::Drums),
+                demo_clip(12, "Warm pulse", DemoPart::Bass),
+                demo_clip(13, "Four-chord glow", DemoPart::Chords),
+            ],
+            tracks,
             edits: Vec::new(),
             edit_operations: Vec::new(),
         }
@@ -260,11 +304,14 @@ impl Project {
             for modulator in &track.modulators {
                 highest = highest.max(modulator.id);
             }
-            for clip in &track.clips {
-                highest = highest.max(clip.id);
-                for event in &clip.events {
-                    highest = highest.max(event.id);
-                }
+        }
+        for zone in &self.key_zones {
+            highest = highest.max(zone.id);
+        }
+        for clip in &self.clips {
+            highest = highest.max(clip.id);
+            for event in &clip.events {
+                highest = highest.max(event.id);
             }
         }
         highest
@@ -319,6 +366,25 @@ impl Project {
                 output.push(',');
             }
             track.write_json(output);
+        }
+        output.push_str("],\"instrumentRack\":{\"type\":\"instrumentRack\",\"keyZones\":[");
+        for (index, zone) in self.key_zones.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            write!(
+                output,
+                "{{\"id\":{},\"lowNote\":{},\"highNote\":{},\"instrumentId\":{}}}",
+                zone.id, zone.low_note, zone.high_note, zone.instrument_id
+            )
+            .expect("writing to a string cannot fail");
+        }
+        output.push_str("]},\"clips\":[");
+        for (index, clip) in self.clips.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            clip.write_json(output);
         }
         output.push(']');
     }
@@ -520,8 +586,7 @@ impl Track {
         output.push_str("],\"routing\":{\"audio\":[");
         write!(
             output,
-            "{},{}",
-            json_string("clips"),
+            "{}",
             json_string(&format!("instrument:{}", self.instrument.id))
         )
         .expect("writing to a string cannot fail");
@@ -556,7 +621,7 @@ impl Track {
         output.push_str(&json_string(&self.routing.output));
         output.push_str(",\"edges\":[");
         let instrument = format!("instrument:{}", self.instrument.id);
-        write_signal_edge(output, false, "clips", &instrument, "midi");
+        let mut wrote_edge = false;
         for modulator in self
             .modulators
             .iter()
@@ -568,13 +633,13 @@ impl Track {
                     modulator.source_track_id.unwrap_or(self.id)
                 ),
                 _ if modulator.source_track_id.is_some_and(|id| id != self.id) => {
-                    format!("track:{}:clips", modulator.source_track_id.unwrap())
+                    format!("track:{}:rack", modulator.source_track_id.unwrap())
                 }
-                _ => "clips".to_owned(),
+                _ => format!("rack:instrument:{}", self.instrument.id),
             };
             write_signal_edge(
                 output,
-                true,
+                wrote_edge,
                 &source,
                 &format!("modulator:{}", modulator.id),
                 if modulator.trigger == "audio" {
@@ -583,14 +648,22 @@ impl Track {
                     "midi"
                 },
             );
+            wrote_edge = true;
         }
         let mut audio_source = instrument;
         for effect_id in &self.routing.effect_order {
             let effect = format!("effect:{effect_id}");
-            write_signal_edge(output, true, &audio_source, &effect, "audio");
+            write_signal_edge(output, wrote_edge, &audio_source, &effect, "audio");
+            wrote_edge = true;
             audio_source = effect;
         }
-        write_signal_edge(output, true, &audio_source, &self.routing.output, "audio");
+        write_signal_edge(
+            output,
+            wrote_edge,
+            &audio_source,
+            &self.routing.output,
+            "audio",
+        );
         for modulator in self.modulators.iter().filter(|modulator| modulator.enabled) {
             write_signal_edge(
                 output,
@@ -600,47 +673,46 @@ impl Track {
                 "control",
             );
         }
-        output.push_str("]},\"clips\":[");
-        for (index, clip) in self.clips.iter().enumerate() {
+        output.push_str("]}}");
+    }
+}
+
+impl Clip {
+    fn write_json(&self, output: &mut String) {
+        write!(
+            output,
+            concat!(
+                "{{\"id\":{},\"label\":{},\"start\":{},\"end\":{},\"sourceStart\":{},",
+                "\"style\":{},\"playback\":{{\"mode\":{},\"lengthBeats\":{}}},\"events\":["
+            ),
+            self.id,
+            json_string(&self.label),
+            decimal(self.start),
+            decimal(self.end),
+            decimal(self.source_start),
+            json_string(&self.style),
+            json_string(&self.playback_mode),
+            decimal(self.loop_beats)
+        )
+        .expect("writing to a string cannot fail");
+        for (index, event) in self.events.iter().enumerate() {
             if index > 0 {
                 output.push(',');
             }
             write!(
                 output,
                 concat!(
-                    "{{\"id\":{},\"label\":{},\"start\":{},\"end\":{},\"sourceStart\":{},",
-                    "\"style\":{},\"playback\":{{\"mode\":{},\"lengthBeats\":{}}},\"events\":["
+                    "{{\"id\":{},\"type\":{},\"time\":{},\"duration\":{},",
+                    "\"pitch\":{},\"velocity\":{}}}"
                 ),
-                clip.id,
-                json_string(&clip.label),
-                decimal(clip.start),
-                decimal(clip.end),
-                decimal(clip.source_start),
-                json_string(&clip.style),
-                json_string(&clip.playback_mode),
-                decimal(clip.loop_beats)
+                event.id,
+                json_string(&event.kind),
+                decimal(event.time),
+                decimal(event.duration),
+                event.pitch,
+                decimal(event.velocity)
             )
             .expect("writing to a string cannot fail");
-            for (event_index, event) in clip.events.iter().enumerate() {
-                if event_index > 0 {
-                    output.push(',');
-                }
-                write!(
-                    output,
-                    concat!(
-                        "{{\"id\":{},\"type\":{},\"time\":{},\"duration\":{},",
-                        "\"pitch\":{},\"velocity\":{}}}"
-                    ),
-                    event.id,
-                    json_string(&event.kind),
-                    decimal(event.time),
-                    decimal(event.duration),
-                    event.pitch,
-                    decimal(event.velocity)
-                )
-                .expect("writing to a string cannot fail");
-            }
-            output.push_str("]}");
         }
         output.push_str("]}");
     }
@@ -787,11 +859,9 @@ impl Studio {
             return Err(StudioError::InvalidDuration);
         }
         self.project.duration = duration;
-        for track in &mut self.project.tracks {
-            track.clips.retain(|clip| clip.start < duration);
-            for clip in &mut track.clips {
-                clip.end = clip.end.min(duration);
-            }
+        self.project.clips.retain(|clip| clip.start < duration);
+        for clip in &mut self.project.clips {
+            clip.end = clip.end.min(duration);
         }
         self.project.edits.retain_mut(|edit| {
             if edit.start >= duration {
@@ -1011,6 +1081,134 @@ impl Studio {
         Ok(())
     }
 
+    pub(crate) fn create_key_zone(
+        &mut self,
+        instrument_id: u64,
+        low_note: u8,
+        high_note: u8,
+    ) -> Result<u64, StudioError> {
+        if low_note > high_note
+            || self.project.key_zones.len() >= KEY_ZONE_LIMIT
+            || !self
+                .project
+                .tracks
+                .iter()
+                .any(|track| track.instrument.id == instrument_id)
+        {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let id = self.take_id();
+        self.project.key_zones.push(KeyZone {
+            id,
+            low_note,
+            high_note,
+            instrument_id,
+        });
+        self.project.version += 1;
+        Ok(id)
+    }
+
+    pub(crate) fn update_key_zone(
+        &mut self,
+        zone_id: u64,
+        instrument_id: u64,
+        low_note: u8,
+        high_note: u8,
+    ) -> Result<(), StudioError> {
+        if low_note > high_note
+            || !self
+                .project
+                .tracks
+                .iter()
+                .any(|track| track.instrument.id == instrument_id)
+        {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let zone = self
+            .project
+            .key_zones
+            .iter_mut()
+            .find(|zone| zone.id == zone_id)
+            .ok_or(StudioError::UnknownSoundTool)?;
+        zone.low_note = low_note;
+        zone.high_note = high_note;
+        zone.instrument_id = instrument_id;
+        self.project.version += 1;
+        Ok(())
+    }
+
+    pub(crate) fn delete_key_zone(&mut self, zone_id: u64) -> Result<(), StudioError> {
+        let index = self
+            .project
+            .key_zones
+            .iter()
+            .position(|zone| zone.id == zone_id)
+            .ok_or(StudioError::UnknownSoundTool)?;
+        self.project.key_zones.remove(index);
+        self.project.version += 1;
+        Ok(())
+    }
+
+    pub(crate) fn add_configured_channel(
+        &mut self,
+        source: &Track,
+        description: &str,
+        color: &str,
+        low_note: u8,
+        high_note: u8,
+    ) -> Result<(u64, u64), StudioError> {
+        let description = description.trim();
+        if self.project.tracks.len() >= TRACK_LIMIT
+            || self.project.key_zones.len() >= KEY_ZONE_LIMIT
+            || description.is_empty()
+            || description.chars().count() > 16
+            || !TRACK_COLOR_PALETTE.contains(&color)
+            || low_note > high_note
+        {
+            return Err(StudioError::InvalidChannel);
+        }
+        let track_id = self.take_id();
+        let mut track = source.clone();
+        track.id = track_id;
+        track.name = description.to_owned();
+        track.color = color.to_owned();
+        track.instrument.id = self.take_id();
+        let mut remapped_effect_ids = BTreeMap::new();
+        for effect in &mut track.effects {
+            let source_id = effect.id;
+            effect.id = self.take_id();
+            remapped_effect_ids.insert(source_id, effect.id);
+        }
+        track.routing.effect_order = source
+            .routing
+            .effect_order
+            .iter()
+            .map(|effect_id| {
+                remapped_effect_ids
+                    .get(effect_id)
+                    .copied()
+                    .ok_or(StudioError::InvalidSoundTool)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for modulator in &mut track.modulators {
+            modulator.id = self.take_id();
+            if modulator.trigger != "free" {
+                modulator.source_track_id = Some(track_id);
+            }
+        }
+        let instrument_id = track.instrument.id;
+        self.project.tracks.push(track);
+        let zone_id = self.take_id();
+        self.project.key_zones.push(KeyZone {
+            id: zone_id,
+            low_note,
+            high_note,
+            instrument_id,
+        });
+        self.project.version += 1;
+        Ok((track_id, zone_id))
+    }
+
     pub fn delete_channel(&mut self, track_id: u64) -> Result<(), StudioError> {
         let Some(index) = self
             .project
@@ -1024,7 +1222,11 @@ impl Studio {
             return Err(StudioError::LastTrack);
         }
 
+        let instrument_id = self.project.tracks[index].instrument.id;
         self.project.tracks.remove(index);
+        self.project
+            .key_zones
+            .retain(|zone| zone.instrument_id != instrument_id);
         for track in &mut self.project.tracks {
             track
                 .modulators
@@ -1036,7 +1238,6 @@ impl Studio {
 
     pub(crate) fn delete_midi_clip(
         &mut self,
-        track_id: u64,
         clip_id: u64,
         selection_start: f32,
         selection_end: f32,
@@ -1045,17 +1246,12 @@ impl Studio {
             return Err(StudioError::InvalidSoundTool);
         }
         let mut project = self.project.clone();
-        let track_index = project
-            .tracks
-            .iter()
-            .position(|track| track.id == track_id)
-            .ok_or(StudioError::UnknownTrack)?;
-        let clip_index = project.tracks[track_index]
+        let clip_index = project
             .clips
             .iter()
             .position(|clip| clip.id == clip_id)
             .ok_or(StudioError::UnknownSoundTool)?;
-        let original = project.tracks[track_index].clips.remove(clip_index);
+        let original = project.clips.remove(clip_index);
         if original.end <= selection_start + TIMELINE_EPSILON_SECONDS
             || original.start >= selection_end - TIMELINE_EPSILON_SECONDS
         {
@@ -1075,8 +1271,8 @@ impl Studio {
             right.start = selection_end;
             retained.push(right);
         }
-        project.tracks[track_index].clips.extend(retained);
-        project.tracks[track_index]
+        project.clips.extend(retained);
+        project
             .clips
             .sort_by(|left, right| left.start.total_cmp(&right.start));
         project.version = self.project.version + 1;
@@ -1084,14 +1280,7 @@ impl Studio {
         Ok(())
     }
 
-    pub(crate) fn create_midi_clip(
-        &mut self,
-        track_id: u64,
-        spec: &MidiClipSpec,
-    ) -> Result<u64, StudioError> {
-        if !self.project.tracks.iter().any(|track| track.id == track_id) {
-            return Err(StudioError::UnknownTrack);
-        }
+    pub(crate) fn create_midi_clip(&mut self, spec: &MidiClipSpec) -> Result<u64, StudioError> {
         validate_clip_fields(
             &spec.label,
             spec.start,
@@ -1114,13 +1303,7 @@ impl Studio {
                 velocity: note.velocity,
             })
             .collect();
-        let track = self
-            .project
-            .tracks
-            .iter_mut()
-            .find(|track| track.id == track_id)
-            .expect("track was validated");
-        track.clips.push(Clip {
+        self.project.clips.push(Clip {
             id: clip_id,
             label: spec.label.trim().to_owned(),
             start: spec.start,
@@ -1131,7 +1314,7 @@ impl Studio {
             loop_beats: spec.loop_beats,
             events,
         });
-        track
+        self.project
             .clips
             .sort_by(|left, right| left.start.total_cmp(&right.start));
         self.project.version += 1;
@@ -1140,7 +1323,6 @@ impl Studio {
 
     pub(crate) fn replace_midi_clip(
         &mut self,
-        track_id: u64,
         clip_id: u64,
         spec: &MidiClipSpec,
         selection_start: f32,
@@ -1162,17 +1344,12 @@ impl Studio {
             return Err(StudioError::InvalidSoundTool);
         }
         let mut project = self.project.clone();
-        let track_index = project
-            .tracks
-            .iter()
-            .position(|track| track.id == track_id)
-            .ok_or(StudioError::UnknownTrack)?;
-        let clip_index = project.tracks[track_index]
+        let clip_index = project
             .clips
             .iter()
             .position(|clip| clip.id == clip_id)
             .ok_or(StudioError::UnknownSoundTool)?;
-        let original = project.tracks[track_index].clips.remove(clip_index);
+        let original = project.clips.remove(clip_index);
         if original.end <= selection_start + TIMELINE_EPSILON_SECONDS
             || original.start >= selection_end - TIMELINE_EPSILON_SECONDS
         {
@@ -1219,9 +1396,8 @@ impl Studio {
             right.start = spec.end;
             replacements.push(right);
         }
-        let track = &mut project.tracks[track_index];
-        track.clips.extend(replacements);
-        track
+        project.clips.extend(replacements);
+        project
             .clips
             .sort_by(|left, right| left.start.total_cmp(&right.start));
         project.version = self.project.version + 1;
@@ -1314,9 +1490,9 @@ impl Studio {
         let scale = f32::from(self.project.bpm) / f32::from(bpm);
         let required_duration = self
             .project
-            .tracks
+            .clips
             .iter()
-            .flat_map(|track| track.clips.iter().map(|clip| clip.end))
+            .map(|clip| clip.end)
             .chain(self.project.edits.iter().map(|edit| edit.end))
             .fold(0.0_f32, f32::max)
             * scale;
@@ -1324,12 +1500,10 @@ impl Studio {
             return Err(StudioError::InvalidDuration);
         }
         self.project.duration = self.project.duration.max(required_duration);
-        for track in &mut self.project.tracks {
-            for clip in &mut track.clips {
-                clip.start *= scale;
-                clip.end *= scale;
-                clip.source_start *= scale;
-            }
+        for clip in &mut self.project.clips {
+            clip.start *= scale;
+            clip.end *= scale;
+            clip.source_start *= scale;
         }
         for edit in &mut self.project.edits {
             edit.start *= scale;
@@ -1577,7 +1751,7 @@ fn configure_track_tool(
     track: &mut Track,
     tool: &str,
     tool_id: u64,
-    clip_id: Option<u64>,
+    _clip_id: Option<u64>,
     parameter: &str,
     value: &str,
 ) -> Result<(), StudioError> {
@@ -1695,34 +1869,6 @@ fn configure_track_tool(
                 "enabled" => modulator.enabled = parse_bool(value)?,
                 _ => return Err(StudioError::InvalidSoundTool),
             }
-            Ok(())
-        }
-        "event" => {
-            let clip = track
-                .clips
-                .iter_mut()
-                .find(|clip| Some(clip.id) == clip_id)
-                .ok_or(StudioError::UnknownSoundTool)?;
-            let event = clip
-                .events
-                .iter_mut()
-                .find(|event| event.id == tool_id)
-                .ok_or(StudioError::UnknownSoundTool)?;
-            match parameter {
-                "time" => event.time = parse_range_exclusive(value, 0.0, clip.loop_beats)?,
-                "duration" => {
-                    event.duration = parse_range(
-                        value,
-                        MIN_MIDI_NOTE_BEATS,
-                        clip.loop_beats.min(MAX_MIDI_NOTE_DURATION_BEATS),
-                    )?
-                }
-                "pitch" => event.pitch = parse_integer_range(value, 0, 127)? as u8,
-                "velocity" => event.velocity = parse_range(value, 0.01, 1.0)?,
-                _ => return Err(StudioError::InvalidSoundTool),
-            }
-            clip.events
-                .sort_by(|left, right| left.time.total_cmp(&right.time));
             Ok(())
         }
         "routing" if parameter == "position" => {
@@ -1865,14 +2011,6 @@ fn parse_range(value: &str, minimum: f32, maximum: f32) -> Result<f32, StudioErr
         .ok_or(StudioError::InvalidSoundTool)
 }
 
-fn parse_range_exclusive(value: &str, minimum: f32, maximum: f32) -> Result<f32, StudioError> {
-    value
-        .parse::<f32>()
-        .ok()
-        .filter(|value| value.is_finite() && *value >= minimum && *value < maximum)
-        .ok_or(StudioError::InvalidSoundTool)
-}
-
 fn parse_integer_range(value: &str, minimum: u64, maximum: u64) -> Result<u64, StudioError> {
     value
         .parse::<u64>()
@@ -1972,18 +2110,6 @@ fn demo_track(id: u64, role: DemoPart, name: &str, color: &str) -> Track {
     let mut track = demo_role_track(id, role);
     track.name = name.to_owned();
     track.color = color.to_owned();
-    track.clips = vec![clip(
-        id + 10,
-        match role {
-            DemoPart::Drums => "Pocket beat",
-            DemoPart::Bass => "Warm pulse",
-            DemoPart::Chords => "Four-chord glow",
-        },
-        0.0,
-        32.0,
-        "foundation",
-        role,
-    )];
     track.modulators.clear();
     #[cfg(test)]
     if let Some(parameter) = crate::surge::instrument_parameters_for_instrument(&track.instrument)
@@ -2018,7 +2144,6 @@ fn empty_track(id: u64) -> Track {
     track.effects.clear();
     track.modulators.clear();
     track.routing.effect_order.clear();
-    track.clips.clear();
     track
 }
 
@@ -2042,7 +2167,6 @@ fn generated_track(id: u64) -> Track {
             effect_order: Vec::new(),
             output: "master".to_owned(),
         },
-        clips: Vec::new(),
     }
 }
 
@@ -2077,18 +2201,17 @@ fn demo_role_track(id: u64, role: DemoPart) -> Track {
             effect_order: Vec::new(),
             output: "master".to_owned(),
         },
-        clips: Vec::new(),
     }
 }
 
-fn clip(id: u64, label: &str, start: f32, end: f32, style: &str, role: DemoPart) -> Clip {
+fn demo_clip(id: u64, label: &str, role: DemoPart) -> Clip {
     Clip {
         id,
         label: label.to_owned(),
-        start,
-        end,
-        source_start: start,
-        style: style.to_owned(),
+        start: 0.0,
+        end: 32.0,
+        source_start: 0.0,
+        style: "foundation".to_owned(),
         playback_mode: "loop".to_owned(),
         loop_beats: 4.0,
         events: pattern_events(id, role),
@@ -2104,18 +2227,18 @@ fn pattern_events(clip_id: u64, role: DemoPart) -> Vec<ClipEvent> {
             ("note", 3.0, 0.25, 36, 0.84),
         ],
         DemoPart::Bass => vec![
-            ("note", 0.0, 0.7, 33, 0.82),
-            ("note", 1.0, 0.7, 33, 0.72),
-            ("note", 2.0, 0.7, 36, 0.78),
-            ("note", 3.0, 0.7, 31, 0.74),
+            ("note", 0.0, 0.7, 50, 0.82),
+            ("note", 1.0, 0.7, 50, 0.72),
+            ("note", 2.0, 0.7, 53, 0.78),
+            ("note", 3.0, 0.7, 48, 0.74),
         ],
         DemoPart::Chords => vec![
-            ("note", 0.0, 1.85, 57, 0.62),
-            ("note", 0.0, 1.85, 60, 0.56),
-            ("note", 0.0, 1.85, 64, 0.54),
-            ("note", 2.0, 1.85, 53, 0.6),
-            ("note", 2.0, 1.85, 57, 0.54),
-            ("note", 2.0, 1.85, 60, 0.52),
+            ("note", 0.0, 1.85, 69, 0.62),
+            ("note", 0.0, 1.85, 72, 0.56),
+            ("note", 0.0, 1.85, 76, 0.54),
+            ("note", 2.0, 1.85, 65, 0.6),
+            ("note", 2.0, 1.85, 69, 0.54),
+            ("note", 2.0, 1.85, 72, 0.52),
         ],
     };
     specs
@@ -2199,7 +2322,9 @@ mod tests {
         let track = &project.tracks[0];
         assert_eq!(track.name, "Empty Track");
         assert_eq!(track.instrument.preset, "Init");
-        assert!(track.clips.is_empty());
+        assert!(project.clips.is_empty());
+        assert_eq!(project.key_zones.len(), 1);
+        assert_eq!(project.key_zones[0].instrument_id, track.instrument.id);
         assert!(track.effects.is_empty());
         assert!(track.modulators.is_empty());
         assert!(track.routing.effect_order.is_empty());
@@ -2221,7 +2346,7 @@ mod tests {
             "Factory/Percussion/Kick 909ish"
         );
         assert!(
-            project.tracks[0].clips[0]
+            project.clips[0]
                 .events
                 .iter()
                 .all(|event| event.pitch == 36)
@@ -2234,18 +2359,20 @@ mod tests {
             project.tracks[2].instrument.preset,
             "Factory/Polysynths/Anthemish 1"
         );
-        assert!(project.tracks.iter().all(|track| !track.clips.is_empty()));
-        assert!(project.tracks.iter().all(|track| {
-            !track.clips[0].events.is_empty()
-                && track.routing.effect_order.len() == track.effects.len()
-        }));
+        assert_eq!(project.clips.len(), 3);
+        assert!(project.clips.iter().all(|clip| !clip.events.is_empty()));
+        assert_eq!(project.key_zones.len(), 3);
+        assert!(
+            project
+                .tracks
+                .iter()
+                .all(|track| track.routing.effect_order.len() == track.effects.len())
+        );
         let json = project.to_json();
         assert!(json.contains("Neon First Light"));
         assert!(json.contains("\"routing\""));
         assert!(json.contains("\"playback\":{\"mode\":\"loop\",\"lengthBeats\":4.0}"));
-        assert!(
-            json.contains("\"source\":\"clips\",\"target\":\"instrument:101\",\"type\":\"midi\"")
-        );
+        assert!(json.contains("\"audio\":[\"instrument:101\""));
     }
 
     #[test]
@@ -2268,13 +2395,13 @@ mod tests {
         let mut studio = Studio::from_project(Project::demo());
         let original_bpm = studio.project().bpm;
         let original_duration = studio.project().duration;
-        let original_clip_start = studio.project().tracks[0].clips[0].start;
-        let original_clip_end = studio.project().tracks[0].clips[0].end;
+        let original_clip_start = studio.project().clips[0].start;
+        let original_clip_end = studio.project().clips[0].end;
 
         studio.set_tempo(60).expect("slower tempo");
 
         let project = studio.project();
-        let clip = &project.tracks[0].clips[0];
+        let clip = &project.clips[0];
         let scale = f32::from(original_bpm) / f32::from(project.bpm);
         assert!(project.duration >= original_duration);
         assert!(project.duration >= clip.end);

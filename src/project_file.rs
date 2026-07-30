@@ -3,14 +3,15 @@ use std::collections::HashSet;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::model::{
-    Clip, ClipEvent, Edit, EditOperation, Effect, Instrument, MAX_MIDI_EVENTS_PER_CLIP,
+    Clip, ClipEvent, Edit, EditOperation, Effect, Instrument, KeyZone, MAX_MIDI_EVENTS_PER_CLIP,
     MAX_PROMPT_CHARACTERS, MIN_MIDI_NOTE_BEATS, Modulator, PROJECT_SCHEMA_VERSION, Project,
     ProjectFileError, Routing, SURGE_ENGINE, Track, valid_operation_id, valid_surge_preset,
 };
 
 const MAX_TRACKS: usize = 128;
 const MAX_TOOLS_PER_TRACK: usize = 256;
-const MAX_CLIPS_PER_TRACK: usize = 2_048;
+const MAX_CLIPS: usize = 2_048;
+const MAX_KEY_ZONES: usize = 2_048;
 const MAX_EDITS: usize = 10_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -45,7 +46,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     let tracks = track_values
         .iter()
         .enumerate()
-        .map(|(index, value)| parse_track(value, index, duration, &mut ids, &mut event_ids))
+        .map(|(index, value)| parse_track(value, index, &mut ids))
         .collect::<Result<Vec<_>, _>>()?;
     let track_ids = tracks.iter().map(|track| track.id).collect::<HashSet<_>>();
     let track_ids = track_ids.into_iter().collect::<Vec<_>>();
@@ -59,6 +60,33 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     for track in &tracks {
         validate_modulator_targets(track)?;
     }
+    let instrument_ids = tracks
+        .iter()
+        .map(|track| track.instrument.id)
+        .collect::<HashSet<_>>();
+    let rack = object(field(root, "instrumentRack")?, "instrument rack")?;
+    expect_type(rack, "instrumentRack")?;
+    let zone_values = array(rack, "keyZones")?;
+    if zone_values.len() > MAX_KEY_ZONES {
+        return Err(invalid(format!(
+            "instrument rack supports at most {MAX_KEY_ZONES} key zones"
+        )));
+    }
+    let key_zones = zone_values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| parse_key_zone(value, index, &instrument_ids, &mut ids))
+        .collect::<Result<Vec<_>, _>>()?;
+    let clip_values = array(root, "clips")?;
+    if clip_values.len() > MAX_CLIPS {
+        return Err(invalid(format!(
+            "sound graph supports at most {MAX_CLIPS} MIDI clips"
+        )));
+    }
+    let clips = clip_values
+        .iter()
+        .map(|value| parse_clip(value, duration, &mut ids, &mut event_ids))
+        .collect::<Result<Vec<_>, _>>()?;
     let edit_values = array(root, "edits")?;
     if edit_values.len() > MAX_EDITS {
         return Err(invalid(format!(
@@ -100,6 +128,8 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         duration,
         version,
         tracks,
+        key_zones,
+        clips,
         edits,
         edit_operations,
     })
@@ -108,9 +138,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
 fn parse_track(
     value: &JsonValue,
     index: usize,
-    project_duration: f32,
     ids: &mut HashSet<u64>,
-    event_ids: &mut HashSet<u64>,
 ) -> Result<Track, ProjectFileError> {
     let context = format!("track {}", index + 1);
     let track = object(value, &context)?;
@@ -199,16 +227,6 @@ fn parse_track(
         id,
     )?;
 
-    let clip_values = array(track, "clips")?;
-    if clip_values.len() > MAX_CLIPS_PER_TRACK {
-        return Err(invalid(format!(
-            "{context} supports at most {MAX_CLIPS_PER_TRACK} clips"
-        )));
-    }
-    let clips = clip_values
-        .iter()
-        .map(|value| parse_clip(value, project_duration, ids, event_ids))
-        .collect::<Result<Vec<_>, _>>()?;
     let parsed = Track {
         id,
         name,
@@ -222,7 +240,6 @@ fn parse_track(
             effect_order,
             output,
         },
-        clips,
     };
     if !crate::model::track_effects_fit(&parsed) {
         return Err(invalid(format!(
@@ -230,6 +247,36 @@ fn parse_track(
         )));
     }
     Ok(parsed)
+}
+
+fn parse_key_zone(
+    value: &JsonValue,
+    index: usize,
+    instrument_ids: &HashSet<u64>,
+    ids: &mut HashSet<u64>,
+) -> Result<KeyZone, ProjectFileError> {
+    let context = format!("key zone {}", index + 1);
+    let zone = object(value, &context)?;
+    let id = unique_id(zone, "id", ids, &context)?;
+    let low_note = bounded_integer(zone, "lowNote", 0, 127)? as u8;
+    let high_note = bounded_integer(zone, "highNote", 0, 127)? as u8;
+    let instrument_id = integer(zone, "instrumentId")?;
+    if low_note > high_note {
+        return Err(invalid(format!(
+            "{context} lowNote must not exceed highNote"
+        )));
+    }
+    if !instrument_ids.contains(&instrument_id) {
+        return Err(invalid(format!(
+            "{context} references an unknown instrument"
+        )));
+    }
+    Ok(KeyZone {
+        id,
+        low_note,
+        high_note,
+        instrument_id,
+    })
 }
 
 fn parse_effect(
@@ -443,13 +490,12 @@ fn parse_effect_order(
     effects: &[Effect],
 ) -> Result<Vec<u64>, ProjectFileError> {
     let audio = array(routing, "audio")?;
-    if audio.len() != effects.len() + 3 {
+    if audio.len() != effects.len() + 2 {
         return Err(invalid(
-            "routing audio chain must include clips, instrument, every effect, and master",
+            "routing audio chain must include instrument, every effect, and master",
         ));
     }
-    if audio[0].as_str() != Some("clips")
-        || audio[1].as_str() != Some(format!("instrument:{instrument_id}").as_str())
+    if audio[0].as_str() != Some(format!("instrument:{instrument_id}").as_str())
         || audio.last().and_then(JsonValue::as_str) != Some("master")
     {
         return Err(invalid("routing audio chain has invalid endpoints"));
@@ -459,7 +505,7 @@ fn parse_effect_order(
         .map(|effect| effect.id)
         .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
-    let order = audio[2..audio.len() - 1]
+    let order = audio[1..audio.len() - 1]
         .iter()
         .map(|value| {
             let id = value
@@ -521,7 +567,7 @@ fn validate_routing_edges(
     owner_track_id: u64,
 ) -> Result<(), ProjectFileError> {
     let instrument = format!("instrument:{instrument_id}");
-    let mut expected = HashSet::from([("clips".to_owned(), instrument.clone(), "midi".to_owned())]);
+    let mut expected = HashSet::new();
     expected.extend(
         modulators
             .iter()
@@ -532,9 +578,9 @@ fn validate_routing_edges(
                     if modulator.trigger == "audio" {
                         format!("track:{source_track_id}:output")
                     } else if source_track_id == owner_track_id {
-                        "clips".to_owned()
+                        format!("rack:instrument:{instrument_id}")
                     } else {
-                        format!("track:{source_track_id}:clips")
+                        format!("track:{source_track_id}:rack")
                     },
                     format!("modulator:{}", modulator.id),
                     modulator.trigger.clone(),

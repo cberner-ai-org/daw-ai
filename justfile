@@ -17,8 +17,5 @@ test: pre
 qa-browser-setup:
   node qa/browser.test.js --check-browser
 
-msrv-test:
-  cargo +1.85.1 test --locked --all-targets --all-features
-
 format:
   cargo fmt

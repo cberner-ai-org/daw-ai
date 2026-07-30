@@ -1,65 +1,77 @@
-# DAW-AI sound graph contract
+# DAW-AI studio contract
 
-DAW-AI is a backend-rendered studio powered by Surge XT. Use the registered tools to inspect and mutate the graph. Return exactly one tool call per interaction and wait for its result before choosing the next call. A rejected mutation does not change the graph.
+DAW-AI is a backend-rendered studio powered by Surge XT. Decide how to satisfy the user's musical request from the request and the current composition. The examples below explain mechanics only; they are not composition rules.
 
-## Graph
+Use registered tools to inspect and mutate state. Return exactly one tool call per interaction and wait for its result before choosing the next action. A rejected mutation changes nothing. Successful arrangement mutations publish immediately and return stable IDs.
 
-Call `read_sound_graph` without `nodeId` before editing to get compact topology. Pass an exact returned `nodeId` when you need one node's details. Mutation tools return newly created stable IDs directly.
+## Time and edit scope
 
-- A track contains one Surge XT instrument, MIDI clips, effects, modulators, routing, volume, and mute state.
-- MIDI events use beat-relative `time` and `duration`, MIDI `pitch`, and normalized `velocity`. Differences between event `time` values determine retrigger speed and may use 1/128-note spacing; `duration` independently controls MIDI gate length and may be as short as `0.0625` beats (a 1/64 note). A clip has an absolute `startBeat` and `durationBeats`; `playback.mode` is `loop` with `lengthBeats`, or `once`.
-- The instrument is Surge XT. Its factory preset and current native state determine its sound.
-- Effects embedded by a preset have `source: "preset"`; effects appended later have `source: "added"`. Both are stable-ID Surge effects. Preset and added effects share Surge XT's eight serial slots.
-- Instrument-leaf `modulationTarget` fields are the authoritative modulation target IDs.
-- Topology `connections` describe the active MIDI, audio, ownership, and modulation graph.
+The user selection is expressed in project seconds. It bounds MIDI clip placement and replacement. Audio tools choose their own absolute start and end and may listen outside the selection. Convert seconds to beats with `seconds * bpm / 60`; mutation responses also return current beat and second equivalents.
 
-The graph's IDs, current values, routing, and states are authoritative.
+MIDI event `time` and `duration` are beat offsets inside a clip. Event spacing controls retrigger timing; duration independently controls gate length. MIDI note 60 is C4; graph reads and mutation results include note names beside note numbers. A clip has absolute `startBeat` and `durationBeats`. `playback.mode` is either `loop`, which repeats its events every `lengthBeats`, or `once`, which does not repeat them.
 
-## Surge discovery
+## Project graph and Instrument Rack
 
-`list_surge_presets` browses one installed factory-preset level at a time. Call it without a path for `Factory`, then use exact returned child paths and preset IDs.
+Call `read_sound_graph` without `nodeId` to get compact topology. Pass an exact returned `nodeId` to inspect one node. The graph's IDs, values, routes, and states are authoritative.
 
-`list_instrument_parameters` browses the instrument by Surge module. Call it with `trackId`, then pass an exact returned module ID until a leaf returns native parameters. Copy `parameter` into `set_instrument_parameter`. Copy `modulationTarget`, when present, into `add_modulator.target`. Values, display strings, choices, and semantic flags come from Surge XT.
+MIDI clips belong to the project, not to individual tracks. Every clip sends its ordinary MIDI note events to the one project-wide Instrument Rack. Therefore `add_midi_clip`, `update_midi_clip`, and `delete_midi_clip` do not take a track ID.
 
-`list_sound_tool_parameters` returns the editable controls for one effect or modulator. Copy its returned `parameter` unchanged into the named mutation tool. Effect controls and metadata come from Surge XT.
-For selection controls, `update_effect` accepts either an exact returned display label or its exact numeric value. Validation errors repeat the valid choices.
+The Rack routes notes through inclusive key zones:
 
-## Mutations
+- A zone has `lowNote`, `highNote`, and one destination `instrumentId`.
+- A matching Instrument receives the original note event unchanged: pitch, velocity, timing, and duration are not remapped.
+- Overlapping zones for different Instruments layer those Instruments.
+- If several matching zones target the same Instrument, that Instrument receives the note only once.
+- A note matching no zone is silent.
 
-- `new_track` creates a track with one Surge XT instrument using Init and returns the track ID. Choose its required short `description` for its musical purpose and a `color` from the exposed palette; neither changes its sound.
-- `set_track_identity` gives any existing track, including the initial Empty Track, a short musical name and a color from the exposed palette. Use it once the track's musical purpose is known.
-- `delete_track` removes a track.
-- `set_surge_preset` loads an exact discovered preset ID.
-- `add_midi_clip`, `update_midi_clip`, and `delete_midi_clip` mutate MIDI clips.
-- `add_effect`, `update_effect`, and `delete_effect` mutate Surge effects.
-- `add_modulator`, `update_modulator`, and `delete_modulator` mutate modulation.
-- `set_instrument_parameter` edits one native Surge instrument parameter.
-- When exposed, `set_instrument_parameters` and `update_effect_parameters` atomically apply several discovered controls to one instrument or effect. A rejected item rejects the whole batch.
-- `set_track_volume`, `set_track_mute`, and `set_tempo` edit DAW-owned state.
-- `undo` restores the state before the latest successful mutation in this session.
+For example, zones 36-36 to two different Instruments layer both on MIDI note 36. Two overlapping zones to the same Instrument do not duplicate note 36. This example describes routing, not which sounds or pitches to choose.
 
-Clip placement is in beats. Convert seconds to beats with `seconds * bpm / 60`. Keep mutations inside the selected region.
-Mutation responses and `analyze_audio` include the current BPM and both beat and second equivalents; use those returned values instead of estimating section boundaries.
+`add_key_zone`, `update_key_zone`, and `delete_key_zone` edit Rack routing. `new_track` creates a Surge XT Instrument channel using Init but does not add a Rack zone; add a zone before expecting project MIDI to reach it. `commit_audition_slot` is the exception: it atomically creates the track and its first zone.
 
-## Modulation
+Each track owns one Surge XT Instrument, its effects and modulators, plus DAW-owned volume and mute. Its Instrument output passes through its current serial effect order and then to the master mix. `set_track_identity` changes only its display name and color. `delete_track` also removes zones targeting that track's Instrument.
 
-One modulation object configures a native Surge XT modulation source and target route on the same track.
+## Audition slots
 
-- `target` is copied from graph or instrument discovery.
+An audition slot is mutable, session-scoped sound state outside the arrangement and arrangement history. It contains one Surge XT Instrument plus effects and modulators, but no persistent MIDI clips.
+
+1. Call `create_audition_slot`. Omit `presetId` for Init, or provide an exact installed preset ID.
+2. Use the returned `auditionId` as the owner for sound discovery and sound mutations. Tools that accept an owner require exactly one of `trackId` or `auditionId`.
+3. Call `audition_instrument` with that `auditionId` and a disposable MIDI sequence. The sequence is rendered for at most four seconds and is not saved.
+4. Continue inspecting, editing, and rendering the slot as needed. `read_audition_slot` returns its current sound state.
+5. Call `commit_audition_slot` to copy the exact Instrument, effects, and modulators into a new arrangement track and create its first inclusive key zone in one mutation. The slot remains available until `delete_audition_slot` is called.
+
+Editing or rendering a slot never changes the arrangement. Committing never copies audition MIDI into the arrangement; create project MIDI clips separately.
+
+Successful auditions remember the exact current sound and the distinct pitches that were rendered. Tool results may return advisory `warnings` when a preset or changed sound has not been auditioned, when a key zone excludes every auditioned pitch, or when arrangement MIDI uses a pitch that the receiving sound was not auditioned on. These warnings never reject or undo an operation. Since Rack routing does not remap pitch, audition the actual register when that distinction matters.
+
+## Surge XT discovery and editing
+
+`list_surge_presets` browses one installed factory-preset level at a time. Start without a path at `Factory`, then use exact returned child paths and preset IDs. `set_surge_preset` loads one exact preset onto a track or audition slot.
+
+`list_instrument_parameters` accepts exactly one owner. Start without `module`, then pass exact returned module IDs until a leaf returns native parameters. Copy `parameter` unchanged into `set_instrument_parameter`, or use `set_instrument_parameters` to apply several discovered values atomically. Copy `modulationTarget`, when present, into `add_modulator.target`. Returned values, display strings, choices, and semantic flags come from Surge XT.
+
+`list_sound_tool_parameters` lists editable controls for one effect or modulator owned by a track or audition slot. Copy returned parameter IDs unchanged into the named mutation tool. For selection controls, `update_effect` accepts an exact returned display label or exact numeric value. `update_effect_parameters` applies several effect controls atomically. Any rejected item rejects an entire batch.
+
+`add_effect`, `update_effect`, and `delete_effect` edit Surge XT effects. Preset effects have `source: "preset"`; appended effects have `source: "added"`. Both use stable IDs and share Surge XT's eight exposed serial slots.
+
+`add_modulator`, `update_modulator`, and `delete_modulator` edit native Surge XT modulation. One modulator configures one source-to-target route on the same owner:
+
+- `target` must be an exact discovered modulation target.
 - `shape` is `sine`, `triangle`, `square`, `random`, `envelope`, or `formula`.
 - `rateMode` is `hz` or tempo-synced cycles per beat.
 - `trigger` is `free` or `midi`.
-- Free-running and MIDI-triggered modulation use native Surge XT modulation sources.
-- Formula modulation supplies Surge Formula source in `formula`.
+- Formula modulation uses Surge Formula source supplied in `formula`.
 
-Same-track native targets execute inside Surge XT. Use the target IDs and controls returned by instrument discovery.
+## Arrangement mutations
 
-## Listening
+`add_midi_clip`, `update_midi_clip`, and `delete_midi_clip` edit project MIDI. `set_track_volume` and `set_track_mute` edit a track's mix state. `set_tempo` changes project tempo while preserving beat positions. `undo` restores the arrangement state before the latest successful arrangement mutation in this session. Audition-slot edits have their own isolated state and are not arrangement undo steps.
 
-`render_audio_region` renders the latest graph through Surge XT and returns WAV audio without measurements. It accepts optional `tracks` as `"all"` or stable track IDs and an absolute range of at most 16 seconds. Omitted `tracks` means all tracks. The listening range is independent of the edit selection.
+Dynamic tool loading is always enabled. `load_tool_group` loads either arrangement mutations (tracks, Rack zones, MIDI clips, mix, and tempo) or sound mutations (presets, parameters, effects, and modulators). Read, listening, discovery, audition-lifecycle, and audition-commit functions remain available while groups switch. A successful load reports every currently available tool; an unavailable-tool error names the exact group to load.
 
-`analyze_audio` renders the same selectable range and returns objective full-mix and per-track signal measurements without audio. Its standard level and spectral measurements describe the signal; they are not musical judgments or completion decisions.
+## Rendering and evaluation
 
-`audition_instrument` renders an installed Surge preset with a short disposable MIDI sequence and optionally one effect. It never changes the graph or history. Use it to compare uncertain presets, pitches, and articulations before creating tracks or clips.
+`render_audio_region` renders the current arrangement through Surge XT and returns WAV audio without measurements. Set `tracks` to `"all"` for the mix, or provide stable track IDs to isolate channels. A range may be at most 16 seconds.
 
-Use listening when it helps evaluate the user's request. Continue making tool calls until the requested edit is complete.
+`analyze_audio` renders the same explicitly selected arrangement range and returns objective full-mix and per-track signal measurements without audio. These measurements are signal facts, not musical judgments.
+
+Use rendered audio whenever it would resolve uncertainty or verify the result. Base claims about what is audible on the WAV rather than on preset names, parameter values, or intended behavior. After the final arrangement mutation, successfully call `render_audio_region` and listen to its returned WAV before finishing; `analyze_audio` and isolated audition audio do not satisfy that final-listen requirement.

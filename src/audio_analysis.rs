@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::model::{Clip, ClipEvent, Project, Track};
 
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
@@ -19,6 +21,31 @@ struct ClipOccurrence<'a> {
 
 struct TrackRenderState<'a> {
     occurrences: Vec<ClipOccurrence<'a>>,
+}
+
+struct RackRoutingIndex {
+    pitches_by_instrument: HashMap<u64, [bool; 128]>,
+}
+
+impl RackRoutingIndex {
+    fn new(project: &Project) -> Self {
+        let mut pitches_by_instrument = HashMap::new();
+        for zone in &project.key_zones {
+            let pitches = pitches_by_instrument
+                .entry(zone.instrument_id)
+                .or_insert([false; 128]);
+            pitches[usize::from(zone.low_note)..=usize::from(zone.high_note)].fill(true);
+        }
+        Self {
+            pitches_by_instrument,
+        }
+    }
+
+    fn instrument_receives_pitch(&self, instrument_id: u64, pitch: u8) -> bool {
+        self.pitches_by_instrument
+            .get(&instrument_id)
+            .is_some_and(|pitches| pitches[usize::from(pitch)])
+    }
 }
 
 pub(crate) struct AudioRegion {
@@ -145,10 +172,12 @@ fn render_tracks_with_stems_samples(
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<AudioRegions, String> {
     let start = sample_time(start_sample);
-    let preroll_sample = playback_preroll_sample(project, start_sample);
+    let routing = RackRoutingIndex::new(project);
+    let preroll_sample = playback_preroll_sample(project, &routing, start_sample);
     let regions = render_audio_samples_with_tracks(
         project,
         track_ids,
+        &routing,
         preroll_sample,
         end_sample,
         cancelled,
@@ -226,9 +255,11 @@ fn render_audio(
     start: f32,
     end: f32,
 ) -> Result<AudioRegion, String> {
+    let routing = RackRoutingIndex::new(project);
     Ok(render_audio_samples_with_tracks(
         project,
         track_ids,
+        &routing,
         playback_start_sample(start),
         playback_end_sample(end),
         &mut || false,
@@ -239,6 +270,7 @@ fn render_audio(
 fn render_audio_samples_with_tracks(
     project: &Project,
     track_ids: &[u64],
+    routing: &RackRoutingIndex,
     start_sample: usize,
     end_sample: usize,
     cancelled: &mut dyn FnMut() -> bool,
@@ -280,7 +312,7 @@ fn render_audio_samples_with_tracks(
             ));
             continue;
         }
-        let render_state = TrackRenderState::new(project, track, start, end);
+        let render_state = TrackRenderState::new(project, track, routing, start, end);
         render_track(
             project,
             track,
@@ -431,10 +463,10 @@ fn render_track(
             }
         }
         let block = engine.process();
-        for index in 0..count {
+        for (index, (&left, &right)) in block[0].iter().zip(&block[1]).take(count).enumerate() {
             let output_index = (output_frame + index) * CHANNEL_COUNT;
-            output[output_index] = block[0][index];
-            output[output_index + 1] = block[1][index];
+            output[output_index] = left;
+            output[output_index + 1] = right;
         }
         output_frame += count;
     }
@@ -469,7 +501,8 @@ fn scheduled_midi_events_for_block<'a>(
 
 fn clip_events_in_window<'a>(
     project: &Project,
-    _track: &Track,
+    track: &Track,
+    routing: &RackRoutingIndex,
     clip: &'a Clip,
     window_start: f64,
     window_end: f64,
@@ -496,6 +529,9 @@ fn clip_events_in_window<'a>(
     let mut occurrences = Vec::new();
     for cycle in first_cycle..=last_cycle {
         for event in &clip.events {
+            if !routing.instrument_receives_pitch(track.instrument.id, event.pitch) {
+                continue;
+            }
             let time = f64::from(clip.source_start)
                 + cycle as f64 * loop_duration
                 + f64::from(event.time) * beat_duration;
@@ -520,12 +556,18 @@ fn clip_events_in_window<'a>(
 }
 
 impl<'a> TrackRenderState<'a> {
-    fn new(project: &'a Project, track: &'a Track, start: f64, end: f64) -> Self {
+    fn new(
+        project: &'a Project,
+        track: &'a Track,
+        routing: &RackRoutingIndex,
+        start: f64,
+        end: f64,
+    ) -> Self {
         let beat_duration = 60.0 / f64::from(project.bpm);
-        let maximum_voice = f64::from(maximum_voice_lifetime(project, track));
+        let maximum_voice = f64::from(maximum_voice_lifetime(project, track, routing));
         let render_lookback = (start - maximum_voice).max(0.0);
         let mut occurrences = Vec::new();
-        for clip in &track.clips {
+        for clip in &project.clips {
             let loop_duration = f64::from(clip.loop_beats) * beat_duration;
             if loop_duration <= 0.0 {
                 continue;
@@ -535,6 +577,7 @@ impl<'a> TrackRenderState<'a> {
             occurrences.extend(clip_events_in_window(
                 project,
                 track,
+                routing,
                 clip,
                 onset_lookback,
                 window_end,
@@ -545,36 +588,44 @@ impl<'a> TrackRenderState<'a> {
     }
 }
 
-fn maximum_voice_lifetime(project: &Project, track: &Track) -> f32 {
+fn maximum_voice_lifetime(project: &Project, track: &Track, routing: &RackRoutingIndex) -> f32 {
     let beat_duration = 60.0 / project.bpm as f32;
-    track
+    project
         .clips
         .iter()
         .flat_map(|clip| &clip.events)
+        .filter(|event| routing.instrument_receives_pitch(track.instrument.id, event.pitch))
         .map(|event| event.duration * beat_duration + 8.0)
         .fold(0.0_f32, f32::max)
 }
 
-fn playback_preroll_seconds(project: &Project) -> f32 {
+fn playback_preroll_seconds(project: &Project, routing: &RackRoutingIndex) -> f32 {
     let maximum_voice = project
         .tracks
         .iter()
-        .map(|track| maximum_voice_lifetime(project, track))
+        .map(|track| maximum_voice_lifetime(project, track, routing))
         .fold(0.0_f32, f32::max);
     maximum_voice + DSP_SETTLING_SECONDS
 }
 
-fn playback_preroll_sample(project: &Project, start_sample: usize) -> usize {
-    let unaligned =
-        (precise_sample_time(start_sample) - f64::from(playback_preroll_seconds(project))).max(0.0);
+fn playback_preroll_sample(
+    project: &Project,
+    routing: &RackRoutingIndex,
+    start_sample: usize,
+) -> usize {
+    let unaligned = (precise_sample_time(start_sample)
+        - f64::from(playback_preroll_seconds(project, routing)))
+    .max(0.0);
     // Whole seconds keep the audio and control-rate grids absolute even at the 24-hour limit.
     (unaligned.floor() * f64::from(SAMPLE_RATE)) as usize
 }
 
 #[cfg(test)]
 fn playback_preroll_start(project: &Project, start: f32) -> f32 {
+    let routing = RackRoutingIndex::new(project);
     sample_time(playback_preroll_sample(
         project,
+        &routing,
         playback_start_sample(start),
     ))
 }
@@ -742,28 +793,31 @@ mod tests {
     fn once_clip_events_do_not_wrap() {
         let mut project = Project::demo();
         project.bpm = 60;
-        let clip = &mut project.tracks[2].clips[0];
+        let clip = &mut project.clips[2];
         clip.start = 0.0;
         clip.source_start = 0.0;
         clip.end = 8.0;
         clip.loop_beats = 4.0;
         clip.playback_mode = "loop".to_owned();
         let event_id = clip.events[0].id;
+        let routing = RackRoutingIndex::new(&project);
         let looped = clip_events_in_window(
             &project,
             &project.tracks[2],
-            &project.tracks[2].clips[0],
+            &routing,
+            &project.clips[2],
             0.0,
             8.0,
         )
         .into_iter()
         .filter(|occurrence| occurrence.event.id == event_id)
         .count();
-        project.tracks[2].clips[0].playback_mode = "once".to_owned();
+        project.clips[2].playback_mode = "once".to_owned();
         let once = clip_events_in_window(
             &project,
             &project.tracks[2],
-            &project.tracks[2].clips[0],
+            &routing,
+            &project.clips[2],
             0.0,
             8.0,
         )
@@ -773,6 +827,71 @@ mod tests {
 
         assert_eq!(looped, 2);
         assert_eq!(once, 1);
+    }
+
+    #[test]
+    fn rack_zones_layer_distinct_instruments_without_duplicate_delivery() {
+        let mut studio = crate::model::Studio::from_project(Project::initial());
+        let first_instrument = studio.project().tracks[0].instrument.id;
+        let second_track = studio
+            .add_described_channel("Layer", "#8ca9ff")
+            .expect("second track");
+        let second_instrument = studio
+            .project()
+            .tracks
+            .iter()
+            .find(|track| track.id == second_track)
+            .expect("second track")
+            .instrument
+            .id;
+        studio
+            .create_key_zone(first_instrument, 60, 60)
+            .expect("overlapping same-instrument zone");
+        studio
+            .create_key_zone(second_instrument, 60, 60)
+            .expect("layer zone");
+        let mut project = studio.project().clone();
+        project.clips.push(crate::model::Clip {
+            id: 1_000,
+            label: "Rack test".to_owned(),
+            start: 0.0,
+            end: 1.0,
+            source_start: 0.0,
+            style: "generated".to_owned(),
+            playback_mode: "once".to_owned(),
+            loop_beats: 1.0,
+            events: vec![crate::model::ClipEvent {
+                id: 1_001,
+                kind: "note".to_owned(),
+                time: 0.0,
+                duration: 0.5,
+                pitch: 60,
+                velocity: 0.8,
+            }],
+        });
+
+        let routing = RackRoutingIndex::new(&project);
+        let first = clip_events_in_window(
+            &project,
+            &project.tracks[0],
+            &routing,
+            &project.clips[0],
+            0.0,
+            1.0,
+        );
+        let second = clip_events_in_window(
+            &project,
+            &project.tracks[1],
+            &routing,
+            &project.clips[0],
+            0.0,
+            1.0,
+        );
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].event.pitch, 60);
+        assert_eq!(second[0].event.pitch, 60);
     }
 
     #[test]
@@ -828,10 +947,12 @@ mod tests {
             .iter()
             .map(|track| track.id)
             .collect::<Vec<_>>();
+        let routing = RackRoutingIndex::new(&project);
         let mut cancelled = || false;
         let regions = render_audio_samples_with_tracks(
             &project,
             &track_ids,
+            &routing,
             0,
             SAMPLE_RATE as usize,
             &mut cancelled,
@@ -897,10 +1018,8 @@ mod tests {
     fn playback_overlaps_remain_stable_when_preroll_moves() {
         let mut project = Project::demo();
         project.duration = 64.0;
-        for track in &mut project.tracks {
-            for clip in &mut track.clips {
-                clip.end = 64.0;
-            }
+        for clip in &mut project.clips {
+            clip.end = 64.0;
         }
         assert_ne!(
             playback_preroll_start(&project, 32.0),
@@ -1201,14 +1320,15 @@ mod tests {
     fn clip_boundary_truncates_sustained_note_gates() {
         let mut project = Project::demo();
         {
-            let clip = &mut project.tracks[1].clips[0];
+            let clip = &mut project.clips[1];
             clip.end = clip.start + 0.5;
             clip.events[0].time = 0.0;
             clip.events[0].duration = 16.0;
         }
         let track = &project.tracks[1];
-        let clip = &track.clips[0];
-        let occurrences = clip_events_in_window(&project, track, clip, 0.0, 1.0);
+        let clip = &project.clips[1];
+        let routing = RackRoutingIndex::new(&project);
+        let occurrences = clip_events_in_window(&project, track, &routing, clip, 0.0, 1.0);
         assert_eq!(occurrences.len(), 1);
         assert!(occurrences[0].duration <= project.bpm as f32 / 120.0 + 0.000_01);
     }

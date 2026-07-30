@@ -24,7 +24,7 @@ use crate::audio_renderer::{AudioRenderError, AudioRenderPriority, AudioRenderer
 use crate::audio_stream::{
     ByteRange, WAV_HEADER_BYTES, bounded_audio_byte_range, wait_for_playback_window,
 };
-use crate::concurrency::{Limiter, Permit};
+use crate::concurrency::{Limiter, Permit, RecoverPoison};
 use crate::edit_jobs::{EditJobCreateError, EditJobs, accepted_edit_job_json, new_operation_id};
 use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerError};
 #[cfg(test)]
@@ -38,7 +38,7 @@ use crate::http::{AUDIO_REQUEST_HEADER, authority};
 use crate::http::{
     HttpBody, MAX_REQUEST_BYTES, Request, Response, empty_body, full_body, response_with_body,
 };
-use crate::model::{Project, Studio, StudioError, json_string, valid_operation_id};
+use crate::model::{Project, Studio, StudioError, valid_operation_id};
 use crate::project_history::{
     ProjectHistory, open_project_with_history, project_document, save_project_state,
 };
@@ -213,10 +213,10 @@ async fn serve_http(
     {
         connection_tasks.abort_all();
         while let Some(completed) = connection_tasks.join_next().await {
-            if let Err(error) = completed {
-                if error.is_panic() {
-                    eprintln!("error: HTTP connection worker panicked during shutdown: {error}");
-                }
+            if let Err(error) = completed
+                && error.is_panic()
+            {
+                eprintln!("error: HTTP connection worker panicked during shutdown: {error}");
             }
         }
     }
@@ -510,37 +510,25 @@ impl PlannerGate {
     }
 
     fn wait_until_released(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.lock().recover_poison();
         state.0 = true;
         self.changed.notify_all();
         while !state.1 {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = self.changed.wait(state).recover_poison();
         }
     }
 
     fn wait_until_started(&self) {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.state.lock().recover_poison();
         let (state, _) = self
             .changed
             .wait_timeout_while(state, Duration::from_secs(2), |state| !state.0)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .recover_poison();
         assert!(state.0, "planner did not reach the test gate");
     }
 
     fn release(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.lock().recover_poison();
         state.1 = true;
         self.changed.notify_all();
     }
@@ -553,9 +541,7 @@ struct EditRequest {
     end: f32,
     deadline: Instant,
     project: crate::model::Project,
-    batch_parameter_tools: bool,
-    slim_prompt: bool,
-    dynamic_tools: bool,
+    new_prompt: bool,
 }
 
 struct EditFailure {
@@ -835,27 +821,23 @@ impl Router {
                         .saturating_mul(SPECTRUM_BANDS),
                 );
             let cached = {
-                let _cache_guard = self
-                    .spectrum_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _cache_guard = self.spectrum_cache.lock().recover_poison();
                 read_bounded_file(path, expected_length as u64, "track spectrum cache")
             };
-            if let Ok(cached) = cached {
-                if cached.len() == expected_length
-                    && cached[..8] == version.to_le_bytes()
-                    && cached[8..16] == *TRACK_SPECTRUM_MAGIC
-                {
-                    return Ok(TrackSpectrumPreparation::Ready(BinaryResponse {
-                        status: 200,
-                        content_type: "application/vnd.daw-ai.track-spectrum",
-                        headers: vec![(
-                            "Cache-Control".to_owned(),
-                            "private, max-age=31536000, immutable".to_owned(),
-                        )],
-                        body: cached[8..].to_vec(),
-                    }));
-                }
+            if let Ok(cached) = cached
+                && cached.len() == expected_length
+                && cached[..8] == version.to_le_bytes()
+                && cached[8..16] == *TRACK_SPECTRUM_MAGIC
+            {
+                return Ok(TrackSpectrumPreparation::Ready(BinaryResponse {
+                    status: 200,
+                    content_type: "application/vnd.daw-ai.track-spectrum",
+                    headers: vec![(
+                        "Cache-Control".to_owned(),
+                        "private, max-age=31536000, immutable".to_owned(),
+                    )],
+                    body: cached[8..].to_vec(),
+                }));
             }
         }
         Ok(TrackSpectrumPreparation::Render(TrackSpectrumPlan {
@@ -927,10 +909,7 @@ impl Router {
             cursor = chunk_end;
         }
         if let Some(path) = &plan.cache_path {
-            let _cache_guard = self
-                .spectrum_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _cache_guard = self.spectrum_cache.lock().recover_poison();
             let mut cached = Vec::with_capacity(8 + body.len());
             cached.extend_from_slice(&plan.version.to_le_bytes());
             cached.extend_from_slice(&body);
@@ -1110,10 +1089,7 @@ impl Router {
             Some(existing) => existing.to_owned(),
             None => new_operation_id().map_err(io::Error::other)?,
         };
-        let mut users = registry
-            .users
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut users = registry.users.lock().recover_poison();
         users.retain(|_, user| user.last_used.elapsed() < USER_CACHE_IDLE || !user.can_evict());
         if let Some(user) = users.get_mut(&user_id) {
             user.last_used = Instant::now();
@@ -1190,7 +1166,7 @@ impl Router {
             }
             return Response::json(
                 200,
-                format!("{{\"streamToken\":{}}}", json_string(&self.audio_token)),
+                serde_json::json!({"streamToken":self.audio_token.as_str()}).to_string(),
             );
         }
         if request.path.starts_with("/api/audio") {
@@ -1286,15 +1262,7 @@ impl Router {
         let Some(end) = form.get("end").and_then(|value| value.parse::<f32>().ok()) else {
             return Response::json(422, error_json("selection end is required"));
         };
-        let batch_parameter_tools = match parse_optional_boolean(&form, "batch_parameter_tools") {
-            Ok(value) => value,
-            Err(message) => return Response::json(422, error_json(message)),
-        };
-        let slim_prompt = match parse_optional_boolean(&form, "slim_prompt") {
-            Ok(value) => value,
-            Err(message) => return Response::json(422, error_json(message)),
-        };
-        let dynamic_tools = match parse_optional_boolean(&form, "dynamic_tools") {
+        let new_prompt = match parse_optional_boolean(&form, "new_prompt") {
             Ok(value) => value,
             Err(message) => return Response::json(422, error_json(message)),
         };
@@ -1305,14 +1273,13 @@ impl Router {
             }
             studio.project().clone()
         };
-        if let Some(operation_id) = operation_id {
-            if let Some(operation) = project
+        if let Some(operation_id) = operation_id
+            && let Some(operation) = project
                 .edit_operations
                 .iter()
                 .find(|operation| operation.operation_id == operation_id)
-            {
-                return Response::json(200, recovered_operation_json(operation));
-            }
+        {
+            return Response::json(200, recovered_operation_json(operation));
         }
         let poll_after_ms = match &self.ai {
             Ai::Gemini => GEMINI_POLL_INTERVAL_MS,
@@ -1358,9 +1325,7 @@ impl Router {
             end,
             deadline: Instant::now() + Duration::from_secs(EDIT_TIMEOUT_SECONDS),
             project,
-            batch_parameter_tools,
-            slim_prompt,
-            dynamic_tools,
+            new_prompt,
         };
         let worker = self.clone();
         let spawn = thread::Builder::new()
@@ -1739,9 +1704,7 @@ impl Router {
             edit.start,
             edit.end,
             &edit.project,
-            edit.batch_parameter_tools,
-            edit.slim_prompt,
-            edit.dynamic_tools,
+            edit.new_prompt,
             deadline,
             cancellation,
             |request| self.render_gemini_audio(job_id, request, &render_cancellation, deadline),
@@ -1996,10 +1959,7 @@ impl Router {
 
     fn undo(&self) -> Response {
         let mut studio = self.lock_studio();
-        let mut history = self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut history = self.history.lock().recover_poison();
         let Some(previous_index) = history.parent(history.current) else {
             return Response::json(409, error_json("nothing to undo"));
         };
@@ -2039,18 +1999,12 @@ impl Router {
             return Response::json(500, error_json("could not reset the project"));
         }
         *studio = candidate;
-        *self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = history;
+        *self.history.lock().recover_poison() = history;
         Response::json(200, studio.to_json_with_can_undo(false))
     }
 
     fn history_response(&self) -> Response {
-        let history = self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let history = self.history.lock().recover_poison();
         let entries = history
             .entries()
             .enumerate()
@@ -2089,10 +2043,7 @@ impl Router {
             return Response::json(422, error_json("history index is required"));
         };
         let mut studio = self.lock_studio();
-        let mut history = self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut history = self.history.lock().recover_poison();
         if index >= history.len() {
             return Response::json(404, error_json("history state not found"));
         }
@@ -2123,10 +2074,7 @@ impl Router {
     }
 
     fn project_response(&self, studio: &Studio) -> Response {
-        let history = self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let history = self.history.lock().recover_poison();
         let can_undo = history.parent(history.current).is_some();
         Response::json(200, studio.to_json_with_can_undo(can_undo))
     }
@@ -2136,11 +2084,7 @@ impl Router {
         studio: &mut std::sync::MutexGuard<'_, Studio>,
         candidate: Studio,
     ) -> Result<(), Response> {
-        let mut history = self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let mut history = self.history.lock().recover_poison().clone();
         history
             .push(studio.project(), candidate.project())
             .map_err(|error| {
@@ -2155,10 +2099,7 @@ impl Router {
             ));
         }
         **studio = candidate;
-        *self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = history;
+        *self.history.lock().recover_poison() = history;
         Ok(())
     }
 
@@ -2167,11 +2108,7 @@ impl Router {
         studio: &mut std::sync::MutexGuard<'_, Studio>,
         candidate: Studio,
     ) -> Result<(), Response> {
-        let mut history = self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let mut history = self.history.lock().recover_poison().clone();
         history.update_current_metadata(candidate.project());
         if let Err(error) = self.save_state(candidate.project(), &mut history) {
             eprintln!("error: could not save project history metadata: {error}");
@@ -2181,10 +2118,7 @@ impl Router {
             ));
         }
         **studio = candidate;
-        *self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = history;
+        *self.history.lock().recover_poison() = history;
         Ok(())
     }
 
@@ -2222,30 +2156,24 @@ impl Router {
     }
 
     fn lock_studio(&self) -> std::sync::MutexGuard<'_, Studio> {
-        self.studio
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.studio.lock().recover_poison()
     }
 }
 
 fn recovered_operation_json(operation: &crate::model::EditOperation) -> String {
-    let common = format!(
-        concat!(
-            "\"id\":\"recovered\",\"operationId\":{},\"elapsedSeconds\":0,",
-            "\"timeoutSeconds\":{},\"appliedSteps\":{},\"initialVersion\":{},",
-            "\"projectVersion\":{}"
-        ),
-        json_string(&operation.operation_id),
-        EDIT_TIMEOUT_SECONDS,
-        operation.applied_steps,
-        operation.initial_version,
-        operation.project_version
-    );
+    let mut response = serde_json::json!({
+        "id": "recovered",
+        "operationId": operation.operation_id,
+        "elapsedSeconds": 0,
+        "timeoutSeconds": EDIT_TIMEOUT_SECONDS,
+        "appliedSteps": operation.applied_steps,
+        "initialVersion": operation.initial_version,
+        "projectVersion": operation.project_version
+    });
     if operation.status == crate::model::EditOperationStatus::Completed {
-        format!(
-            "{{{common},\"status\":\"completed\",\"phase\":\"completed\",\"message\":{}}}",
-            json_string(&operation.message)
-        )
+        response["status"] = "completed".into();
+        response["phase"] = "completed".into();
+        response["message"] = operation.message.clone().into();
     } else {
         let recovered_status = match operation.status {
             crate::model::EditOperationStatus::Interrupted => "interrupted_with_changes",
@@ -2253,17 +2181,12 @@ fn recovered_operation_json(operation: &crate::model::EditOperation) -> String {
             | crate::model::EditOperationStatus::Failed => "failed_with_changes",
             crate::model::EditOperationStatus::Completed => unreachable!(),
         };
-        format!(
-            concat!(
-                "{{{},\"status\":{},\"phase\":\"failed\",",
-                "\"errorStatus\":500,",
-                "\"error\":{}}}"
-            ),
-            common,
-            json_string(recovered_status),
-            json_string(&operation.message)
-        )
+        response["status"] = recovered_status.into();
+        response["phase"] = "failed".into();
+        response["errorStatus"] = 500.into();
+        response["error"] = operation.message.clone().into();
     }
+    response.to_string()
 }
 
 fn edit_job_id(path: &str) -> Option<u64> {
@@ -2352,14 +2275,15 @@ fn parse_optional_boolean(
     name: &str,
 ) -> Result<bool, &'static str> {
     match form.get(name).map(String::as_str) {
-        None | Some("false") => Ok(false),
+        None => Ok(false),
+        Some("false") => Ok(false),
         Some("true") => Ok(true),
         Some(_) => Err("boolean setting must be true or false"),
     }
 }
 
 fn error_json(message: &str) -> String {
-    format!("{{\"error\":{}}}", json_string(message))
+    serde_json::json!({"error":message}).to_string()
 }
 
 fn single_line(value: &str) -> String {
@@ -2880,26 +2804,12 @@ mod tests {
     }
 
     #[test]
-    fn validates_optional_batch_parameter_setting() {
-        assert!(!parse_optional_boolean(&HashMap::new(), "batch_parameter_tools").unwrap());
-        assert!(
-            parse_optional_boolean(
-                &parse_form("batch_parameter_tools=true"),
-                "batch_parameter_tools"
-            )
-            .unwrap()
-        );
+    fn validates_the_optional_prompt_experiment() {
+        assert!(!parse_optional_boolean(&HashMap::new(), "new_prompt").unwrap());
+        assert!(parse_optional_boolean(&parse_form("new_prompt=true"), "new_prompt").unwrap());
         assert_eq!(
-            parse_optional_boolean(
-                &parse_form("batch_parameter_tools=enabled"),
-                "batch_parameter_tools"
-            )
-            .unwrap_err(),
+            parse_optional_boolean(&parse_form("new_prompt=enabled"), "new_prompt").unwrap_err(),
             "boolean setting must be true or false"
-        );
-        assert!(parse_optional_boolean(&parse_form("slim_prompt=true"), "slim_prompt").unwrap());
-        assert!(
-            parse_optional_boolean(&parse_form("dynamic_tools=true"), "dynamic_tools").unwrap()
         );
     }
 

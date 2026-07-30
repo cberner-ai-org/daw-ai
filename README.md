@@ -8,7 +8,8 @@ The project is a small Rust server with a responsive browser client. Surge XT re
 
 Prerequisites:
 
-- Rust 1.85 or newer
+- Rust 1.97 or newer
+- Git, used to fetch the pinned Surge XT source and its recursive submodules
 - A [Gemini API key](https://ai.google.dev/gemini-api/docs/api-key)
 - `just` (optional, but recommended)
 
@@ -49,19 +50,19 @@ cargo run -- --port 8888
 3. Press **Make change**, then use the transport to hear the result. The button becomes **Interrupt** while Gemini is working.
 4. Use session history to inspect earlier states and move forward again, or download the complete arrangement with **Export WAV**.
 5. Use **Duration** in AI Mode to set the song length from 1 second to 5 minutes. Shortening a song trims arrangement content past the new endpoint, and the change can be undone.
-6. The **Debug** tab lists retained AI sessions, provides a copyable environment and browser-error report, and can omit objective audio metrics from Gemini listening responses. Gemini still receives the rendered audio when metrics are disabled.
+6. The **Debug** tab lists retained AI sessions, provides a copyable environment and browser-error report, and exposes the **New Gemini prompt** A/B preference. Dynamic tool loading and arrangement-feedback policy are always enabled.
 
 Playback and WAV exports are rendered by Surge XT as 48 kHz, 16-bit stereo audio.
 
 No login is required. DAW-AI assigns each browser a private random cookie and stores its project under `users/<cookie>/sound-graph.json` beside `DAW_AI_PROJECT_PATH` (or beside the working-directory default). Each user has independent edit jobs, history, playback, and project state, while expensive edit and render work is bounded across the whole server. DAW-AI creates the demo graph for a new user and safely saves every accepted prompt, undo, reset, and history selection. Existing user projects are never deleted automatically to make room for a new user; once the configured hard bound is reached, new projects receive a storage-capacity error instead.
 
-For each prompt, Gemini receives the edit range and checked-in studio contract under `gemini/`, along with registered stable-ID graph tools for reads, mutations, control discovery, undo, and Surge XT rendering. Gemini receives listening renders as audio input. Listening is independent of edit scope and model-directed.
+For each prompt, Gemini receives the edit range and checked-in studio contract under `gemini/`, along with registered stable-ID graph tools for reads, mutations, control discovery, undo, and Surge XT rendering. Gemini receives listening renders as audio input. Listening ranges and track selections are independent of edit scope and model-directed.
 
 Surge factory patches expose their embedded effect slots in the same sound graph as added effects. New effects append after the preset chain instead of replacing it, and changing presets refreshes only the preset-sourced effects. New effects are initialized from Surge's native state without DAW-AI aliases or parameter defaults. Instrument controls expose separately named edit and modulation fields, while effect discovery returns all native controls in one call with Surge-native names, choices, values, display text, and semantics.
 
 Surge patches expose their scene mode, split point, and scene pitch/octave settings directly. DAW-AI does not add a recommended MIDI-note range.
 
-Gemini may render before or after edits whenever listening would help, but no separate model reviews or rejects its completion decision. It may also complete based on graph inspection alone. There is no predetermined iteration or tool-call limit; the overall 20-minute request timeout is the loop boundary. The server publishes each successful atomic mutation as an undoable edit while Gemini is still working.
+Gemini may render before or between edits whenever listening would help. After at most four successful project mutations it must successfully analyze or render the arrangement before making another mutation. Before completing, it must successfully call `render_audio_region` after its final project mutation and listen to the returned arrangement WAV; objective analysis and isolated audition audio do not satisfy this final-listen gate. No separate model reviews or rejects its completion decision after that gate. There is no predetermined iteration or tool-call limit; the overall 20-minute request timeout is the loop boundary. The server publishes each successful atomic mutation as an undoable edit while Gemini is still working.
 
 Prompted edits run as asynchronous jobs so reverse proxies never need to hold one request open while Gemini works. The browser polls short status requests, fetches each published intermediate project and the completed project, and shows the current phase, applied steps, and elapsed time. Gemini may spend up to 20 minutes on an edit; if the project changes before that edit finishes, the result is rejected instead of overwriting newer work.
 

@@ -1,5 +1,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LockResult, PoisonError};
+
+pub(crate) trait RecoverPoison<T> {
+    fn recover_poison(self) -> T;
+}
+
+impl<T> RecoverPoison<T> for LockResult<T> {
+    fn recover_poison(self) -> T {
+        self.unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 pub(crate) struct Limiter {
     active: AtomicUsize,
@@ -39,7 +50,22 @@ impl Drop for Permit {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    #[test]
+    fn poisoned_lock_state_remains_available() {
+        let value = Arc::new(Mutex::new(0));
+        let worker_value = Arc::clone(&value);
+        let worker = std::thread::spawn(move || {
+            let mut value = worker_value.lock().recover_poison();
+            *value = 1;
+            panic!("poison lock");
+        });
+        assert!(worker.join().is_err());
+        assert_eq!(*value.lock().recover_poison(), 1);
+    }
 
     #[test]
     fn permits_are_bounded_and_released_on_drop() {

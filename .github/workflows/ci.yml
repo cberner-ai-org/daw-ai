@@ -29,10 +29,6 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install just
         run: cargo install --force --version 1.49.0 just --locked
-      - name: Install Rust MSRV
-        run: |
-          rustup toolchain install 1.85.1 --profile minimal --component rustfmt --component clippy
-          rustup default 1.85.1
       - uses: actions/setup-node@v4
         with:
           node-version: "22"

@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftNum, FftPlanner};
@@ -67,17 +67,13 @@ fn hann_window<T: FftNum>(length: usize, convert: impl Fn(f64) -> T) -> Vec<T> {
 }
 
 pub(crate) fn power_512(samples: impl Iterator<Item = f32>) -> Vec<f32> {
-    static TRANSFORM: OnceLock<Transform<f32>> = OnceLock::new();
-    TRANSFORM
-        .get_or_init(|| Transform::<f32>::new(512))
-        .power(samples)
+    static TRANSFORM: LazyLock<Transform<f32>> = LazyLock::new(|| Transform::<f32>::new(512));
+    TRANSFORM.power(samples)
 }
 
 pub(crate) fn magnitudes_1024(samples: impl Iterator<Item = f64>) -> Vec<f64> {
-    static TRANSFORM: OnceLock<Transform<f64>> = OnceLock::new();
-    TRANSFORM
-        .get_or_init(|| Transform::<f64>::new(1024))
-        .magnitudes(samples)
+    static TRANSFORM: LazyLock<Transform<f64>> = LazyLock::new(|| Transform::<f64>::new(1024));
+    TRANSFORM.magnitudes(samples)
 }
 
 #[cfg(test)]

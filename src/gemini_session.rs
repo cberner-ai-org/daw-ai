@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value as JsonValue;
 
-use crate::model::{Project, json_string};
+use crate::model::Project;
 use crate::prompt::EditPlan;
 use crate::storage::{MAX_PROJECT_BYTES, read_bounded_text, replace_text_file};
 
@@ -64,9 +64,7 @@ pub(crate) struct EditSession {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SessionVariants {
-    pub(crate) batch_parameter_tools: bool,
-    pub(crate) slim_prompt: bool,
-    pub(crate) dynamic_tools: bool,
+    pub(crate) new_prompt: bool,
 }
 
 impl EditSession {
@@ -101,10 +99,12 @@ impl EditSession {
             write_new(&path.join(GRAPH_FILE), &project.to_json())?;
             write_new(
                 &path.join(REQUEST_FILE),
-                &format!(
-                    "{{\"start\":{start},\"end\":{end},\"prompt\":{}}}",
-                    json_string(prompt)
-                ),
+                &serde_json::json!({
+                    "start": start,
+                    "end": end,
+                    "prompt": prompt
+                })
+                .to_string(),
             )?;
             write_new(
                 &path.join(SESSION_FILE),
@@ -119,9 +119,7 @@ impl EditSession {
                     "end": end,
                     "appliedSteps": 0,
                     "audioListens": 0,
-                    "batchParameterTools": variants.batch_parameter_tools,
-                    "slimPrompt": variants.slim_prompt,
-                    "dynamicToolLoading": variants.dynamic_tools,
+                    "newPrompt": variants.new_prompt,
                     "detail": "Gemini session started"
                 })
                 .to_string(),
@@ -309,10 +307,10 @@ impl Drop for EditSession {
         if self.persistent {
             return;
         }
-        if let Err(error) = fs::remove_dir_all(&self.path) {
-            if error.kind() != io::ErrorKind::NotFound {
-                eprintln!("warning: could not remove Gemini test session: {error}");
-            }
+        if let Err(error) = fs::remove_dir_all(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("warning: could not remove Gemini test session: {error}");
         }
     }
 }
@@ -386,10 +384,10 @@ pub(crate) fn session_root() -> PathBuf {
     {
         return PathBuf::from(path);
     }
-    if let Some(path) = std::env::var_os("DAW_AI_PROJECT_PATH").filter(|path| !path.is_empty()) {
-        if let Some(parent) = Path::new(&path).parent() {
-            return parent.join("gemini-sessions");
-        }
+    if let Some(path) = std::env::var_os("DAW_AI_PROJECT_PATH").filter(|path| !path.is_empty())
+        && let Some(parent) = Path::new(&path).parent()
+    {
+        return parent.join("gemini-sessions");
     }
     std::env::temp_dir().join(format!("daw-ai-gemini-tests-{}", std::process::id()))
 }
@@ -689,6 +687,34 @@ pub(crate) fn write_replace(path: &Path, source: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_metadata_records_current_prompt_variant() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-session-variants-{}-{}",
+            std::process::id(),
+            SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let session = EditSession::create_in(
+            &root,
+            &Project::initial(),
+            "test prompt variant",
+            0.0,
+            1.0,
+            SessionVariants { new_prompt: true },
+        )
+        .expect("session with prompt variant");
+
+        let metadata: JsonValue =
+            serde_json::from_str(&session.metadata_source().expect("session metadata"))
+                .expect("session metadata JSON");
+        assert_eq!(metadata["newPrompt"], true);
+        assert!(metadata.get("slimPrompt").is_none());
+        assert!(metadata.get("dynamicToolLoading").is_none());
+        assert!(metadata.get("requireAnalysis").is_none());
+        assert!(metadata.get("batchParameterTools").is_none());
+        fs::remove_dir_all(root).expect("remove session test directory");
+    }
 
     #[test]
     fn directory_sizing_ignores_disappearing_entries() {

@@ -2,6 +2,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use crate::audio_analysis;
+use crate::concurrency::RecoverPoison;
 use crate::model::Project;
 
 #[derive(Default)]
@@ -68,11 +69,7 @@ impl Drop for AudioWaiter<'_> {
         if !self.active {
             return;
         }
-        let mut state = self
-            .renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.renderer.state.lock().recover_poison();
         state.remove_waiter(self.priority);
         self.renderer.completed.notify_all();
     }
@@ -80,11 +77,7 @@ impl Drop for AudioWaiter<'_> {
 
 impl Drop for AudioRenderPermit<'_> {
     fn drop(&mut self) {
-        let mut state = self
-            .renderer
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.renderer.state.lock().recover_poison();
         state.rendering = false;
         self.renderer.completed.notify_all();
     }
@@ -102,10 +95,7 @@ impl AudioRenderer {
         if is_cancelled() {
             return Err(AudioRenderError::Cancelled);
         }
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.lock().recover_poison();
         state.add_waiter(priority);
         let mut waiter = AudioWaiter {
             renderer: self,
@@ -118,10 +108,7 @@ impl AudioRenderer {
             if is_cancelled() {
                 return Err(AudioRenderError::Cancelled);
             }
-            state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = self.state.lock().recover_poison();
             if !state.rendering
                 && (priority == AudioRenderPriority::Foreground || state.foreground_waiters == 0)
             {
@@ -134,7 +121,7 @@ impl AudioRenderer {
             let (next_state, _) = self
                 .completed
                 .wait_timeout(state, Self::CANCELLATION_POLL_INTERVAL)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .recover_poison();
             state = next_state;
         }
     }
@@ -207,40 +194,28 @@ impl AudioRenderer {
 
     #[cfg(test)]
     pub(crate) fn occupy_for_test(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .rendering = true;
+        self.state.lock().recover_poison().rendering = true;
     }
 
     #[cfg(test)]
     pub(crate) fn release_for_test(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .rendering = false;
+        self.state.lock().recover_poison().rendering = false;
         self.completed.notify_all();
     }
 
     #[cfg(test)]
     pub(crate) fn wait_until_queued_for_test(&self, priority: AudioRenderPriority) {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.state.lock().recover_poison();
         drop(
             self.completed
                 .wait_while(state, |state| state.waiter_count(priority) == 0)
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                .recover_poison(),
         );
     }
 
     #[cfg(test)]
     pub(crate) fn queued_for_test(&self, priority: AudioRenderPriority) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .waiter_count(priority)
+        self.state.lock().recover_poison().waiter_count(priority)
     }
 }
 
