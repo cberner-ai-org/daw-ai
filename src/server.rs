@@ -2003,14 +2003,10 @@ impl Router {
         let mut studio = self.lock_studio();
         let mut candidate = studio.clone();
         candidate.reset();
-        let mut history = ProjectHistory::new(candidate.project().clone());
-        if let Err(error) = self.save_state(candidate.project(), &mut history) {
-            eprintln!("error: could not reset project and history: {error}");
-            return Response::json(500, error_json("could not reset the project"));
+        match self.commit(&mut studio, candidate) {
+            Ok(()) => self.project_response(&studio),
+            Err(response) => response,
         }
-        *studio = candidate;
-        *self.history.lock().recover_poison() = history;
-        Response::json(200, studio.to_json_with_can_undo(false))
     }
 
     fn history_response(&self) -> Response {
@@ -2424,22 +2420,25 @@ mod tests {
         let (store, _) = ProjectStore::open(path.clone()).expect("test project store");
         let studio = Studio::from_project(Project::demo());
         store.save(studio.project()).expect("save demo fixture");
-        (
-            Router {
-                history: Arc::new(Mutex::new(ProjectHistory::new(studio.project().clone()))),
-                studio: Arc::new(Mutex::new(studio)),
-                store: Some(store),
-                ai: Ai::Deterministic(Duration::ZERO),
-                edit_jobs: Arc::new(EditJobs::new()),
-                edit_limiter: Limiter::new(MAX_ACTIVE_EDIT_JOBS),
-                stream_limiter: Limiter::new(MAX_ACTIVE_HTTP_STREAMS),
-                audio_renderer: Arc::new(AudioRenderer::default()),
-                spectrum_cache: Arc::new(Mutex::new(())),
-                audio_token: Arc::new("test-audio-token".to_owned()),
-                users: None,
-            },
-            path,
-        )
+        (open_persisted_router(path.clone()), path)
+    }
+
+    fn open_persisted_router(path: std::path::PathBuf) -> Router {
+        let (store, studio, history) =
+            open_project_with_history(path).expect("open persisted test project");
+        Router {
+            history: Arc::new(Mutex::new(history)),
+            studio: Arc::new(Mutex::new(studio)),
+            store: Some(store),
+            ai: Ai::Deterministic(Duration::ZERO),
+            edit_jobs: Arc::new(EditJobs::new()),
+            edit_limiter: Limiter::new(MAX_ACTIVE_EDIT_JOBS),
+            stream_limiter: Limiter::new(MAX_ACTIVE_HTTP_STREAMS),
+            audio_renderer: Arc::new(AudioRenderer::default()),
+            spectrum_cache: Arc::new(Mutex::new(())),
+            audio_token: Arc::new("test-audio-token".to_owned()),
+            users: None,
+        }
     }
 
     #[test]
@@ -2524,6 +2523,73 @@ mod tests {
                 .status,
             422
         );
+    }
+
+    #[test]
+    fn reset_is_undoable_without_losing_edit_idempotency() {
+        let (router, path) = persisted_demo();
+        let edit_body = "operation_id=reset-operation&start=4&end=8&prompt=increase+volume";
+        let accepted = router.handle(&request("POST", "/api/edits", edit_body));
+        let completed = wait_for_edit(&router, &accepted);
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["operationId"], "reset-operation");
+        let original: serde_json::Value =
+            serde_json::from_str(&router.handle(&request("GET", "/api/project", "")).body)
+                .expect("initial project response");
+        assert_eq!(original["edits"].as_array().map(Vec::len), Some(1));
+        assert_eq!(original["editOperations"].as_array().map(Vec::len), Some(1));
+
+        let reset = router.handle(&request("POST", "/api/reset", ""));
+        assert_eq!(reset.status, 200);
+        let reset: serde_json::Value = serde_json::from_str(&reset.body).expect("reset response");
+        assert_eq!(reset["tracks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(reset["clips"].as_array().map(Vec::len), Some(0));
+        assert_eq!(reset["edits"].as_array().map(Vec::len), Some(0));
+        assert_eq!(reset["editOperations"], original["editOperations"]);
+        assert_eq!(reset["canUndo"], true);
+
+        drop(router);
+        let reloaded = open_persisted_router(path.clone());
+        let persisted_reset: serde_json::Value =
+            serde_json::from_str(&reloaded.handle(&request("GET", "/api/project", "")).body)
+                .expect("persisted reset project");
+        assert_eq!(persisted_reset["tracks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            persisted_reset["editOperations"],
+            original["editOperations"]
+        );
+
+        let undone = reloaded.handle(&request("POST", "/api/undo", ""));
+        assert_eq!(undone.status, 200);
+        let undone: serde_json::Value = serde_json::from_str(&undone.body).expect("undo response");
+        assert_eq!(undone["canUndo"], true);
+        for field in [
+            "name",
+            "bpm",
+            "duration",
+            "instrumentRack",
+            "clips",
+            "tracks",
+            "edits",
+            "editOperations",
+        ] {
+            assert_eq!(undone[field], original[field], "restored {field}");
+        }
+
+        drop(reloaded);
+        let restarted = open_persisted_router(path.clone());
+        let recovered = restarted.handle(&request("POST", "/api/edits", edit_body));
+        assert_eq!(recovered.status, 200);
+        let recovered: serde_json::Value =
+            serde_json::from_str(&recovered.body).expect("recovered operation response");
+        assert_eq!(recovered["status"], "completed");
+        assert_eq!(recovered["operationId"], "reset-operation");
+        assert_eq!(
+            restarted.lock_studio().project().edits.len(),
+            1,
+            "recovering a completed operation must not queue another edit"
+        );
+        fs::remove_file(path).expect("remove test graph");
     }
 
     #[test]

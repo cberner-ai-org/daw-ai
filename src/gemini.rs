@@ -261,7 +261,7 @@ fn clip_recipient_track_ids(project: &Project, clip: &Clip) -> BTreeSet<u64> {
         .filter_map(|track| {
             clip.events
                 .iter()
-                .any(|event| project.track_receives_clip_pitch(clip, track, event.pitch))
+                .any(|event| project.track_receives_pitch(track, event.pitch))
                 .then_some(track.id)
         })
         .collect()

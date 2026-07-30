@@ -287,6 +287,53 @@ async function run() {
       10_000,
     );
     await cdp.send("Target.closeTarget", { targetId: degradedSpectrumPage.targetId });
+    const staleSpectrumPage = await openPageWithScript(cdp, appUrl, `(() => {
+      const originalFetch = window.fetch;
+      HTMLMediaElement.prototype.play = function play() {
+        this.dispatchEvent(new Event('playing'));
+        return Promise.resolve();
+      };
+      window.__staleSpectrumRequests = 0;
+      window.fetch = function fetch(resource, options) {
+        if (typeof resource === 'string' && resource.startsWith('/api/track-spectrum/')) {
+          window.__staleSpectrumRequests += 1;
+          return Promise.resolve(new Response('{"error":"stale project"}', {
+            status: 409,
+            headers: { 'Content-Type': 'application/json' },
+          }));
+        }
+        return originalFetch(resource, options);
+      };
+    })()`);
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        staleSpectrumPage.sessionId,
+        `!document.querySelector('#play-button').disabled && window.__staleSpectrumRequests === 1`,
+      ),
+      "stale spectrum warmup response",
+    );
+    await evaluate(cdp, staleSpectrumPage.sessionId, "document.querySelector('#play-button').click()");
+    await waitFor(
+      async () => evaluate(
+        cdp,
+        staleSpectrumPage.sessionId,
+        `document.documentElement.dataset.audioState === 'playing' && window.__staleSpectrumRequests === 2`,
+      ),
+      "stale spectrum response during playback",
+      30_000,
+    );
+    await evaluate(
+      cdp,
+      staleSpectrumPage.sessionId,
+      "new Promise((resolve) => setTimeout(resolve, 250))",
+    );
+    assert.equal(
+      await evaluate(cdp, staleSpectrumPage.sessionId, "window.__staleSpectrumRequests"),
+      2,
+      "stale spectrum responses must not cause an animation-frame request loop",
+    );
+    await cdp.send("Target.closeTarget", { targetId: staleSpectrumPage.targetId });
     const longProjectPage = await openPageWithScript(cdp, appUrl, `(() => {
       const originalFetch = window.fetch;
       HTMLMediaElement.prototype.play = function play() {
