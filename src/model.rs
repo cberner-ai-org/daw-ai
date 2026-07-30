@@ -1272,7 +1272,7 @@ impl Studio {
         if original.end > selection_end + TIMELINE_EPSILON_SECONDS {
             let mut right = original;
             if !retained.is_empty() {
-                right.id = self.take_id();
+                self.rekey_clip(&mut right);
             }
             right.start = selection_end;
             retained.push(right);
@@ -1381,7 +1381,7 @@ impl Studio {
         let mut replacements = Vec::with_capacity(3);
         if original.start + TIMELINE_EPSILON_SECONDS < spec.start {
             let mut left = original.clone();
-            left.id = self.take_id();
+            self.rekey_clip(&mut left);
             left.end = spec.start;
             replacements.push(left);
         }
@@ -1398,7 +1398,7 @@ impl Studio {
         });
         if original.end > spec.end + TIMELINE_EPSILON_SECONDS {
             let mut right = original;
-            right.id = self.take_id();
+            self.rekey_clip(&mut right);
             right.start = spec.end;
             replacements.push(right);
         }
@@ -1658,6 +1658,13 @@ impl Studio {
         self.project = Project::initial();
         self.project.version = version;
         self.project.edit_operations = edit_operations;
+    }
+
+    fn rekey_clip(&mut self, clip: &mut Clip) {
+        clip.id = self.take_id();
+        for event in &mut clip.events {
+            event.id = self.take_id();
+        }
     }
 
     fn take_id(&mut self) -> u64 {
@@ -2380,6 +2387,57 @@ mod tests {
         assert!(json.contains("\"routing\""));
         assert!(json.contains("\"playback\":{\"mode\":\"loop\",\"lengthBeats\":4.0}"));
         assert!(json.contains("\"audio\":[\"instrument:101\""));
+    }
+
+    #[test]
+    fn midi_clip_splits_rekey_retained_events() {
+        let mut deleted = Studio::new();
+        deleted
+            .delete_midi_clip(11, 8.0, 16.0)
+            .expect("middle clip deletion");
+        assert_eq!(
+            deleted
+                .project()
+                .clips
+                .iter()
+                .filter(|clip| clip.label == "Pocket beat")
+                .count(),
+            2
+        );
+        Project::from_json(&deleted.project().to_json()).expect("deleted clip fragments validate");
+
+        let mut replaced = Studio::new();
+        replaced
+            .replace_midi_clip(
+                11,
+                &MidiClipSpec {
+                    label: "Replacement".to_owned(),
+                    start: 8.0,
+                    end: 16.0,
+                    playback_mode: "loop".to_owned(),
+                    loop_beats: 4.0,
+                    notes: vec![MidiNote {
+                        time: 0.0,
+                        duration: 1.0,
+                        pitch: 60,
+                        velocity: 0.8,
+                    }],
+                },
+                0.0,
+                32.0,
+            )
+            .expect("middle clip replacement");
+        assert_eq!(
+            replaced
+                .project()
+                .clips
+                .iter()
+                .filter(|clip| clip.label == "Pocket beat")
+                .count(),
+            2
+        );
+        Project::from_json(&replaced.project().to_json())
+            .expect("replaced clip fragments validate");
     }
 
     #[test]
