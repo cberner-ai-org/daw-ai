@@ -23,7 +23,7 @@ use crate::gemini_tools::{
     prepare_audio_render, prepare_instrument_audition, read_audition_slot, read_sound_graph,
     record_instrument_audition,
 };
-use crate::model::Project;
+use crate::model::{Clip, Project};
 use crate::prompt::EditPlan;
 use crate::storage::read_bounded_text_following_links;
 
@@ -142,10 +142,10 @@ impl ArrangementListenRequirement {
     fn covers(&self, request: &AudioRenderRequest) -> bool {
         request.start < self.end
             && self.start < request.end
-            && request
+            && self
                 .track_ids
                 .iter()
-                .any(|track_id| self.track_ids.contains(track_id))
+                .all(|track_id| request.track_ids.contains(track_id))
     }
 
     fn guidance(&self) -> String {
@@ -156,7 +156,7 @@ impl ArrangementListenRequirement {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "The render range must overlap {:.3}-{:.3} seconds and include at least one affected track: [{track_ids}].",
+            "The render range must overlap {:.3}-{:.3} seconds and include every affected track: [{track_ids}].",
             self.start, self.end
         )
     }
@@ -254,6 +254,19 @@ impl LoopState {
     }
 }
 
+fn clip_recipient_track_ids(project: &Project, clip: &Clip) -> BTreeSet<u64> {
+    project
+        .tracks
+        .iter()
+        .filter_map(|track| {
+            clip.events
+                .iter()
+                .any(|event| project.track_receives_clip_pitch(clip, track, event.pitch))
+                .then_some(track.id)
+        })
+        .collect()
+}
+
 fn arrangement_listen_requirement(
     name: &str,
     arguments: &JsonValue,
@@ -265,7 +278,7 @@ fn arrangement_listen_requirement(
 ) -> ArrangementListenRequirement {
     let response = serde_json::from_str::<JsonValue>(result).ok();
     let clip_timing = response.as_ref().and_then(|value| value.get("clipTiming"));
-    let deleted_clip = (name == "delete_midi_clip")
+    let previous_clip = matches!(name, "update_midi_clip" | "delete_midi_clip")
         .then(|| arguments["clipId"].as_u64())
         .flatten()
         .and_then(|clip_id| {
@@ -277,24 +290,27 @@ fn arrangement_listen_requirement(
     let start = clip_timing
         .and_then(|timing| timing["startSeconds"].as_f64())
         .map(|seconds| seconds as f32)
-        .or_else(|| deleted_clip.map(|clip| clip.start.max(selection_start)))
+        .or_else(|| {
+            (name == "delete_midi_clip")
+                .then(|| previous_clip.map(|clip| clip.start.max(selection_start)))
+                .flatten()
+        })
         .unwrap_or(selection_start);
     let end = clip_timing
         .and_then(|timing| timing["endSeconds"].as_f64())
         .map(|seconds| seconds as f32)
-        .or_else(|| deleted_clip.map(|clip| clip.end.min(selection_end)))
+        .or_else(|| {
+            (name == "delete_midi_clip")
+                .then(|| previous_clip.map(|clip| clip.end.min(selection_end)))
+                .flatten()
+        })
         .unwrap_or(selection_end);
 
     let mut track_ids = BTreeSet::new();
-    if let Some(clip) = deleted_clip {
-        track_ids.extend(previous_project.tracks.iter().filter_map(|track| {
-            clip.events
-                .iter()
-                .any(|event| previous_project.track_receives_clip_pitch(clip, track, event.pitch))
-                .then_some(track.id)
-        }));
+    if let Some(clip) = previous_clip {
+        track_ids.extend(clip_recipient_track_ids(previous_project, clip));
     }
-    if name == "delete_key_zone"
+    if matches!(name, "update_key_zone" | "delete_key_zone")
         && let Some(zone_id) = arguments["keyZoneId"].as_u64()
         && let Some(zone) = previous_project
             .key_zones
@@ -331,12 +347,7 @@ fn arrangement_listen_requirement(
         && let Some(clip_id) = response.as_ref().and_then(|value| value["id"].as_u64())
         && let Some(clip) = project.clips.iter().find(|clip| clip.id == clip_id)
     {
-        track_ids.extend(project.tracks.iter().filter_map(|track| {
-            clip.events
-                .iter()
-                .any(|event| project.track_receives_clip_pitch(clip, track, event.pitch))
-                .then_some(track.id)
-        }));
+        track_ids.extend(clip_recipient_track_ids(project, clip));
     }
     if track_ids.is_empty() {
         track_ids.extend(project.tracks.iter().map(|track| track.id));
@@ -2177,6 +2188,118 @@ mod tests {
         );
         assert_eq!((zone_requirement.start, zone_requirement.end), (8.0, 12.0));
         assert_eq!(zone_requirement.track_ids, BTreeSet::from([2]));
+    }
+
+    #[test]
+    fn clip_and_zone_updates_require_every_pre_and_post_recipient() {
+        let before_clip = Project::demo();
+        let mut after_clip = before_clip.clone();
+        for event in &mut after_clip
+            .clips
+            .iter_mut()
+            .find(|clip| clip.id == 12)
+            .expect("bass clip")
+            .events
+        {
+            event.pitch = 60;
+        }
+        let clip_result = serde_json::json!({
+            "id":12,
+            "clipTiming":{"startSeconds":0,"endSeconds":32}
+        })
+        .to_string();
+        let clip_requirement = arrangement_listen_requirement(
+            "update_midi_clip",
+            &serde_json::json!({"clipId":12}),
+            &clip_result,
+            &before_clip,
+            &after_clip,
+            0.0,
+            32.0,
+        );
+        assert_eq!(clip_requirement.track_ids, BTreeSet::from([2, 3]));
+
+        let before_zone = Project::demo();
+        let mut after_zone = before_zone.clone();
+        let new_instrument_id = after_zone.tracks[2].instrument.id;
+        after_zone
+            .key_zones
+            .iter_mut()
+            .find(|zone| zone.id == 202)
+            .expect("bass zone")
+            .instrument_id = new_instrument_id;
+        let zone_requirement = arrangement_listen_requirement(
+            "update_key_zone",
+            &serde_json::json!({
+                "keyZoneId":202,
+                "instrumentId":new_instrument_id
+            }),
+            "{}",
+            &before_zone,
+            &after_zone,
+            8.0,
+            12.0,
+        );
+        assert_eq!(zone_requirement.track_ids, BTreeSet::from([2, 3]));
+
+        let partial_render = AudioRenderRequest {
+            project: after_zone.clone(),
+            track_ids: vec![3],
+            start: 8.0,
+            end: 12.0,
+            description: String::new(),
+            require_audible_output: false,
+        };
+        assert!(!zone_requirement.covers(&partial_render));
+        let complete_render = AudioRenderRequest {
+            project: after_zone,
+            track_ids: vec![2, 3],
+            start: 8.0,
+            end: 12.0,
+            description: String::new(),
+            require_audible_output: false,
+        };
+        assert!(zone_requirement.covers(&complete_render));
+    }
+
+    #[test]
+    fn track_deletion_requires_the_full_remaining_mix() {
+        let before = Project::demo();
+        let mut after = before.clone();
+        let deleted_instrument_id = after.tracks[1].instrument.id;
+        after.tracks.retain(|track| track.id != 2);
+        after
+            .key_zones
+            .retain(|zone| zone.instrument_id != deleted_instrument_id);
+        let requirement = arrangement_listen_requirement(
+            "delete_track",
+            &serde_json::json!({"trackId":2}),
+            "{}",
+            &before,
+            &after,
+            0.0,
+            4.0,
+        );
+        assert_eq!(requirement.track_ids, BTreeSet::from([1, 3]));
+
+        let partial_render = AudioRenderRequest {
+            project: after.clone(),
+            track_ids: vec![1],
+            start: 0.0,
+            end: 4.0,
+            description: String::new(),
+            require_audible_output: false,
+        };
+        assert!(!requirement.covers(&partial_render));
+        let full_mix = AudioRenderRequest {
+            project: after,
+            track_ids: vec![1, 3],
+            start: 0.0,
+            end: 4.0,
+            description: String::new(),
+            require_audible_output: false,
+        };
+        assert!(requirement.covers(&full_mix));
     }
 
     #[test]
