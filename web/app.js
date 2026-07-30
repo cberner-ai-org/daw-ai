@@ -43,9 +43,7 @@
     debugReport: document.querySelector("#debug-report"),
     copyDebug: document.querySelector("#copy-debug"),
     clearDebug: document.querySelector("#clear-debug"),
-    batchParameterTools: document.querySelector("#batch-parameter-tools"),
-    slimPrompt: document.querySelector("#slim-prompt"),
-    dynamicTools: document.querySelector("#dynamic-tools"),
+    newPrompt: document.querySelector("#new-prompt"),
     refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
     geminiSessionList: document.querySelector("#gemini-session-list"),
     sessionHistoryList: document.querySelector("#session-history-list"),
@@ -79,9 +77,7 @@
   const RECONCILED_REQUEST_TIMEOUT_MS = 2000;
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
-  const BATCH_PARAMETER_TOOLS_STORAGE_KEY = "daw-ai.batch-parameter-tools.v1";
-  const SLIM_PROMPT_STORAGE_KEY = "daw-ai.slim-prompt.v1";
-  const DYNAMIC_TOOLS_STORAGE_KEY = "daw-ai.dynamic-tools.v1";
+  const NEW_PROMPT_STORAGE_KEY = "daw-ai.new-prompt.v1";
   const TOAST_DISMISS_MS = 4200;
   const ERROR_TOAST_DISMISS_MS = 60_000;
   const LONG_PRESS_MS = 500;
@@ -317,13 +313,15 @@
     elements.trackRows.innerHTML = state.project.tracks
       .map((track) => {
         const trackColor = /^#[0-9a-f]{6}$/i.test(track.color) ? track.color : "#808080";
-        const midiClips = track.clips
-          .map((clip) => {
+        const midiClips = state.project.clips
+          .map((clip) => [clip, routedClipEvents(track, clip)])
+          .filter(([, events]) => events.length > 0)
+          .map(([clip, events]) => {
             const left = (clip.start / duration) * 100;
             const width = ((clip.end - clip.start) / duration) * 100;
             return `<div class="clip ${clip.style === "generated" ? "is-generated" : ""} ${track.muted ? "is-muted" : ""}" style="left:${left}%;width:${width}%;--track-color:${trackColor}">
               <span class="clip-name">${escapeHtml(clip.label)}</span>
-              <span class="timeline-midi" aria-hidden="true">${renderTimelineNotes(track, clip)}</span>
+              <span class="timeline-midi" aria-hidden="true">${renderTimelineNotes(track, clip, events)}</span>
             </div>`;
           })
           .join("");
@@ -348,16 +346,24 @@
       .join("");
   }
 
-  function renderTimelineNotes(track, clip) {
+  function routedClipEvents(track, clip) {
+    const zones = state.project.instrumentRack?.keyZones ?? [];
+    const ranges = zones.filter((zone) => zone.instrumentId === track.instrument.id);
+    return clip.events.filter((event) =>
+      ranges.some((zone) => event.pitch >= zone.lowNote && event.pitch <= zone.highNote),
+    );
+  }
+
+  function renderTimelineNotes(track, clip, events) {
     const playbackBeats = clip.playback?.lengthBeats ?? clip.loopBeats;
-    if (clip.events.length === 0 || clip.end <= clip.start || playbackBeats <= 0) return "";
+    if (events.length === 0 || clip.end <= clip.start || playbackBeats <= 0) return "";
     const clipDuration = clip.end - clip.start;
     const beatDuration = 60 / state.project.bpm;
     const loopDuration = playbackBeats * beatDuration;
     const loopCount = clip.playback?.mode === "once" ? 1 : Math.ceil(clipDuration / loopDuration);
-    const occurrenceCount = loopCount * clip.events.length;
+    const occurrenceCount = loopCount * events.length;
     const stride = Math.max(1, Math.ceil(occurrenceCount / 512));
-    const pitches = clip.events.map((event) => event.pitch);
+    const pitches = events.map((event) => event.pitch);
     const minimumPitch = Math.min(...pitches);
     const maximumPitch = Math.max(...pitches);
     const pitchSpan = Math.max(1, maximumPitch - minimumPitch);
@@ -365,8 +371,8 @@
     const renderedOccurrences = Math.min(occurrenceCount, 512);
     for (let renderedIndex = 0; renderedIndex < renderedOccurrences; renderedIndex += 1) {
       const occurrenceIndex = renderedIndex * stride;
-      const loop = Math.floor(occurrenceIndex / clip.events.length);
-      const event = clip.events[occurrenceIndex % clip.events.length];
+      const loop = Math.floor(occurrenceIndex / events.length);
+      const event = events[occurrenceIndex % events.length];
       const loopStart = loop * loopDuration;
       const noteStart = loopStart + event.time * beatDuration;
       if (noteStart >= clipDuration) continue;
@@ -678,16 +684,10 @@
         (typeof pending.acceptedJob === "object" &&
           typeof pending.acceptedJob.id === "string" &&
           pending.acceptedJob.operationId === pending.operationId);
-      const validBatchSetting =
-        pending.batchParameterTools === undefined || typeof pending.batchParameterTools === "boolean";
       const validPromptSetting =
-        pending.slimPrompt === undefined || typeof pending.slimPrompt === "boolean";
-      const validDynamicSetting =
-        pending.dynamicTools === undefined || typeof pending.dynamicTools === "boolean";
-      if (validOperationId && validRequest && validJob && validBatchSetting && validPromptSetting && validDynamicSetting) {
-        pending.batchParameterTools = pending.batchParameterTools === true;
-        pending.slimPrompt = pending.slimPrompt === true;
-        pending.dynamicTools = pending.dynamicTools === true;
+        pending.newPrompt === undefined || typeof pending.newPrompt === "boolean";
+      if (validOperationId && validRequest && validJob && validPromptSetting) {
+        pending.newPrompt = pending.newPrompt === true;
         return pending;
       }
     } catch (_error) {
@@ -1042,9 +1042,7 @@
           start: String(selectionStart),
           end: String(selectionEnd),
         });
-        editBody.set("batch_parameter_tools", String(pending.batchParameterTools === true));
-        editBody.set("slim_prompt", String(pending.slimPrompt === true));
-        editBody.set("dynamic_tools", String(pending.dynamicTools === true));
+        editBody.set("new_prompt", String(pending.newPrompt === true));
         accepted = await acceptEdit(
           clientOperationId,
           editBody,
@@ -1142,9 +1140,7 @@
         start: state.selectionStart,
         end: state.selectionEnd,
         acceptedJob: null,
-        batchParameterTools: elements.batchParameterTools.checked,
-        slimPrompt: elements.slimPrompt.checked,
-        dynamicTools: elements.dynamicTools.checked,
+        newPrompt: elements.newPrompt.checked,
       };
       persistPendingEdit(pending);
       handedOff = true;
@@ -1264,9 +1260,8 @@
       `Audio: ${audio.playbackState}; continuous stream ${audio.audioVersion ?? "not loaded"}`,
       `AI edit: ${state.promptPending ? "pending" : "idle"}`,
       `AI sessions: ${state.geminiSessions.length} retained locally`,
-      `Batch parameter tools: ${elements.batchParameterTools.checked ? "enabled" : "disabled"}`,
-      `Slim Gemini prompt: ${elements.slimPrompt.checked ? "enabled" : "disabled"}`,
-      `Dynamic tools: ${elements.dynamicTools.checked ? "enabled" : "disabled"}`,
+      "Gemini policy: dynamic tools and arrangement feedback always enabled",
+      `New Gemini prompt: ${elements.newPrompt.checked ? "enabled" : "disabled"}`,
       `Selection: ${state.selectionStart.toFixed(1)}s - ${state.selectionEnd.toFixed(1)}s`,
     ];
     if (project) {
@@ -1285,7 +1280,7 @@
       for (const session of state.geminiSessions.slice(0, 10)) {
         lines.push(
           `${new Date(Number(session.createdAt) || 0).toISOString()} [${session.model || "Unknown provider"}; ${session.status || "unknown"}] ` +
-            `${session.appliedSteps || 0} edit actions, ${session.audioListens || 0} listens, batch ${session.batchParameterTools ? "on" : "off"}, slim ${session.slimPrompt ? "on" : "off"}, dynamic ${session.dynamicToolLoading ? "on" : "off"}: ${session.prompt || ""}`,
+            `${session.appliedSteps || 0} edit actions, ${session.audioListens || 0} listens, new prompt ${session.newPrompt ? "on" : "off"}: ${session.prompt || ""}`,
           `  Metrics: ${sessionMetricsSummary(session)}`,
           `  Tool calls: ${JSON.stringify(session.metrics?.toolCalls || {})}`,
         );
@@ -1321,7 +1316,7 @@
       .map(
         (session) => `<article class="gemini-session-item">
           <div><strong>${escapeHtml(new Date(Number(session.createdAt) || 0).toLocaleString())}</strong>
-          <span>${escapeHtml(session.model || "Unknown provider")} &middot; ${escapeHtml(session.status || "unknown")} &middot; ${Number(session.appliedSteps) || 0} actions &middot; ${Number(session.audioListens) || 0} listens &middot; batch ${session.batchParameterTools ? "on" : "off"} &middot; slim ${session.slimPrompt ? "on" : "off"} &middot; dynamic ${session.dynamicToolLoading ? "on" : "off"}</span></div>
+          <span>${escapeHtml(session.model || "Unknown provider")} &middot; ${escapeHtml(session.status || "unknown")} &middot; ${Number(session.appliedSteps) || 0} actions &middot; ${Number(session.audioListens) || 0} listens &middot; new prompt ${session.newPrompt ? "on" : "off"}</span></div>
           <p>${escapeHtml(session.prompt || "Untitled edit")}</p>
           <p>${escapeHtml(sessionMetricsSummary(session))}</p>
         </article>`,
@@ -1438,28 +1433,9 @@
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
   elements.refreshGeminiSessions.addEventListener("click", () => void loadGeminiSessions());
-  elements.batchParameterTools.addEventListener("change", () => {
+  elements.newPrompt.addEventListener("change", () => {
     try {
-      window.localStorage.setItem(
-        BATCH_PARAMETER_TOOLS_STORAGE_KEY,
-        String(elements.batchParameterTools.checked),
-      );
-    } catch (_error) {
-      // An unavailable preference store must not prevent the experiment.
-    }
-    renderDebug();
-  });
-  elements.slimPrompt.addEventListener("change", () => {
-    try {
-      window.localStorage.setItem(SLIM_PROMPT_STORAGE_KEY, String(elements.slimPrompt.checked));
-    } catch (_error) {
-      // An unavailable preference store must not prevent the experiment.
-    }
-    renderDebug();
-  });
-  elements.dynamicTools.addEventListener("change", () => {
-    try {
-      window.localStorage.setItem(DYNAMIC_TOOLS_STORAGE_KEY, String(elements.dynamicTools.checked));
+      window.localStorage.setItem(NEW_PROMPT_STORAGE_KEY, String(elements.newPrompt.checked));
     } catch (_error) {
       // An unavailable preference store must not prevent the experiment.
     }
@@ -1504,22 +1480,10 @@
 
   async function initialize() {
     try {
-      elements.batchParameterTools.checked =
-        window.localStorage.getItem(BATCH_PARAMETER_TOOLS_STORAGE_KEY) === "true";
+      elements.newPrompt.checked =
+        window.localStorage.getItem(NEW_PROMPT_STORAGE_KEY) === "true";
     } catch (_error) {
-      elements.batchParameterTools.checked = false;
-    }
-    try {
-      elements.slimPrompt.checked =
-        window.localStorage.getItem(SLIM_PROMPT_STORAGE_KEY) === "true";
-    } catch (_error) {
-      elements.slimPrompt.checked = false;
-    }
-    try {
-      elements.dynamicTools.checked =
-        window.localStorage.getItem(DYNAMIC_TOOLS_STORAGE_KEY) === "true";
-    } catch (_error) {
-      elements.dynamicTools.checked = false;
+      elements.newPrompt.checked = false;
     }
     const pending = readPendingEdit();
     if (pending) {

@@ -2,7 +2,7 @@
 name = "daw-ai"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.97"
 description = "A local, prompt-driven music studio"
 license = "MIT"
 

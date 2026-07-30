@@ -3,8 +3,8 @@
 This is `surge-rs` from the official `surge-synthesizer/surge-rs` repository at
 commit `7bfeafc76d1c57860a177e9e076bed7ec764009a`.
 
-DAW-AI uses the patched `git2` 0.21 build dependency with only HTTPS transport
-enabled.
+DAW-AI removes the upstream crate's unused build dependencies; this crate has
+no build script.
 
 DAW-AI also wraps the parameter-semantic and native-choice queries exposed by
 the patched bridge, including Surge XT's native modulation-target validation.

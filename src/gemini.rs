@@ -14,11 +14,14 @@ use crate::gemini_session::{EditSession, SessionVariants, apply_session_retentio
 use crate::gemini_tools::render_audio_request;
 use crate::gemini_tools::{
     ANALYZE_AUDIO_TOOL_NAME, AUDIO_TOOL_NAME, AUDITION_TOOL_NAME, AudioRender, AudioRenderRequest,
-    INSTRUMENT_PARAMETER_TOOL_NAME, LOAD_TOOL_GROUP_NAME, PRESET_TOOL_NAME, READ_TOOL_NAME,
-    SOUND_TOOL_PARAMETER_TOOL_NAME, apply_agent_mutation, base64_audio, dynamic_tool_declarations,
-    is_batch_mutation_tool, is_mutation_tool, list_instrument_parameters,
-    list_sound_tool_parameters, list_surge_presets, prepare_audio_render,
-    prepare_instrument_audition, read_sound_graph, tool_declarations,
+    COMMIT_AUDITION_TOOL_NAME, CREATE_AUDITION_TOOL_NAME, DELETE_AUDITION_TOOL_NAME,
+    INSTRUMENT_PARAMETER_TOOL_NAME, LOAD_TOOL_GROUP_NAME, PRESET_TOOL_NAME,
+    READ_AUDITION_TOOL_NAME, READ_TOOL_NAME, SOUND_TOOL_PARAMETER_TOOL_NAME, ToolGroup,
+    apply_agent_mutation, apply_audition_mutation, base64_audio, create_audition_slot,
+    delete_audition_slot, dynamic_tool_declarations, dynamic_tool_group, is_mutation_tool,
+    list_instrument_parameters, list_sound_tool_parameters, list_surge_presets,
+    prepare_audio_render, prepare_instrument_audition, read_audition_slot, read_sound_graph,
+    record_instrument_audition,
 };
 use crate::model::Project;
 use crate::prompt::EditPlan;
@@ -31,6 +34,18 @@ const DEFAULT_INTERACTIONS_ENDPOINT: &str =
 const SYSTEMD_CREDENTIAL_NAME: &str = "gemini-api-key";
 const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 const MAX_INTERACTION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_MUTATIONS_WITHOUT_FEEDBACK: usize = 4;
+const MUSICAL_PLANNING_GUIDANCE: &str = concat!(
+    "Before the first sound-graph mutation, inspect the current graph and form a concise musical ",
+    "plan based on the user's request, selected region, and existing composition. Use that plan ",
+    "to choose tools: rhythm, melody, and harmony map to MIDI pitches, timing, durations, and ",
+    "velocities; register and layering map to tracks and Rack key zones; timbre and articulation ",
+    "map to an initialized or preset instrument and its parameters; movement maps to modulators; ",
+    "tone, dynamics, and space map to effects, routing, and track mix. For example, a planned ",
+    "shorter articulation can use MIDI duration and/or envelope parameters, while a planned ",
+    "register-specific layer can use a new instrument track plus a key zone. These mappings ",
+    "explain how to realize your plan; they do not prescribe the musical choices in it."
+);
 pub(crate) const EDIT_TIMEOUT_SECONDS: u64 = 20 * 60;
 #[cfg(test)]
 const EDIT_TIMEOUT: Duration = Duration::from_secs(EDIT_TIMEOUT_SECONDS);
@@ -39,6 +54,13 @@ const TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(4),
 ];
+
+#[derive(Clone, Copy)]
+struct SessionOptions {
+    new_prompt: bool,
+    deadline: Instant,
+}
+
 #[derive(Debug)]
 pub enum PlannerError {
     Unavailable(String),
@@ -99,10 +121,12 @@ struct LoopState {
     tool_calls: BTreeMap<String, usize>,
     failed_tool_calls: usize,
     mutations_since_listen: usize,
+    mutations_since_feedback: usize,
+    mutations_since_arrangement_listen: usize,
     mutations_before_first_listen: Option<usize>,
     mutations_between_listens: Vec<usize>,
     auditions: usize,
-    auditioned_presets: BTreeSet<String>,
+    auditioned_slots: BTreeSet<u64>,
     applied_auditions: usize,
 }
 
@@ -120,6 +144,8 @@ impl LoopState {
 
     fn record_mutation(&mut self) {
         self.mutations_since_listen += 1;
+        self.mutations_since_feedback += 1;
+        self.mutations_since_arrangement_listen += 1;
     }
 
     fn record_listen(&mut self) {
@@ -131,6 +157,24 @@ impl LoopState {
         }
         self.mutations_since_listen = 0;
         self.audio_listens += 1;
+    }
+
+    fn record_arrangement_feedback(&mut self) {
+        self.mutations_since_feedback = 0;
+    }
+
+    fn record_arrangement_listen(&mut self) {
+        self.record_listen();
+        self.record_arrangement_feedback();
+        self.mutations_since_arrangement_listen = 0;
+    }
+
+    fn periodic_feedback_required(&self) -> bool {
+        self.mutations_since_feedback >= MAX_MUTATIONS_WITHOUT_FEEDBACK
+    }
+
+    fn completion_listen_required(&self) -> bool {
+        self.mutations_since_arrangement_listen > 0
     }
 
     fn metrics(&self, elapsed: Duration) -> JsonValue {
@@ -166,9 +210,7 @@ impl GeminiPlanner {
         start: f32,
         end: f32,
         project: &Project,
-        batch_parameter_tools: bool,
-        slim_prompt: bool,
-        dynamic_tools: bool,
+        new_prompt: bool,
         deadline: Instant,
         cancellation: Arc<AtomicBool>,
         mut render_audio: impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
@@ -180,22 +222,19 @@ impl GeminiPlanner {
             prompt,
             start,
             end,
-            SessionVariants {
-                batch_parameter_tools,
-                slim_prompt,
-                dynamic_tools,
-            },
+            SessionVariants { new_prompt },
         )
         .map_err(PlannerError::Io)?;
+        let options = SessionOptions {
+            new_prompt,
+            deadline,
+        };
         let result = run_session(
             &session,
             prompt,
             start,
             end,
-            batch_parameter_tools,
-            slim_prompt,
-            dynamic_tools,
-            deadline,
+            options,
             cancellation,
             &mut render_audio,
             &mut on_update,
@@ -222,10 +261,7 @@ fn run_session(
     prompt: &str,
     start: f32,
     end: f32,
-    batch_parameter_tools: bool,
-    slim_prompt: bool,
-    dynamic_tools: bool,
-    deadline: Instant,
+    options: SessionOptions,
     cancellation: Arc<AtomicBool>,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
@@ -238,10 +274,7 @@ fn run_session(
         prompt,
         start,
         end,
-        batch_parameter_tools,
-        slim_prompt,
-        dynamic_tools,
-        deadline,
+        options,
         render_audio,
         on_update,
         &|| cancellation.load(Ordering::SeqCst),
@@ -277,10 +310,10 @@ fn run_session_with_transport(
         prompt,
         start,
         end,
-        false,
-        false,
-        false,
-        Instant::now() + EDIT_TIMEOUT,
+        SessionOptions {
+            new_prompt: false,
+            deadline: Instant::now() + EDIT_TIMEOUT,
+        },
         render_audio,
         on_update,
         is_cancelled,
@@ -294,18 +327,15 @@ fn run_session_with_transport_options(
     prompt: &str,
     start: f32,
     end: f32,
-    batch_parameter_tools: bool,
-    slim_prompt: bool,
-    dynamic_tools: bool,
-    deadline: Instant,
+    options: SessionOptions,
     render_audio: &mut impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
     is_cancelled: &impl Fn() -> bool,
     transport: &mut impl FnMut(usize, &JsonValue, Duration) -> Result<String, PlannerError>,
 ) -> Result<GeminiEdit, PlannerError> {
     let started = Instant::now();
-    let mut loaded_tool_group: Option<String> = None;
-    let mut input = JsonValue::String(planner_task(prompt, start, end, slim_prompt));
+    let mut loaded_tool_group: Option<ToolGroup> = None;
+    let mut input = JsonValue::String(planner_task(prompt, start, end, options.new_prompt));
     let mut previous_interaction_id: Option<String> = None;
     let mut sequence = 0_usize;
     let mut state = LoopState::default();
@@ -314,20 +344,17 @@ fn run_session_with_transport_options(
         if is_cancelled() {
             return Err(PlannerError::Interrupted);
         }
-        let remaining = deadline
+        let remaining = options
+            .deadline
             .checked_duration_since(Instant::now())
             .ok_or(PlannerError::TimedOut)?;
         sequence += 1;
-        let tools = if dynamic_tools {
-            dynamic_tool_declarations(batch_parameter_tools, loaded_tool_group.as_deref())
-        } else {
-            tool_declarations(batch_parameter_tools)
-        };
+        let tools = dynamic_tool_declarations(loaded_tool_group);
         let mut request = serde_json::json!({
             "model": GEMINI_MODEL,
             "input": input,
             "tools": &tools,
-            "system_instruction": system_instruction(slim_prompt),
+            "system_instruction": system_instruction(options.new_prompt),
             "generation_config": {"thinking_level": "high"},
             "store": true
         });
@@ -362,6 +389,12 @@ fn run_session_with_transport_options(
                 ));
                 continue;
             }
+            if state.completion_listen_required() {
+                input = JsonValue::String(format!(
+                    "Before completing, call {AUDIO_TOOL_NAME} after the latest successful project mutation and listen to the returned WAV. The render must succeed; {ANALYZE_AUDIO_TOOL_NAME} measurements and isolated audition audio do not verify the arrangement."
+                ));
+                continue;
+            }
             let (plan, project) = session
                 .finish(state.plans)
                 .map_err(|message| invalid(&message))?;
@@ -385,37 +418,52 @@ fn run_session_with_transport_options(
                 return Err(PlannerError::Interrupted);
             }
             state.record_call(&call.name);
-            let output = if index == 0 && dynamic_tools && call.name == LOAD_TOOL_GROUP_NAME {
+            let output = if index == 0 && call.name == LOAD_TOOL_GROUP_NAME {
                 let group = call
                     .arguments
                     .get("group")
                     .and_then(JsonValue::as_str)
-                    .filter(|group| matches!(*group, "arrangement" | "sound"));
+                    .and_then(ToolGroup::parse);
                 match group {
                     Some(group) => {
-                        loaded_tool_group = Some(group.to_owned());
-                        ToolOutput::text(format!("Loaded {group} editing tools"))
+                        loaded_tool_group = Some(group);
+                        let group_name = group.as_str();
+                        let available_tools = dynamic_tool_declarations(loaded_tool_group)
+                            .into_iter()
+                            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                            .collect::<Vec<_>>();
+                        ToolOutput::text(
+                            serde_json::json!({
+                                "message":format!("Loaded {group_name} editing tools"),
+                                "group":group_name,
+                                "availableTools":available_tools
+                            })
+                            .to_string(),
+                        )
                     }
                     None => ToolOutput::text(
                         "Tool error: group must be arrangement or sound".to_owned(),
                     ),
                 }
+            } else if index == 0 && !tools.iter().any(|tool| tool["name"] == call.name) {
+                let recovery = dynamic_tool_group(&call.name).map_or_else(
+                    || format!("tool {} is unknown", call.name),
+                    |group| {
+                        let group = group.as_str();
+                        format!(
+                            "{} is not currently available; call {LOAD_TOOL_GROUP_NAME} with {{\"group\":\"{group}\"}}",
+                            call.name
+                        )
+                    },
+                );
+                ToolOutput::text(format!("Tool error: {recovery}"))
             } else if index == 0
-                && !tools.iter().any(|tool| tool["name"] == call.name)
-                && (dynamic_tools || (!batch_parameter_tools && is_batch_mutation_tool(&call.name)))
+                && state.periodic_feedback_required()
+                && is_project_mutation_call(&call)
             {
-                let message = if dynamic_tools {
-                    format!(
-                        "Tool error: {} is not currently available; call {LOAD_TOOL_GROUP_NAME} for the required editing group",
-                        call.name
-                    )
-                } else {
-                    format!(
-                        "Tool error: {} is not available in the current session",
-                        call.name
-                    )
-                };
-                ToolOutput::text(message)
+                ToolOutput::text(format!(
+                    "Tool error: at most {MAX_MUTATIONS_WITHOUT_FEEDBACK} successful project mutations may occur without arrangement feedback. Call {ANALYZE_AUDIO_TOOL_NAME} or {AUDIO_TOOL_NAME}, then retry this mutation. The feedback must succeed; isolated audition audio does not qualify."
+                ))
             } else if index == 0 {
                 execute_tool(
                     session,
@@ -458,6 +506,11 @@ struct FunctionCall {
     id: String,
     name: String,
     arguments: JsonValue,
+}
+
+fn is_project_mutation_call(call: &FunctionCall) -> bool {
+    (is_mutation_tool(&call.name) || call.name == "set_parameter")
+        && (call.name == COMMIT_AUDITION_TOOL_NAME || call.arguments.get("auditionId").is_none())
 }
 
 struct ToolOutput {
@@ -554,14 +607,40 @@ fn execute_tool(
             list_sound_tool_parameters(session.path(), &call.arguments)
                 .unwrap_or_else(|error| format!("Tool error: {error}")),
         )),
+        CREATE_AUDITION_TOOL_NAME => Ok(ToolOutput::text(
+            create_audition_slot(session.path(), &call.arguments)
+                .unwrap_or_else(|error| format!("Tool error: {error}")),
+        )),
+        READ_AUDITION_TOOL_NAME => Ok(ToolOutput::text(
+            read_audition_slot(session.path(), &call.arguments)
+                .unwrap_or_else(|error| format!("Tool error: {error}")),
+        )),
+        DELETE_AUDITION_TOOL_NAME => Ok(ToolOutput::text(
+            delete_audition_slot(session.path(), &call.arguments)
+                .unwrap_or_else(|error| format!("Tool error: {error}")),
+        )),
+        name if name != COMMIT_AUDITION_TOOL_NAME
+            && (is_mutation_tool(name) || name == "set_parameter")
+            && call.arguments.get("auditionId").is_some() =>
+        {
+            Ok(ToolOutput::text(
+                apply_audition_mutation(session.path(), name, &call.arguments)
+                    .unwrap_or_else(|error| format!("Tool error: {error}")),
+            ))
+        }
         name if is_mutation_tool(name) || name == "set_parameter" => Ok(ToolOutput::text(
             apply_and_commit_mutation(session, &call.arguments, name, state, on_update)?,
         )),
         ANALYZE_AUDIO_TOOL_NAME => {
-            let result = prepare_audio_render(session.path(), &call.arguments)
+            let result = match prepare_audio_render(session.path(), &call.arguments)
                 .and_then(render_audio)
-                .map(|audio| audio.measurements.to_string())
-                .unwrap_or_else(|error| format!("Tool error: {error}"));
+            {
+                Ok(audio) => {
+                    state.record_arrangement_feedback();
+                    audio.measurements.to_string()
+                }
+                Err(error) => format!("Tool error: {error}"),
+            };
             Ok(ToolOutput::text(result))
         }
         AUDIO_TOOL_NAME | AUDITION_TOOL_NAME => {
@@ -572,19 +651,31 @@ fn execute_tool(
             };
             match prepared.and_then(render_audio) {
                 Ok(audio) => {
-                    state.record_listen();
+                    if call.name == AUDIO_TOOL_NAME {
+                        state.record_arrangement_listen();
+                    } else {
+                        state.record_listen();
+                    }
                     if call.name == AUDITION_TOOL_NAME {
                         state.auditions += 1;
-                        if let Some(preset) = call.arguments["presetId"].as_str() {
-                            state.auditioned_presets.insert(preset.to_owned());
+                        if let Some(audition_id) = call.arguments["auditionId"].as_u64() {
+                            state.auditioned_slots.insert(audition_id);
                         }
                     }
                     state.audio_artifacts += 1;
                     let audio_name = session
                         .record_audio(sequence * 1_000_000 + state.audio_artifacts, &audio.wav)
                         .map_err(PlannerError::Io)?;
-                    let description =
+                    let mut description =
                         format!("{} Session artifact: {audio_name}.", audio.description);
+                    if call.name == AUDITION_TOOL_NAME
+                        && let Err(error) =
+                            record_instrument_audition(session.path(), &call.arguments)
+                    {
+                        description.push_str(&format!(
+                            " Advisory warning: the audition succeeded, but its note provenance could not be recorded: {error}."
+                        ));
+                    }
                     let output = ToolOutput {
                         result: vec![serde_json::json!({
                             "type": "text",
@@ -650,10 +741,10 @@ fn apply_and_commit_mutation(
                 .map_err(|message| invalid(&message))?;
             state.plans.push(plan);
             state.record_mutation();
-            if name == "set_surge_preset"
-                && arguments["presetId"]
-                    .as_str()
-                    .is_some_and(|preset| state.auditioned_presets.contains(preset))
+            if name == COMMIT_AUDITION_TOOL_NAME
+                && arguments["auditionId"]
+                    .as_u64()
+                    .is_some_and(|audition_id| state.auditioned_slots.contains(&audition_id))
             {
                 state.applied_auditions += 1;
             }
@@ -972,43 +1063,56 @@ fn missing_credentials(path: Option<&Path>) -> PlannerError {
     ))
 }
 
-fn planner_task(prompt: &str, start: f32, end: f32, slim_prompt: bool) -> String {
-    if slim_prompt {
+fn planner_task(prompt: &str, start: f32, end: f32, new_prompt: bool) -> String {
+    if new_prompt {
         return format!(
-            "Selected edit region: {start:.3} to {end:.3} seconds.\nUser request: {prompt}\n\nInspect the current project, use the available tools to make the requested change, listen to candidate and edited sounds, and iterate based on the rendered audio."
+            concat!(
+                "Selected edit region: {start:.3} to {end:.3} seconds. This bounds MIDI arrangement edits, not listening or analysis.\n",
+                "User request: {prompt}\n\n",
+                "Complete the request in the existing project. Inspect the current graph first, identify the exact material the request refers to, form a concise musical plan before changing the graph, and preserve unrelated material. ",
+                "Load the editing tool group needed for the next action, work through studio tools, evaluate the resulting project with explicitly selected audio, and continue until the project itself fulfills the request."
+            ),
+            start = start,
+            end = end,
+            prompt = prompt
         );
     }
     format!(
-        "Selected edit region: {start:.3} to {end:.3} seconds. This bounds graph edits, not listening.\nUser request: {prompt}\n\nBegin by reading the current sound graph. Before editing, form a concise musical plan for the selected region's arrangement based on the user's request, requested genre, and existing composition. Plan the section roles, rhythm, harmony, orchestration, energy contour, transitions, and sound design needed to make the genre and request recognizable. For creative work, listen after each change, compare the sound with the user's request, and iterate on composition and sound design until they match. Establish an audible baseline, audition important sound choices on isolated tracks, and evaluate the final full mix."
+        "Selected edit region: {start:.3} to {end:.3} seconds. This bounds MIDI arrangement edits, not listening.\nUser request: {prompt}\n\nRead the current sound graph, infer the musical intent from the request and existing composition, and form a concise musical plan before changing the graph. Then implement that plan with the studio tools. Use audition slots when exploring sounds, and render the arrangement to listen after its final audible change."
     )
 }
 
-fn system_instruction(slim_prompt: bool) -> String {
-    if slim_prompt {
-        return "You are interacting with a DAW-like environment powered by Surge XT. Perform the user's request using the available tools. Inspect the project, listen to relevant candidate and edited sounds, and iterate from the rendered audio until the request is complete.".to_owned();
-    }
-    format!(
-        concat!(
-            "You are the autonomous sound-graph producer inside DAW-AI. Use the registered tools; ",
-            "you cannot alter the graph by merely describing changes. First inspect the graph and form ",
-            "a concise musical plan for the arrangement based on the user's request, requested genre, ",
-            "selected region, and existing composition. The selected region bounds edits only; every audio-tool call chooses ",
-            "its own absolute project start and end, so include surrounding context when useful. Read ",
-            "the graph before editing. For creative or style-based work, listen after each change, ",
-            "compare the audible result with the user's request, and iterate on composition and sound ",
-            "design until they match. Listen before editing, audition important preset or effect choices ",
-            "on isolated tracks, and evaluate the final full mix. ",
-            "When you listen, reason from the WAV itself. Use analyze_audio separately when standard objective signal measurements would help; do not treat those measurements as musical judgments. ",
-            "If a style depends on intensification, express it ",
-            "through composition and rhythmic subdivision when appropriate. Default drums, bass grooves, ",
-            "chord accompaniment, arpeggios, and repeated riffs to musical beat loops; reserve one-shot ",
-            "MIDI phrases mainly for melody and genuinely non-repeating fills or transitions. Do not assume the project ",
-            "tempo must change. Continue until the result fulfills the request, then finish. There is no ",
-            "separate completion reviewer. There is no ",
-            "predetermined tool-call or iteration limit; the request timeout is the only loop limit.\n\n{}"
-        ),
-        STUDIO_CONTRACT
-    )
+fn system_instruction(new_prompt: bool) -> String {
+    let mut instruction = if new_prompt {
+        format!(
+            concat!(
+                "You are the autonomous producer inside DAW-AI. Make the user's requested change in the existing project with tools; prose alone changes nothing. ",
+                "Choose the musical result yourself from the request and current composition. Contract descriptions and examples explain mechanics, never preferred musical choices. ",
+                "{} ",
+                "Work from evidence: inspect authoritative graph state before acting, treat follow-up requests as edits to that current state, and preserve material the user did not ask to change. ",
+                "Use exact returned IDs and values, load the editing tool group needed for the next action, and update your understanding after every result because rejected calls change nothing. ",
+                "Use audition slots when exploring or customizing sounds outside the arrangement. For arrangement evidence, explicitly choose the tracks and range to render. Reason from heard WAV audio for audible claims; use analyze_audio only for objective signal measurements. ",
+                "Continue until the actual project state fulfills the request. There is no separate completion reviewer or predetermined tool-call limit; the request timeout is the only loop limit.\n\n{}"
+            ),
+            MUSICAL_PLANNING_GUIDANCE, STUDIO_CONTRACT
+        )
+    } else {
+        format!(
+            concat!(
+                "You are the autonomous producer inside DAW-AI. Decide the musical result from the user's request, selected region, and current composition. ",
+                "Use registered tools to implement the result; describing an edit does not change the project. Inspect authoritative state before relying on it. ",
+                "Use your own musical judgment rather than treating tool descriptions or examples as composition advice. The studio contract explains mechanics and constraints. ",
+                "{} ",
+                "When audio would resolve uncertainty or verify completion, render it and reason from the WAV itself. Use analyze_audio only for objective signal measurements, not as a substitute for listening or musical judgment. ",
+                "You may iterate as needed until the user's request is fulfilled. There is no separate completion reviewer and no predetermined tool-call limit; the request timeout is the only loop limit.\n\n{}"
+            ),
+            MUSICAL_PLANNING_GUIDANCE, STUDIO_CONTRACT
+        )
+    };
+    instruction.push_str(&format!(
+        "\n\nAfter at most {MAX_MUTATIONS_WITHOUT_FEEDBACK} successful project mutations, call {ANALYZE_AUDIO_TOOL_NAME} or {AUDIO_TOOL_NAME}; the checkpoint call must succeed. Before completing, you must successfully call {AUDIO_TOOL_NAME} after the final project mutation and listen to its returned WAV. {ANALYZE_AUDIO_TOOL_NAME} is useful for objective measurements but does not satisfy this final-listen requirement. Isolated audition audio does not satisfy either arrangement requirement."
+    ));
+    instruction
 }
 
 fn api_error_message(error: &JsonValue) -> String {
@@ -1217,16 +1321,34 @@ mod tests {
         let responses = [
             serde_json::json!({
                 "id":"multi","status":"requires_action","steps":[
-                    {"type":"function_call","id":"edit-bass","name":"set_parameter",
-                     "arguments":preset_edit("Factory/Leads/Classic Lead 1")},
+                    {"type":"function_call","id":"load-sound","name":LOAD_TOOL_GROUP_NAME,
+                     "arguments":{"group":"sound"}},
                     {"type":"function_call","id":"tempo-early","name":"set_tempo",
                      "arguments":{"bpm":140}}
                 ]
             }),
             serde_json::json!({
+                "id":"edit","status":"requires_action","steps":[{
+                    "type":"function_call","id":"edit-bass","name":"set_surge_preset",
+                    "arguments":{"trackId":2,"presetId":"Factory/Leads/Classic Lead 1"}
+                }]
+            }),
+            serde_json::json!({
+                "id":"load","status":"requires_action","steps":[{
+                    "type":"function_call","id":"load-arrangement","name":LOAD_TOOL_GROUP_NAME,
+                    "arguments":{"group":"arrangement"}
+                }]
+            }),
+            serde_json::json!({
                 "id":"tempo","status":"requires_action","steps":[{
                     "type":"function_call","id":"tempo-retry","name":"set_tempo",
                     "arguments":{"bpm":140}
+                }]
+            }),
+            serde_json::json!({
+                "id":"listen","status":"requires_action","steps":[{
+                    "type":"function_call","id":"listen-final","name":AUDIO_TOOL_NAME,
+                    "arguments":{"tracks":"all","start":0,"end":4}
                 }]
             }),
             serde_json::json!({"id":"done","status":"completed","steps":[]}),
@@ -1268,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_tools_reject_calls_outside_the_loaded_group() {
+    fn dynamic_tool_loading_is_always_enforced() {
         let session =
             EditSession::create(&Project::demo(), "change tempo", 0.0, 4.0).expect("session");
         let responses = [
@@ -1290,25 +1412,39 @@ mod tests {
                     "arguments":{"bpm":140}
                 }]
             }),
+            serde_json::json!({
+                "id":"listen","status":"requires_action","steps":[{
+                    "type":"function_call","id":"listen-final","name":AUDIO_TOOL_NAME,
+                    "arguments":{"tracks":"all","start":0,"end":4}
+                }]
+            }),
             serde_json::json!({"id":"done","status":"completed","steps":[]}),
         ];
         let mut response_index = 0;
         let mut rejected_stale_call = false;
+        let mut load_reported_available_tools = false;
         let result = run_session_with_transport_options(
             &session,
             "change tempo",
             0.0,
             4.0,
-            false,
-            false,
-            true,
-            Instant::now() + EDIT_TIMEOUT,
+            SessionOptions {
+                new_prompt: false,
+                deadline: Instant::now() + EDIT_TIMEOUT,
+            },
             &mut render_audio_request,
             &mut |edit| Ok(edit.project),
             &|| false,
             &mut |sequence, request, _| {
                 if sequence == 2 {
-                    rejected_stale_call = request.to_string().contains("not currently available");
+                    let request = request.to_string();
+                    rejected_stale_call = request.contains("not currently available")
+                        && request.contains(r#"load_tool_group with {\"group\":\"arrangement\"}"#);
+                }
+                if sequence == 3 {
+                    let request = request.to_string();
+                    load_reported_available_tools =
+                        request.contains("availableTools") && request.contains("add_midi_clip");
                 }
                 let response = responses[response_index].to_string();
                 response_index += 1;
@@ -1318,60 +1454,165 @@ mod tests {
         .expect("dynamic tool session");
 
         assert!(rejected_stale_call);
+        assert!(load_reported_available_tools);
         assert_eq!(result.project.bpm, 140);
         assert_eq!(session.stats().unwrap().0, 1);
     }
 
     #[test]
-    fn disabled_batch_tools_cannot_execute_undeclared_calls() {
+    fn batch_parameter_tools_are_available_in_the_sound_group() {
         let session =
             EditSession::create(&Project::demo(), "change tempo", 0.0, 4.0).expect("session");
         let responses = [
             serde_json::json!({
+                "id":"load","status":"requires_action","steps":[{
+                    "type":"function_call","id":"load-sound","name":LOAD_TOOL_GROUP_NAME,
+                    "arguments":{"group":"sound"}
+                }]
+            }),
+            serde_json::json!({
                 "id":"batch","status":"requires_action","steps":[{
-                    "type":"function_call","id":"batch-stale",
+                    "type":"function_call","id":"batch-edit",
                     "name":"set_instrument_parameters",
                     "arguments":{"trackId":2,"changes":[{"parameter":"native:264","value":"0.4"}]}
                 }]
             }),
             serde_json::json!({
-                "id":"tempo","status":"requires_action","steps":[{
-                    "type":"function_call","id":"tempo-allowed","name":"set_tempo",
-                    "arguments":{"bpm":140}
+                "id":"listen","status":"requires_action","steps":[{
+                    "type":"function_call","id":"listen-final","name":AUDIO_TOOL_NAME,
+                    "arguments":{"tracks":[2],"start":0,"end":4}
                 }]
             }),
             serde_json::json!({"id":"done","status":"completed","steps":[]}),
         ];
         let mut response_index = 0;
-        let mut rejected_batch_call = false;
         let result = run_session_with_transport_options(
             &session,
             "change tempo",
             0.0,
             4.0,
-            false,
-            false,
-            false,
-            Instant::now() + EDIT_TIMEOUT,
+            SessionOptions {
+                new_prompt: false,
+                deadline: Instant::now() + EDIT_TIMEOUT,
+            },
             &mut render_audio_request,
             &mut |edit| Ok(edit.project),
             &|| false,
+            &mut |_, _, _| {
+                let response = responses[response_index].to_string();
+                response_index += 1;
+                Ok(response)
+            },
+        )
+        .expect("standard batch session");
+
+        assert_eq!(
+            result.project.tracks[1].instrument.native_overrides[&264],
+            0.4
+        );
+        assert_eq!(session.stats().unwrap().0, 1);
+    }
+
+    #[test]
+    fn arrangement_feedback_is_always_enforced_periodically_and_before_completion() {
+        let session =
+            EditSession::create(&Project::demo(), "shape the mix", 0.0, 4.0).expect("session");
+        let volume_call = |id: &str, volume: f64| {
+            serde_json::json!({
+                "id":id,"status":"requires_action","steps":[{
+                    "type":"function_call","id":format!("{id}-call"),"name":"set_track_volume",
+                    "arguments":{"trackId":2,"volume":volume}
+                }]
+            })
+        };
+        let responses = [
+            serde_json::json!({
+                "id":"load","status":"requires_action","steps":[{
+                    "type":"function_call","id":"load-arrangement","name":LOAD_TOOL_GROUP_NAME,
+                    "arguments":{"group":"arrangement"}
+                }]
+            }),
+            volume_call("edit-1", 0.9),
+            volume_call("edit-2", 0.8),
+            volume_call("edit-3", 0.7),
+            volume_call("edit-4", 0.6),
+            volume_call("blocked-edit-5", 0.5),
+            serde_json::json!({
+                "id":"analysis","status":"requires_action","steps":[{
+                    "type":"function_call","id":"analysis-call","name":ANALYZE_AUDIO_TOOL_NAME,
+                    "arguments":{"tracks":[2],"start":0,"end":1}
+                }]
+            }),
+            volume_call("edit-5", 0.5),
+            serde_json::json!({"id":"premature-done","status":"completed","steps":[]}),
+            serde_json::json!({
+                "id":"listen","status":"requires_action","steps":[{
+                    "type":"function_call","id":"listen-call","name":AUDIO_TOOL_NAME,
+                    "arguments":{"tracks":[2],"start":0,"end":1}
+                }]
+            }),
+            serde_json::json!({"id":"done","status":"completed","steps":[]}),
+        ];
+        let mut response_index = 0;
+        let mut updates = 0;
+        let mut renders = 0;
+        let mut periodic_enforcement_reported = false;
+        let mut completion_enforcement_reported = false;
+        let result = run_session_with_transport_options(
+            &session,
+            "shape the mix",
+            0.0,
+            4.0,
+            SessionOptions {
+                new_prompt: false,
+                deadline: Instant::now() + EDIT_TIMEOUT,
+            },
+            &mut |request| {
+                renders += 1;
+                render_audio_request(request)
+            },
+            &mut |edit| {
+                updates += 1;
+                Ok(edit.project)
+            },
+            &|| false,
             &mut |sequence, request, _| {
-                if sequence == 2 {
-                    rejected_batch_call = request
+                if sequence == 1 {
+                    assert!(
+                        request["system_instruction"]
+                            .as_str()
+                            .is_some_and(|instruction| instruction
+                                .contains("After at most 4 successful project mutations"))
+                    );
+                }
+                if sequence == 7 {
+                    periodic_enforcement_reported = request
                         .to_string()
-                        .contains("not available in the current session");
+                        .contains("at most 4 successful project mutations");
+                }
+                if sequence == 10 {
+                    completion_enforcement_reported =
+                        request.to_string().contains("Before completing");
                 }
                 let response = responses[response_index].to_string();
                 response_index += 1;
                 Ok(response)
             },
         )
-        .expect("non-batch session");
+        .expect("arrangement-feedback session");
 
-        assert!(rejected_batch_call);
-        assert_eq!(result.project.bpm, 140);
-        assert_eq!(session.stats().unwrap().0, 1);
+        assert!(periodic_enforcement_reported);
+        assert!(completion_enforcement_reported);
+        assert_eq!(response_index, responses.len());
+        assert_eq!(updates, 5);
+        assert_eq!(renders, 2);
+        assert!((result.project.tracks[1].volume - 0.5).abs() < f32::EPSILON);
+        assert_eq!(session.stats().unwrap(), (5, 1));
+        let metadata: JsonValue =
+            serde_json::from_str(&session.metadata_source().unwrap()).expect("session metadata");
+        assert_eq!(metadata["metrics"]["failedToolCalls"], 1);
+        assert_eq!(metadata["metrics"]["toolCalls"][ANALYZE_AUDIO_TOOL_NAME], 1);
+        assert_eq!(metadata["metrics"]["toolCalls"][AUDIO_TOOL_NAME], 1);
     }
 
     #[test]
@@ -1380,9 +1621,15 @@ mod tests {
             EditSession::create(&Project::demo(), "shape the bass", 0.0, 4.0).expect("session");
         let responses = [
             serde_json::json!({
+                "id": "load", "status": "requires_action", "steps": [{
+                    "type": "function_call", "id": "load-sound", "name": LOAD_TOOL_GROUP_NAME,
+                    "arguments": {"group": "sound"}
+                }]
+            }),
+            serde_json::json!({
                 "id": "edit", "status": "requires_action", "steps": [{
-                    "type": "function_call", "id": "edit-bass", "name": "set_parameter",
-                    "arguments": preset_edit("Factory/Leads/Classic Lead 1")
+                    "type": "function_call", "id": "edit-bass", "name": "set_surge_preset",
+                    "arguments": {"trackId": 2, "presetId": "Factory/Leads/Classic Lead 1"}
                 }]
             }),
             serde_json::json!({
@@ -1418,7 +1665,7 @@ mod tests {
         )
         .expect("producer session");
 
-        assert_eq!(response_index, 3);
+        assert_eq!(response_index, 4);
         assert_eq!(updates, 1);
         assert_eq!(
             result.project.tracks[1].instrument.preset,
@@ -1427,7 +1674,7 @@ mod tests {
         assert_eq!(session.stats().unwrap(), (1, 1));
         let metadata: JsonValue =
             serde_json::from_str(&session.metadata_source().unwrap()).expect("session metadata");
-        assert_eq!(metadata["metrics"]["totalToolCalls"], 2);
+        assert_eq!(metadata["metrics"]["totalToolCalls"], 3);
         assert_eq!(metadata["metrics"]["toolCalls"][AUDIO_TOOL_NAME], 1);
         assert_eq!(metadata["metrics"]["mutationsBeforeFirstListen"], 1);
     }
@@ -1613,36 +1860,59 @@ mod tests {
     }
 
     #[test]
-    fn gemini_prompt_encourages_iterative_listening_without_a_tempo_assumption() {
+    fn gemini_prompt_explains_mechanics_without_composition_prescriptions() {
         let task = planner_task("make the bass hit harder", 4.0, 8.0, false);
         let instruction = system_instruction(false);
-        assert!(task.contains("listen after each change"));
-        assert!(task.contains("iterate on composition and sound design"));
-        assert!(task.contains("requested genre"));
-        assert!(task.contains("section roles, rhythm, harmony, orchestration"));
-        assert!(instruction.contains("requested genre"));
-        assert!(instruction.contains("concise musical plan for the arrangement"));
-        assert!(instruction.contains("selected region bounds edits only"));
-        assert!(instruction.contains("chooses its own absolute project start and end"));
-        assert!(instruction.contains("listen after each change"));
-        assert!(instruction.contains("iterate on composition and sound design"));
+        assert!(task.contains("infer the musical intent"));
+        assert!(task.contains("form a concise musical plan before changing the graph"));
+        assert!(task.contains("audition slots"));
+        assert!(instruction.contains("own musical judgment"));
+        assert!(instruction.contains("mechanics and constraints"));
+        assert!(instruction.contains("Before the first sound-graph mutation"));
+        assert!(instruction.contains("rhythm, melody, and harmony map to MIDI"));
+        assert!(instruction.contains("register and layering map to tracks and Rack key zones"));
+        assert!(instruction.contains("timbre and articulation"));
+        assert!(instruction.contains("planned shorter articulation"));
+        assert!(instruction.contains("Instrument Rack"));
+        assert!(
+            instruction.contains("same Instrument, that Instrument receives the note only once")
+        );
+        assert!(instruction.contains("mutable, session-scoped sound state"));
         assert!(instruction.contains("analyze_audio"));
         assert!(instruction.contains("reason from the WAV itself"));
-        assert!(instruction.contains("rhythmic subdivision"));
-        assert!(instruction.contains("Default drums, bass grooves"));
-        assert!(instruction.contains("reserve one-shot MIDI phrases mainly for melody"));
-        assert!(instruction.contains("tempo must change"));
+        assert!(!instruction.contains("Default drums"));
+        assert!(!instruction.contains("rhythmic subdivision"));
+        assert!(!instruction.contains("energy contour"));
         assert!(instruction.contains("no separate completion reviewer"));
-        assert!(instruction.contains("no predetermined tool-call or iteration limit"));
-        assert_eq!(
-            system_instruction(true),
-            "You are interacting with a DAW-like environment powered by Surge XT. Perform the user's request using the available tools. Inspect the project, listen to relevant candidate and edited sounds, and iterate from the rendered audio until the request is complete."
-        );
-        assert!(!system_instruction(true).contains("rhythmic subdivision"));
-        let trimmed_task = planner_task("make the bass hit harder", 4.0, 8.0, true);
-        assert!(trimmed_task.contains("User request: make the bass hit harder"));
-        assert!(trimmed_task.contains("listen to candidate and edited sounds"));
-        assert!(!trimmed_task.contains("musical plan"));
+        assert!(instruction.contains("no predetermined tool-call limit"));
+        assert!(instruction.contains("After at most 4 successful project mutations"));
+        assert!(instruction.contains(ANALYZE_AUDIO_TOOL_NAME));
+        assert!(instruction.contains(AUDIO_TOOL_NAME));
+        assert!(instruction.contains("does not satisfy this final-listen requirement"));
+        let new_instruction = system_instruction(true);
+        assert!(new_instruction.contains("examples explain mechanics"));
+        assert!(new_instruction.contains("follow-up requests as edits to that current state"));
+        assert!(new_instruction.contains("preserve material the user did not ask to change"));
+        assert!(new_instruction.contains("explicitly choose the tracks and range to render"));
+        assert!(new_instruction.contains("create_audition_slot"));
+        let new_task = planner_task("make the bass hit harder", 4.0, 8.0, true);
+        assert!(new_task.contains("User request: make the bass hit harder"));
+        assert!(new_task.contains("Inspect the current graph first"));
+        assert!(new_task.contains("form a concise musical plan before changing the graph"));
+        assert!(new_task.contains("preserve unrelated material"));
+        assert!(new_task.contains("Load the editing tool group"));
+    }
+
+    #[test]
+    fn analysis_cannot_replace_the_required_final_arrangement_listen() {
+        let mut state = LoopState::default();
+        state.record_mutation();
+        state.record_arrangement_feedback();
+        assert!(!state.periodic_feedback_required());
+        assert!(state.completion_listen_required());
+
+        state.record_arrangement_listen();
+        assert!(!state.completion_listen_required());
     }
 
     #[test]

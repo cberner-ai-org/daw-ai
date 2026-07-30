@@ -714,7 +714,7 @@ async function run() {
     );
     const timelineMidi = await evaluate(cdp, appSession, `(async () => {
         const project = await fetch('/api/project').then((response) => response.json());
-        const graphEvents = project.tracks.flatMap((track) => track.clips.flatMap((clip) => clip.events));
+        const graphEvents = project.clips.flatMap((clip) => clip.events);
         const notes = [...document.querySelectorAll('.timeline-midi i')];
         const levels = notes.map((note) => Number(note.style.getPropertyValue('--timeline-note-level')));
         const positions = notes.map((note) => Number.parseFloat(note.style.getPropertyValue('--timeline-note-left')));
@@ -958,9 +958,8 @@ async function run() {
         panelPadding: parseFloat(getComputedStyle(document.querySelector('#debug-panel')).paddingTop),
         reportHeight: document.querySelector('#debug-report').getBoundingClientRect().height,
         settingsDisplay: getComputedStyle(document.querySelector('.debug-settings')).display,
-        batchParameterTools: document.querySelector('#batch-parameter-tools').checked,
-        slimPrompt: document.querySelector('#slim-prompt').checked,
-        dynamicTools: document.querySelector('#dynamic-tools').checked,
+        newPrompt: document.querySelector('#new-prompt').checked,
+        removedPolicyToggles: document.querySelector('#require-analysis, #dynamic-tools'),
       };
     })()`);
     assert.deepEqual(
@@ -972,9 +971,8 @@ async function run() {
       "the two chartered studio views must be exposed as tabs",
     );
     assert.equal(debugView.debugVisible && debugView.aiHidden, true, "Debug must replace the AI Mode panel");
-    assert.equal(debugView.batchParameterTools, false, "batch parameter tools must default off");
-    assert.equal(debugView.slimPrompt, false, "slim prompt must default off");
-    assert.equal(debugView.dynamicTools, false, "dynamic tools must default off independently");
+    assert.equal(debugView.newPrompt, false, "the new prompt experiment must default off");
+    assert.equal(debugView.removedPolicyToggles, null, "always-on policies must not have toggles");
     assert.ok(
       debugView.panelPadding >= 20 &&
         debugView.reportHeight >= 400 &&
@@ -990,12 +988,12 @@ async function run() {
     );
     assert.equal(
       await evaluate(cdp, appSession, `(() => {
-        const toggle = document.querySelector('#batch-parameter-tools');
+        const toggle = document.querySelector('#new-prompt');
         toggle.click();
-        return localStorage.getItem('daw-ai.batch-parameter-tools.v1');
+        return localStorage.getItem('daw-ai.new-prompt.v1');
       })()`),
       "true",
-      "the Debug experiment toggle must persist locally",
+      "the new-prompt toggle must persist locally",
     );
     const sessions = await evaluate(
       cdp,
@@ -1315,17 +1313,13 @@ async function run() {
       const originalFetch = window.fetch;
       window.__refusedEditRequests = 0;
       window.__refusedEditBody = null;
-      window.__persistedBatchAtRequest = null;
-      window.__persistedSlimAtRequest = null;
-      window.__persistedDynamicAtRequest = null;
+      window.__persistedNewPromptAtRequest = null;
       window.fetch = function fetch(resource, options) {
         if (resource === '/api/edits') {
           window.__refusedEditRequests += 1;
           window.__refusedEditBody = options.body.toString();
           const pending = JSON.parse(localStorage.getItem('daw-ai.pending-edit.v1'));
-          window.__persistedBatchAtRequest = pending.batchParameterTools;
-          window.__persistedSlimAtRequest = pending.slimPrompt;
-          window.__persistedDynamicAtRequest = pending.dynamicTools;
+          window.__persistedNewPromptAtRequest = pending.newPrompt;
           return Promise.resolve(new Response(JSON.stringify({ error: 'Edit request refused' }), {
             status: 422,
             headers: { 'Content-Type': 'application/json' },
@@ -1336,8 +1330,6 @@ async function run() {
       window.__restoreFetchAfterRefusedEdit = () => {
         window.fetch = originalFetch;
       };
-      document.querySelector('#slim-prompt').click();
-      document.querySelector('#dynamic-tools').click();
       const input = document.querySelector('#prompt-input');
       input.value = 'refused edit';
       document.querySelector('#prompt-form').requestSubmit();
@@ -1365,34 +1357,24 @@ async function run() {
       "Object.fromEntries(new URLSearchParams(window.__refusedEditBody))",
     );
     assert.equal(
-      refusedEditBody.batch_parameter_tools,
-      "true",
-      "the selected batch-tool variant must travel with the edit request",
+      refusedEditBody.require_analysis,
+      undefined,
+      "the removed required-analysis setting must not travel with the edit request",
     );
     assert.equal(
-      await evaluate(cdp, appSession, "window.__persistedBatchAtRequest"),
-      true,
-      "the variant must be retained with an unaccepted recoverable edit",
-    );
-    assert.equal(
-      refusedEditBody.slim_prompt,
+      refusedEditBody.new_prompt,
       "true",
-      "the selected slim-prompt variant must travel with the edit request",
+      "the selected new-prompt variant must travel with the edit request",
     );
     assert.equal(
       refusedEditBody.dynamic_tools,
-      "true",
-      "the selected dynamic-tools variant must travel independently",
+      undefined,
+      "the removed dynamic-tools setting must not travel with the edit request",
     );
     assert.equal(
-      await evaluate(cdp, appSession, "window.__persistedSlimAtRequest"),
+      await evaluate(cdp, appSession, "window.__persistedNewPromptAtRequest"),
       true,
-      "the slim-prompt variant must be retained with an unaccepted edit",
-    );
-    assert.equal(
-      await evaluate(cdp, appSession, "window.__persistedDynamicAtRequest"),
-      true,
-      "the dynamic-tools variant must be retained with an unaccepted edit",
+      "the new-prompt variant must be retained with an unaccepted edit",
     );
     assert.equal(
       await evaluate(cdp, appSession, "document.querySelector('#reference-audio')"),

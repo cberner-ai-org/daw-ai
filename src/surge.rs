@@ -1,10 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
 };
 
 use surge_rs::glue::synthesizer::{SurgeId, SurgeSynthesizer};
 
+use crate::concurrency::RecoverPoison;
 use crate::model::{Effect, Instrument, Modulator};
 
 pub(crate) const BLOCK_SIZE: usize = 32;
@@ -38,12 +39,13 @@ pub(crate) fn is_native_modulator(track_id: u64, modulator: &Modulator) -> bool 
 
 static SURGE_ENGINE_LOCK: Mutex<()> = Mutex::new(());
 type InstrumentParameterCache = HashMap<String, Arc<Mutex<Option<Vec<InstrumentParameter>>>>>;
-static INSTRUMENT_PARAMETER_CACHE: OnceLock<Mutex<InstrumentParameterCache>> = OnceLock::new();
-static EFFECT_PARAMETER_CACHE: OnceLock<Mutex<HashMap<String, BTreeMap<String, f32>>>> =
-    OnceLock::new();
-static EFFECT_CONTROL_SEMANTICS_CACHE: OnceLock<
+static INSTRUMENT_PARAMETER_CACHE: LazyLock<Mutex<InstrumentParameterCache>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static EFFECT_PARAMETER_CACHE: LazyLock<Mutex<HashMap<String, BTreeMap<String, f32>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static EFFECT_CONTROL_SEMANTICS_CACHE: LazyLock<
     Mutex<HashMap<String, HashMap<String, EffectParameterSemantics>>>,
-> = OnceLock::new();
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 pub(crate) struct Engine {
     synth: SurgeSynthesizer,
     _guard: MutexGuard<'static, ()>,
@@ -113,9 +115,7 @@ impl Engine {
         sample_rate: f32,
         graph_owns_effects: bool,
     ) -> Result<Self, String> {
-        let guard = SURGE_ENGINE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = SURGE_ENGINE_LOCK.lock().recover_poison();
         let mut synth = SurgeSynthesizer::new(sample_rate);
         synth.process();
         let mut engine = Self {
@@ -526,16 +526,13 @@ impl Engine {
 }
 
 pub(crate) fn instrument_parameters(preset: &str) -> Vec<InstrumentParameter> {
-    let cache = INSTRUMENT_PARAMETER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let entry = cache
+    let entry = INSTRUMENT_PARAMETER_CACHE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recover_poison()
         .entry(preset.to_owned())
         .or_insert_with(|| Arc::new(Mutex::new(None)))
         .clone();
-    let mut cached = entry
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cached = entry.lock().recover_poison();
     if let Some(parameters) = cached.as_ref() {
         return parameters.clone();
     }
@@ -675,26 +672,25 @@ pub(crate) fn effect_parameter_semantics(
         return HashMap::new();
     };
     let mut result = HashMap::new();
-    if let Some(native) = engine.effect_mix_parameters.get(&effect_id) {
-        if let Some(semantics) = engine.parameter_semantics(native) {
-            result.insert("mix".to_owned(), semantics);
-        }
+    if let Some(native) = engine.effect_mix_parameters.get(&effect_id)
+        && let Some(semantics) = engine.parameter_semantics(native)
+    {
+        result.insert("mix".to_owned(), semantics);
     }
     for ((candidate_id, parameter), native) in &engine.effect_parameters {
-        if *candidate_id == effect_id {
-            if let Some(semantics) = engine.parameter_semantics(native) {
-                result.insert(parameter.clone(), semantics);
-            }
+        if *candidate_id == effect_id
+            && let Some(semantics) = engine.parameter_semantics(native)
+        {
+            result.insert(parameter.clone(), semantics);
         }
     }
     result
 }
 
 pub(crate) fn effect_control_semantics(name: &str) -> HashMap<String, EffectParameterSemantics> {
-    let cache = EFFECT_CONTROL_SEMANTICS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(semantics) = cache
+    if let Some(semantics) = EFFECT_CONTROL_SEMANTICS_CACHE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recover_poison()
         .get(name)
         .cloned()
     {
@@ -719,9 +715,9 @@ pub(crate) fn effect_control_semantics(name: &str) -> HashMap<String, EffectPara
     };
     let semantics =
         effect_parameter_semantics(&instrument, std::slice::from_ref(&effect), &[1], 1, 1);
-    cache
+    EFFECT_CONTROL_SEMANTICS_CACHE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recover_poison()
         .insert(name.to_owned(), semantics.clone());
     semantics
 }
@@ -804,10 +800,9 @@ fn effect_state_for_slot(
 }
 
 pub(crate) fn effect_parameter_values(name: &str) -> BTreeMap<String, f32> {
-    let cache = EFFECT_PARAMETER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(parameters) = cache
+    if let Some(parameters) = EFFECT_PARAMETER_CACHE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recover_poison()
         .get(name)
         .cloned()
     {
@@ -855,9 +850,9 @@ pub(crate) fn effect_parameter_values(name: &str) -> BTreeMap<String, f32> {
                 })
         })
         .collect();
-    cache
+    EFFECT_PARAMETER_CACHE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recover_poison()
         .insert(name.to_owned(), parameters.clone());
     parameters
 }
@@ -1132,7 +1127,7 @@ mod tests {
                             if !status.success() {
                                 failures
                                     .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .recover_poison()
                                     .push(format!("{} [{mode}]: {status}", preset.id));
                             }
                         }
@@ -1143,9 +1138,7 @@ mod tests {
         for worker in workers {
             worker.join().expect("preset qualification worker");
         }
-        let failures = failures
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failures = failures.lock().recover_poison();
         let failed_presets = failures
             .iter()
             .filter_map(|failure| failure.split_once(" [").map(|(preset, _)| preset))

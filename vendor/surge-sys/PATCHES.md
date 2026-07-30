@@ -3,8 +3,9 @@
 This is `surge-sys` from the official `surge-synthesizer/surge-rs` repository at
 commit `7bfeafc76d1c57860a177e9e076bed7ec764009a`.
 
-DAW-AI uses the patched `git2` 0.21 build dependency with only HTTPS transport
-enabled.
+DAW-AI uses the system Git executable to fetch the pinned Surge XT revision and
+its recursive submodules, avoiding a second embedded Git and TLS stack in the
+Rust dependency graph.
 
 DAW-AI exports every CMake `-D` definition to the bridge compilation. Upstream
 only exported definitions beginning with `SURGE`, so the bridge and engine saw

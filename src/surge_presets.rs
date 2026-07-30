@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{env, fs};
+
+use crate::concurrency::RecoverPoison;
 
 pub(crate) const FACTORY_PREFIX: &str = "Factory/";
 const HEADLESS_UNSAFE_PRESETS: &[&str] = &[
@@ -69,14 +71,9 @@ pub(crate) fn render_safe_catalog() -> Vec<Preset> {
 }
 
 fn catalog_for_root(root: &Path) -> Arc<Vec<Preset>> {
-    static CATALOGS: OnceLock<Mutex<HashMap<PathBuf, Arc<Vec<Preset>>>>> = OnceLock::new();
-    let catalogs = CATALOGS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(catalog) = catalogs
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(root)
-        .cloned()
-    {
+    static CATALOGS: LazyLock<Mutex<HashMap<PathBuf, Arc<Vec<Preset>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    if let Some(catalog) = CATALOGS.lock().recover_poison().get(root).cloned() {
         return catalog;
     }
 
@@ -88,9 +85,9 @@ fn catalog_for_root(root: &Path) -> Arc<Vec<Preset>> {
             .then_with(|| left.name.cmp(&right.name))
     });
     let catalog = Arc::new(presets);
-    catalogs
+    CATALOGS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recover_poison()
         .entry(root.to_owned())
         .or_insert_with(|| Arc::clone(&catalog))
         .clone()

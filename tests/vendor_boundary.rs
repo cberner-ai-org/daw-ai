@@ -23,13 +23,19 @@ fn vendored_surge_boundary_keeps_pins_and_patched_api() {
     let sys_patches = read(root, "vendor/surge-sys/PATCHES.md");
     assert!(sys_patches.contains(SURGE_XT_REVISION));
     assert!(sys_patches.contains("Bindgen models"));
+    let sys_build = read(root, "vendor/surge-sys/build.rs");
+    assert!(
+        sys_build.contains(
+            "checkout_surge_revision(dst);\n            synchronize_surge_submodules(dst);"
+        ),
+        "an existing pinned checkout must still repair recursive submodules"
+    );
     assert!(
         read(root, "vendor/surge-sys/src/lib.rs").contains("improper_ctypes"),
         "generated opaque u128 storage needs a scoped FFI lint allowance"
     );
     assert!(
-        read(root, "vendor/surge-sys/build.rs")
-            .contains(r#".blocklist_function("SurgeSynthesizer::idForParameter")"#),
+        sys_build.contains(r#".blocklist_function("SurgeSynthesizer::idForParameter")"#),
         "the native by-value ID method must not be generated"
     );
     assert!(
