@@ -11,6 +11,7 @@ pub(crate) const MAX_WAV_SECONDS: f32 =
 const DSP_SETTLING_SECONDS: f32 = MAX_REGION_SECONDS;
 const FFT_SIZE: usize = 512;
 const FFT_HOP: usize = 256;
+const CANCELLATION_POLL_BLOCKS: usize = 32;
 
 struct ClipOccurrence<'a> {
     event: &'a ClipEvent,
@@ -124,10 +125,11 @@ pub(crate) fn render_region_with_tracks_cancellable(
     )
 }
 
-pub(crate) fn render_project_sample_range(
+pub(crate) fn render_project_sample_range_cancellable(
     project: &Project,
     start_sample: usize,
     end_sample: usize,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<AudioRegion, String> {
     let project_end_sample = playback_end_sample(project.duration);
     let maximum_samples = (MAX_REGION_SECONDS * SAMPLE_RATE as f32) as usize;
@@ -143,25 +145,19 @@ pub(crate) fn render_project_sample_range(
         .iter()
         .map(|track| track.id)
         .collect::<Vec<_>>();
-    render_tracks_samples(project, &track_ids, start_sample, end_sample)
+    Ok(
+        render_tracks_with_stems_samples(project, &track_ids, start_sample, end_sample, cancelled)?
+            .mix,
+    )
 }
 
-fn render_tracks_samples(
+#[cfg(test)]
+fn render_project_sample_range(
     project: &Project,
-    track_ids: &[u64],
     start_sample: usize,
     end_sample: usize,
 ) -> Result<AudioRegion, String> {
-    Ok(
-        render_tracks_with_stems_samples(
-            project,
-            track_ids,
-            start_sample,
-            end_sample,
-            &mut || false,
-        )?
-        .mix,
-    )
+    render_project_sample_range_cancellable(project, start_sample, end_sample, &mut || false)
 }
 
 fn render_tracks_with_stems_samples(
@@ -197,24 +193,21 @@ fn render_tracks_with_stems_samples(
     })
 }
 
-pub(crate) fn render_project_stems_sample_range(
+pub(crate) fn render_project_stems_sample_range_cancellable(
     project: &Project,
     start_sample: usize,
     end_sample: usize,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Vec<(u64, AudioRegion)>, String> {
     let track_ids = project
         .tracks
         .iter()
         .map(|track| track.id)
         .collect::<Vec<_>>();
-    Ok(render_tracks_with_stems_samples(
-        project,
-        &track_ids,
-        start_sample,
-        end_sample,
-        &mut || false,
-    )?
-    .tracks)
+    Ok(
+        render_tracks_with_stems_samples(project, &track_ids, start_sample, end_sample, cancelled)?
+            .tracks,
+    )
 }
 
 pub(crate) fn playback_sample_count(start: f32, end: f32) -> usize {
@@ -320,6 +313,7 @@ fn render_audio_samples_with_tracks(
             start_sample,
             &mut rendered,
             &mut track_event_onsets,
+            cancelled,
         )?;
         apply_track_gain(track, &mut rendered);
         event_onsets.extend(track_event_onsets.iter().copied());
@@ -395,7 +389,11 @@ fn render_track(
     start_sample: usize,
     output: &mut [f32],
     event_onsets: &mut Vec<f32>,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<(), String> {
+    if cancelled() {
+        return Err("audio render interrupted".to_owned());
+    }
     if let Some(error) = crate::surge_presets::headless_render_error(&track.instrument.preset) {
         return Err(error);
     }
@@ -446,6 +444,10 @@ fn render_track(
     let frame_count = output.len().div_euclid(CHANNEL_COUNT);
     let mut output_frame = 0;
     while output_frame < frame_count {
+        if output_frame % (crate::surge::BLOCK_SIZE * CANCELLATION_POLL_BLOCKS) == 0 && cancelled()
+        {
+            return Err("audio render interrupted".to_owned());
+        }
         let block_start = start_sample + output_frame;
         let count = crate::surge::BLOCK_SIZE.min(frame_count - output_frame);
         let final_block = output_frame + count == frame_count;
@@ -752,6 +754,7 @@ fn frame_power(samples: &[f32], offset: usize) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::f32::consts::PI;
 
     use super::*;
@@ -792,6 +795,31 @@ mod tests {
         };
         Ok((region, end))
     }
+
+    #[test]
+    fn cancellation_is_checked_while_rendering_track_blocks() {
+        let project = Project::demo();
+        let checks = Cell::new(0);
+
+        let result = render_region_with_tracks_cancellable(
+            &project,
+            &[project.tracks[0].id],
+            0.0,
+            0.1,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 4
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("active render cancellation must stop rendering"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "audio render interrupted");
+        assert!(checks.get() > 4);
+    }
+
     #[test]
     fn once_clip_events_do_not_wrap() {
         let mut project = Project::demo();
