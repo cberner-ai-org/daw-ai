@@ -347,6 +347,7 @@
   }
 
   function routedClipEvents(track, clip) {
+    if (clip.legacyTrackId != null && clip.legacyTrackId !== track.id) return [];
     const zones = state.project.instrumentRack?.keyZones ?? [];
     const ranges = zones.filter((zone) => zone.instrumentId === track.instrument.id);
     return clip.events.filter((event) =>

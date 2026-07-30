@@ -14,7 +14,7 @@ const MAX_CLIPS: usize = 2_048;
 const MAX_KEY_ZONES: usize = 2_048;
 const MAX_EDITS: usize = 10_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-const PREVIOUS_PROJECT_SCHEMA_VERSION: u64 = 5;
+pub(crate) const PREVIOUS_PROJECT_SCHEMA_VERSION: u64 = 5;
 
 type Object = Map<String, JsonValue>;
 
@@ -53,10 +53,10 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .map(|(index, value)| parse_track(value, index, &mut ids))
         .collect::<Result<Vec<_>, _>>()?;
     let track_ids = tracks.iter().map(|track| track.id).collect::<HashSet<_>>();
-    let track_ids = track_ids.into_iter().collect::<Vec<_>>();
+    let track_id_list = track_ids.iter().copied().collect::<Vec<_>>();
     if tracks.iter().any(|track| {
         track.modulators.iter().any(|modulator| {
-            !crate::model::valid_modulator_configuration(track.id, modulator, &track_ids)
+            !crate::model::valid_modulator_configuration(track.id, modulator, &track_id_list)
         })
     }) {
         return Err(invalid("modulator configuration is unsupported"));
@@ -89,7 +89,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     }
     let clips = clip_values
         .iter()
-        .map(|value| parse_clip(value, duration, &mut ids, &mut event_ids))
+        .map(|value| parse_clip(value, duration, &track_ids, &mut ids, &mut event_ids))
         .collect::<Result<Vec<_>, _>>()?;
     let edit_values = array(root, "edits")?;
     if edit_values.len() > MAX_EDITS {
@@ -162,6 +162,7 @@ fn migrate_schema_five(value: &mut JsonValue) -> Result<(), ProjectFileError> {
         let track = track_value
             .as_object_mut()
             .ok_or_else(|| invalid(format!("{context} must be an object")))?;
+        let track_id = integer(track, "id")?;
         let instrument = track
             .get("instrument")
             .and_then(JsonValue::as_object)
@@ -173,8 +174,12 @@ fn migrate_schema_five(value: &mut JsonValue) -> Result<(), ProjectFileError> {
             _ => return Err(invalid(format!("{context} clips must be an array"))),
         };
         let mut pitches = [false; 128];
-        for clip in &track_clips {
-            if let Some(events) = clip.get("events").and_then(JsonValue::as_array) {
+        for mut clip in track_clips {
+            let clip_object = clip
+                .as_object_mut()
+                .ok_or_else(|| invalid("MIDI clip must be an object"))?;
+            clip_object.insert("legacyTrackId".to_owned(), JsonValue::from(track_id));
+            if let Some(events) = clip_object.get("events").and_then(JsonValue::as_array) {
                 for pitch in events
                     .iter()
                     .filter_map(|event| event.get("pitch"))
@@ -184,8 +189,8 @@ fn migrate_schema_five(value: &mut JsonValue) -> Result<(), ProjectFileError> {
                     pitches[pitch as usize] = true;
                 }
             }
+            clips.push(clip);
         }
-        clips.extend(track_clips);
         instrument_pitches.push((instrument_id, pitches));
     }
     if instrument_pitches.len() == 1 && !instrument_pitches[0].1.iter().any(|used| *used) {
@@ -842,6 +847,7 @@ fn validate_routing_edges(
 fn parse_clip(
     value: &JsonValue,
     project_duration: f32,
+    track_ids: &HashSet<u64>,
     ids: &mut HashSet<u64>,
     event_ids: &mut HashSet<u64>,
 ) -> Result<Clip, ProjectFileError> {
@@ -893,6 +899,16 @@ fn parse_clip(
         .iter()
         .map(|value| parse_clip_event(value, loop_beats, &mut clip_event_ids, event_ids))
         .collect::<Result<Vec<_>, _>>()?;
+    let legacy_track_id = clip
+        .get("legacyTrackId")
+        .map(|_| integer(clip, "legacyTrackId"))
+        .transpose()?
+        .filter(|track_id| track_ids.contains(track_id));
+    if clip.get("legacyTrackId").is_some() && legacy_track_id.is_none() {
+        return Err(invalid(
+            "MIDI clip legacy track must reference an existing track",
+        ));
+    }
     Ok(Clip {
         id,
         label: limited_string(clip, "label", 1, 64)?,
@@ -900,6 +916,7 @@ fn parse_clip(
         end,
         source_start,
         style: limited_string(clip, "style", 1, 64)?,
+        legacy_track_id,
         playback_mode: playback_mode.to_owned(),
         loop_beats,
         events,
@@ -1367,6 +1384,30 @@ mod tests {
             (empty.key_zones[0].low_note, empty.key_zones[0].high_note),
             (0, 127)
         );
+
+        let mut overlapping: JsonValue = serde_json::from_str(&schema_five_demo_source_for_test())
+            .expect("schema five project JSON");
+        for track in overlapping["tracks"]
+            .as_array_mut()
+            .expect("schema five tracks")
+        {
+            for clip in track["clips"].as_array_mut().expect("track clips") {
+                for event in clip["events"].as_array_mut().expect("clip events") {
+                    event["pitch"] = JsonValue::from(60);
+                }
+            }
+        }
+        let overlapping =
+            parse_project(&overlapping.to_string()).expect("overlapping schema five project");
+        for (owner, clip) in overlapping.tracks.iter().zip(&overlapping.clips) {
+            assert_eq!(clip.legacy_track_id, Some(owner.id));
+            for track in &overlapping.tracks {
+                assert_eq!(
+                    overlapping.track_receives_clip_pitch(clip, track, 60),
+                    track.id == owner.id
+                );
+            }
+        }
     }
 
     #[test]
