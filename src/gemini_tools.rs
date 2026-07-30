@@ -3286,7 +3286,7 @@ fn audition_warnings_for_mutation(
     warnings
 }
 
-fn current_project(session_path: &Path) -> Result<Project, String> {
+pub(crate) fn current_project(session_path: &Path) -> Result<Project, String> {
     let source = read_bounded_text(
         &session_path.join(GRAPH_FILE),
         MAX_SOUND_GRAPH_BYTES,

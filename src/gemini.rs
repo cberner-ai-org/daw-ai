@@ -18,8 +18,8 @@ use crate::gemini_tools::{
     INSTRUMENT_PARAMETER_TOOL_NAME, LOAD_TOOL_GROUP_NAME, PRESET_TOOL_NAME,
     READ_AUDITION_TOOL_NAME, READ_TOOL_NAME, SOUND_TOOL_PARAMETER_TOOL_NAME, ToolGroup,
     apply_agent_mutation, apply_audition_mutation, base64_audio, create_audition_slot,
-    delete_audition_slot, dynamic_tool_declarations, dynamic_tool_group, is_mutation_tool,
-    list_instrument_parameters, list_sound_tool_parameters, list_surge_presets,
+    current_project, delete_audition_slot, dynamic_tool_declarations, dynamic_tool_group,
+    is_mutation_tool, list_instrument_parameters, list_sound_tool_parameters, list_surge_presets,
     prepare_audio_render, prepare_instrument_audition, read_audition_slot, read_sound_graph,
     record_instrument_audition,
 };
@@ -258,22 +258,56 @@ fn arrangement_listen_requirement(
     name: &str,
     arguments: &JsonValue,
     result: &str,
+    previous_project: &Project,
     project: &Project,
     selection_start: f32,
     selection_end: f32,
 ) -> ArrangementListenRequirement {
     let response = serde_json::from_str::<JsonValue>(result).ok();
     let clip_timing = response.as_ref().and_then(|value| value.get("clipTiming"));
+    let deleted_clip = (name == "delete_midi_clip")
+        .then(|| arguments["clipId"].as_u64())
+        .flatten()
+        .and_then(|clip_id| {
+            previous_project
+                .clips
+                .iter()
+                .find(|clip| clip.id == clip_id)
+        });
     let start = clip_timing
         .and_then(|timing| timing["startSeconds"].as_f64())
         .map(|seconds| seconds as f32)
+        .or_else(|| deleted_clip.map(|clip| clip.start.max(selection_start)))
         .unwrap_or(selection_start);
     let end = clip_timing
         .and_then(|timing| timing["endSeconds"].as_f64())
         .map(|seconds| seconds as f32)
+        .or_else(|| deleted_clip.map(|clip| clip.end.min(selection_end)))
         .unwrap_or(selection_end);
 
     let mut track_ids = BTreeSet::new();
+    if let Some(clip) = deleted_clip {
+        track_ids.extend(previous_project.tracks.iter().filter_map(|track| {
+            clip.events
+                .iter()
+                .any(|event| previous_project.track_receives_clip_pitch(clip, track, event.pitch))
+                .then_some(track.id)
+        }));
+    }
+    if name == "delete_key_zone"
+        && let Some(zone_id) = arguments["keyZoneId"].as_u64()
+        && let Some(zone) = previous_project
+            .key_zones
+            .iter()
+            .find(|zone| zone.id == zone_id)
+        && let Some(track) = previous_project
+            .tracks
+            .iter()
+            .find(|track| track.instrument.id == zone.instrument_id)
+        && project.tracks.iter().any(|current| current.id == track.id)
+    {
+        track_ids.insert(track.id);
+    }
     if let Some(track_id) = arguments["trackId"].as_u64()
         && project.tracks.iter().any(|track| track.id == track_id)
     {
@@ -847,6 +881,11 @@ fn apply_and_commit_mutation(
     state: &mut LoopState,
     on_update: &mut impl FnMut(GeminiEdit) -> Result<Project, PlannerError>,
 ) -> Result<String, PlannerError> {
+    let previous_project = current_project(session.path()).map_err(|message| {
+        invalid(&format!(
+            "could not snapshot the project before editing: {message}"
+        ))
+    })?;
     match apply_agent_mutation(session.path(), name, arguments) {
         Ok(message) => {
             let (plan, project) = session
@@ -872,6 +911,7 @@ fn apply_and_commit_mutation(
                 name,
                 arguments,
                 &message,
+                &previous_project,
                 &committed,
                 selection_start,
                 selection_end,
@@ -2048,6 +2088,7 @@ mod tests {
             &serde_json::json!({"trackId":2,"volume":0.8}),
             "{}",
             &project,
+            &project,
             24.0,
             32.0,
         );
@@ -2096,6 +2137,46 @@ mod tests {
         assert!(covers);
         state.record_arrangement_listen(covers);
         assert!(!state.completion_listen_required());
+    }
+
+    #[test]
+    fn deleted_clips_and_zones_keep_their_prior_listen_scope() {
+        let mut before_clip = Project::demo();
+        let clip = before_clip
+            .clips
+            .iter_mut()
+            .find(|clip| clip.id == 12)
+            .expect("bass clip");
+        clip.start = 24.0;
+        clip.end = 32.0;
+        let mut after_clip = before_clip.clone();
+        after_clip.clips.retain(|clip| clip.id != 12);
+        let clip_requirement = arrangement_listen_requirement(
+            "delete_midi_clip",
+            &serde_json::json!({"clipId":12}),
+            "{}",
+            &before_clip,
+            &after_clip,
+            0.0,
+            32.0,
+        );
+        assert_eq!((clip_requirement.start, clip_requirement.end), (24.0, 32.0));
+        assert_eq!(clip_requirement.track_ids, BTreeSet::from([2]));
+
+        let before_zone = Project::demo();
+        let mut after_zone = before_zone.clone();
+        after_zone.key_zones.retain(|zone| zone.id != 202);
+        let zone_requirement = arrangement_listen_requirement(
+            "delete_key_zone",
+            &serde_json::json!({"keyZoneId":202}),
+            "{}",
+            &before_zone,
+            &after_zone,
+            8.0,
+            12.0,
+        );
+        assert_eq!((zone_requirement.start, zone_requirement.end), (8.0, 12.0));
+        assert_eq!(zone_requirement.track_ids, BTreeSet::from([2]));
     }
 
     #[test]
