@@ -804,6 +804,38 @@ mod tests {
     }
 
     #[test]
+    fn schema_five_project_is_migrated_before_persisting_history() {
+        let root = std::env::temp_dir().join(format!(
+            "daw-ai-schema-five-migration-{}-{}",
+            std::process::id(),
+            crate::storage::unique_test_id()
+        ));
+        fs::create_dir(&root).expect("migration test directory");
+        let path = root.join("sound-graph.json");
+        fs::write(
+            &path,
+            crate::project_file::schema_five_demo_source_for_test(),
+        )
+        .expect("schema five project");
+
+        let (store, studio, history) = open_project_with_history(path).expect("migrated project");
+
+        assert_eq!(studio.project().clips.len(), 3);
+        assert!(!studio.project().key_zones.is_empty());
+        assert_eq!(history.len(), 1);
+        let persisted: serde_json::Value =
+            serde_json::from_str(&store.read_source().expect("persisted project"))
+                .expect("persisted project JSON");
+        assert_eq!(
+            persisted["schemaVersion"],
+            crate::model::PROJECT_SCHEMA_VERSION
+        );
+        assert!(persisted.get("instrumentRack").is_some());
+        assert!(persisted.get("history").is_some());
+        fs::remove_dir_all(root).expect("remove migration test directory");
+    }
+
+    #[test]
     fn editing_an_older_state_preserves_forward_history() {
         let initial = Project::initial();
         let mut history = ProjectHistory::new(initial.clone());
