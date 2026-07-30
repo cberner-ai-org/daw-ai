@@ -123,11 +123,43 @@ struct LoopState {
     mutations_since_listen: usize,
     mutations_since_feedback: usize,
     mutations_since_arrangement_listen: usize,
+    arrangement_listen_requirement: Option<ArrangementListenRequirement>,
     mutations_before_first_listen: Option<usize>,
     mutations_between_listens: Vec<usize>,
     auditions: usize,
     auditioned_slots: BTreeSet<u64>,
     applied_auditions: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ArrangementListenRequirement {
+    start: f32,
+    end: f32,
+    track_ids: BTreeSet<u64>,
+}
+
+impl ArrangementListenRequirement {
+    fn covers(&self, request: &AudioRenderRequest) -> bool {
+        request.start < self.end
+            && self.start < request.end
+            && request
+                .track_ids
+                .iter()
+                .any(|track_id| self.track_ids.contains(track_id))
+    }
+
+    fn guidance(&self) -> String {
+        let track_ids = self
+            .track_ids
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "The render range must overlap {:.3}-{:.3} seconds and include at least one affected track: [{track_ids}].",
+            self.start, self.end
+        )
+    }
 }
 
 impl LoopState {
@@ -148,6 +180,11 @@ impl LoopState {
         self.mutations_since_arrangement_listen += 1;
     }
 
+    fn record_project_mutation(&mut self, requirement: ArrangementListenRequirement) {
+        self.record_mutation();
+        self.arrangement_listen_requirement = Some(requirement);
+    }
+
     fn record_listen(&mut self) {
         if self.audio_listens == 0 {
             self.mutations_before_first_listen = Some(self.mutations_since_listen);
@@ -163,10 +200,19 @@ impl LoopState {
         self.mutations_since_feedback = 0;
     }
 
-    fn record_arrangement_listen(&mut self) {
+    fn arrangement_render_covers_latest_mutation(&self, request: &AudioRenderRequest) -> bool {
+        self.arrangement_listen_requirement
+            .as_ref()
+            .is_none_or(|requirement| requirement.covers(request))
+    }
+
+    fn record_arrangement_listen(&mut self, covers_latest_mutation: bool) {
         self.record_listen();
         self.record_arrangement_feedback();
-        self.mutations_since_arrangement_listen = 0;
+        if covers_latest_mutation {
+            self.mutations_since_arrangement_listen = 0;
+            self.arrangement_listen_requirement = None;
+        }
     }
 
     fn periodic_feedback_required(&self) -> bool {
@@ -175,6 +221,12 @@ impl LoopState {
 
     fn completion_listen_required(&self) -> bool {
         self.mutations_since_arrangement_listen > 0
+    }
+
+    fn completion_listen_guidance(&self) -> Option<String> {
+        self.arrangement_listen_requirement
+            .as_ref()
+            .map(ArrangementListenRequirement::guidance)
     }
 
     fn metrics(&self, elapsed: Duration) -> JsonValue {
@@ -199,6 +251,67 @@ impl LoopState {
             "appliedAuditions": self.applied_auditions,
             "auditionApplyRate": if self.auditions == 0 { 0.0 } else { self.applied_auditions as f64 / self.auditions as f64 }
         })
+    }
+}
+
+fn arrangement_listen_requirement(
+    name: &str,
+    arguments: &JsonValue,
+    result: &str,
+    project: &Project,
+    selection_start: f32,
+    selection_end: f32,
+) -> ArrangementListenRequirement {
+    let response = serde_json::from_str::<JsonValue>(result).ok();
+    let clip_timing = response.as_ref().and_then(|value| value.get("clipTiming"));
+    let start = clip_timing
+        .and_then(|timing| timing["startSeconds"].as_f64())
+        .map(|seconds| seconds as f32)
+        .unwrap_or(selection_start);
+    let end = clip_timing
+        .and_then(|timing| timing["endSeconds"].as_f64())
+        .map(|seconds| seconds as f32)
+        .unwrap_or(selection_end);
+
+    let mut track_ids = BTreeSet::new();
+    if let Some(track_id) = arguments["trackId"].as_u64()
+        && project.tracks.iter().any(|track| track.id == track_id)
+    {
+        track_ids.insert(track_id);
+    }
+    if let Some(instrument_id) = arguments["instrumentId"].as_u64()
+        && let Some(track) = project
+            .tracks
+            .iter()
+            .find(|track| track.instrument.id == instrument_id)
+    {
+        track_ids.insert(track.id);
+    }
+    if matches!(name, "new_track" | COMMIT_AUDITION_TOOL_NAME)
+        && let Some(track_id) = response.as_ref().and_then(|value| value["id"].as_u64())
+        && project.tracks.iter().any(|track| track.id == track_id)
+    {
+        track_ids.insert(track_id);
+    }
+    if matches!(name, "add_midi_clip" | "update_midi_clip")
+        && let Some(clip_id) = response.as_ref().and_then(|value| value["id"].as_u64())
+        && let Some(clip) = project.clips.iter().find(|clip| clip.id == clip_id)
+    {
+        track_ids.extend(project.tracks.iter().filter_map(|track| {
+            clip.events
+                .iter()
+                .any(|event| project.track_receives_clip_pitch(clip, track, event.pitch))
+                .then_some(track.id)
+        }));
+    }
+    if track_ids.is_empty() {
+        track_ids.extend(project.tracks.iter().map(|track| track.id));
+    }
+
+    ArrangementListenRequirement {
+        start,
+        end,
+        track_ids,
     }
 }
 
@@ -390,8 +503,11 @@ fn run_session_with_transport_options(
                 continue;
             }
             if state.completion_listen_required() {
+                let coverage = state
+                    .completion_listen_guidance()
+                    .unwrap_or_else(|| "Render the active edit selection.".to_owned());
                 input = JsonValue::String(format!(
-                    "Before completing, call {AUDIO_TOOL_NAME} after the latest successful project mutation and listen to the returned WAV. The render must succeed; {ANALYZE_AUDIO_TOOL_NAME} measurements and isolated audition audio do not verify the arrangement."
+                    "Before completing, call {AUDIO_TOOL_NAME} after the latest successful project mutation and listen to the returned WAV. {coverage} The render must succeed; {ANALYZE_AUDIO_TOOL_NAME} measurements and isolated audition audio do not verify the arrangement."
                 ));
                 continue;
             }
@@ -649,10 +765,15 @@ fn execute_tool(
             } else {
                 prepare_instrument_audition(session.path(), &call.arguments)
             };
-            match prepared.and_then(render_audio) {
-                Ok(audio) => {
+            let rendered = prepared.and_then(|request| {
+                let covers_latest_mutation = call.name == AUDIO_TOOL_NAME
+                    && state.arrangement_render_covers_latest_mutation(&request);
+                render_audio(request).map(|audio| (audio, covers_latest_mutation))
+            });
+            match rendered {
+                Ok((audio, covers_latest_mutation)) => {
                     if call.name == AUDIO_TOOL_NAME {
-                        state.record_arrangement_listen();
+                        state.record_arrangement_listen(covers_latest_mutation);
                     } else {
                         state.record_listen();
                     }
@@ -668,6 +789,14 @@ fn execute_tool(
                         .map_err(PlannerError::Io)?;
                     let mut description =
                         format!("{} Session artifact: {audio_name}.", audio.description);
+                    if call.name == AUDIO_TOOL_NAME
+                        && !covers_latest_mutation
+                        && let Some(coverage) = state.completion_listen_guidance()
+                    {
+                        description.push_str(&format!(
+                            " This render does not verify the latest project mutation. {coverage}"
+                        ));
+                    }
                     if call.name == AUDITION_TOOL_NAME
                         && let Err(error) =
                             record_instrument_audition(session.path(), &call.arguments)
@@ -739,8 +868,16 @@ fn apply_and_commit_mutation(
             session
                 .synchronize_project(&committed)
                 .map_err(|message| invalid(&message))?;
+            let listen_requirement = arrangement_listen_requirement(
+                name,
+                arguments,
+                &message,
+                &committed,
+                selection_start,
+                selection_end,
+            );
             state.plans.push(plan);
-            state.record_mutation();
+            state.record_project_mutation(listen_requirement);
             if name == COMMIT_AUDITION_TOOL_NAME
                 && arguments["auditionId"]
                     .as_u64()
@@ -1904,14 +2041,60 @@ mod tests {
     }
 
     #[test]
-    fn analysis_cannot_replace_the_required_final_arrangement_listen() {
+    fn final_arrangement_listen_must_cover_the_latest_mutation() {
+        let project = Project::demo();
+        let requirement = arrangement_listen_requirement(
+            "set_track_volume",
+            &serde_json::json!({"trackId":2,"volume":0.8}),
+            "{}",
+            &project,
+            24.0,
+            32.0,
+        );
+        assert_eq!(requirement.track_ids, BTreeSet::from([2]));
         let mut state = LoopState::default();
-        state.record_mutation();
+        state.record_project_mutation(requirement);
         state.record_arrangement_feedback();
         assert!(!state.periodic_feedback_required());
         assert!(state.completion_listen_required());
 
-        state.record_arrangement_listen();
+        let unrelated_track = AudioRenderRequest {
+            project: project.clone(),
+            track_ids: vec![1],
+            start: 24.0,
+            end: 25.0,
+            description: String::new(),
+            require_audible_output: false,
+        };
+        let covers = state.arrangement_render_covers_latest_mutation(&unrelated_track);
+        assert!(!covers);
+        state.record_arrangement_listen(covers);
+        assert!(state.completion_listen_required());
+
+        let unrelated_time = AudioRenderRequest {
+            project: project.clone(),
+            track_ids: vec![2],
+            start: 0.0,
+            end: 1.0,
+            description: String::new(),
+            require_audible_output: false,
+        };
+        let covers = state.arrangement_render_covers_latest_mutation(&unrelated_time);
+        assert!(!covers);
+        state.record_arrangement_listen(covers);
+        assert!(state.completion_listen_required());
+
+        let relevant = AudioRenderRequest {
+            project,
+            track_ids: vec![2],
+            start: 24.0,
+            end: 25.0,
+            description: String::new(),
+            require_audible_output: false,
+        };
+        let covers = state.arrangement_render_covers_latest_mutation(&relevant);
+        assert!(covers);
+        state.record_arrangement_listen(covers);
         assert!(!state.completion_listen_required());
     }
 

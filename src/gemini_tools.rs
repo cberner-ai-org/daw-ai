@@ -3365,6 +3365,10 @@ pub(crate) fn create_audition_slot(
             )
             .map_err(studio_error_message)?;
     }
+    let audition_instrument_id = studio.project().tracks[0].instrument.id;
+    studio
+        .create_key_zone(audition_instrument_id, 0, 127)
+        .map_err(studio_error_message)?;
     let (audition_id, path) = reserve_audition_slot(session_path)?;
     let result = (|| {
         write_new(&path.join(GRAPH_FILE), &studio.project().to_json())
@@ -4361,7 +4365,7 @@ mod tests {
     #[test]
     fn audition_provenance_returns_advisory_preset_zone_and_note_warnings() {
         let original = Project::initial();
-        let original_zone_id = original.key_zones[0].id;
+        assert!(original.key_zones.is_empty());
         let session = EditSession::create(&original, "test exact audition pitches", 0.0, 4.0)
             .expect("edit session");
         let created: JsonValue = serde_json::from_str(
@@ -4412,6 +4416,7 @@ mod tests {
         assert_eq!(committed["keyZoneNotes"]["low"]["name"], "C4");
         let track_id = committed["id"].as_u64().expect("committed track ID");
         let committed_project = session.take_update().unwrap().expect("commit update").1;
+        assert_eq!(committed_project.key_zones.len(), 1);
         let instrument_id = committed_project
             .tracks
             .iter()
@@ -4419,14 +4424,7 @@ mod tests {
             .expect("committed track")
             .instrument
             .id;
-
-        apply_agent_mutation(
-            session.path(),
-            "delete_key_zone",
-            &serde_json::json!({"keyZoneId":original_zone_id}),
-        )
-        .expect("remove initial overlapping zone");
-        session.take_update().unwrap().expect("zone deletion");
+        assert_eq!(committed_project.key_zones[0].instrument_id, instrument_id);
 
         let clip: JsonValue = serde_json::from_str(
             &apply_agent_mutation(
