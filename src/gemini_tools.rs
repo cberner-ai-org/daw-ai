@@ -707,7 +707,8 @@ fn sound_graph_topology(project: &Project) -> JsonValue {
         let node_id = format!("clip:{}", clip.id);
         nodes.push(serde_json::json!({
             "nodeId":node_id,"type":"midiClip","label":clip.label,
-            "start":clip.start,"end":clip.end,"eventCount":clip.events.len()
+            "start":clip.start,"end":clip.end,"eventCount":clip.events.len(),
+            "legacyTrackId":clip.legacy_track_id
         }));
         connections.push(serde_json::json!({"from":node_id,"to":"rack","type":"midi"}));
     }
@@ -852,6 +853,7 @@ fn read_sound_node(
             "nodeId":node_id,"type":"midiClip","id":id,
             "label":clip.label,"startBeat":clip.start * beats_per_second,
             "durationBeats":(clip.end - clip.start) * beats_per_second,
+            "legacyTrackId":clip.legacy_track_id,
             "playback":if clip.playback_mode == "loop" {
                 serde_json::json!({"mode":"loop","lengthBeats":clip.loop_beats})
             } else { serde_json::json!({"mode":"once"}) },
@@ -1713,6 +1715,7 @@ pub(crate) fn apply_agent_mutation(
             studio
                 .replace_midi_clip(clip_id, &spec, selection_start, selection_end)
                 .map_err(studio_error_message)?;
+            result_id = Some(clip_id);
             format!("Updated MIDI clip {clip_id}")
         }
         "delete_midi_clip" => {
@@ -3202,14 +3205,24 @@ fn audition_warnings_for_mutation(
     }
 
     let entered = argument_midi_notes(object);
+    let clip = result_id.and_then(|clip_id| project.clips.iter().find(|clip| clip.id == clip_id));
     let mut receiving_notes = BTreeMap::<u64, BTreeSet<u8>>::new();
     let mut silent_notes = BTreeSet::new();
     for note in entered {
         let instruments = project
-            .key_zones
+            .tracks
             .iter()
-            .filter(|zone| (zone.low_note..=zone.high_note).contains(&note))
-            .map(|zone| zone.instrument_id)
+            .filter(|track| {
+                clip.is_none_or(|clip| project.track_receives_clip_pitch(clip, track, note))
+            })
+            .filter(|track| {
+                clip.is_some()
+                    || project.key_zones.iter().any(|zone| {
+                        zone.instrument_id == track.instrument.id
+                            && (zone.low_note..=zone.high_note).contains(&note)
+                    })
+            })
+            .map(|track| track.instrument.id)
             .collect::<BTreeSet<_>>();
         if instruments.is_empty() {
             silent_notes.insert(note);
