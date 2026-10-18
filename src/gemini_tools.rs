@@ -375,7 +375,11 @@ fn owner_object_schema(mut properties: JsonValue, required: &[&str]) -> JsonValu
         "type":"object",
         "properties":properties,
         "required":required,
-        "oneOf":[{"required":["trackId"]},{"required":["auditionId"]}],
+        // Gemini validates required fields within each branch, without parent properties.
+        "oneOf":[
+            {"type":"object","properties":{"trackId":properties["trackId"]},"required":["trackId"]},
+            {"type":"object","properties":{"auditionId":properties["auditionId"]},"required":["auditionId"]}
+        ],
         "additionalProperties":false
     })
 }
@@ -3929,6 +3933,31 @@ mod tests {
         let mut reordered = first.clone();
         reordered.routing.effect_order.reverse();
         assert_ne!(sound_fingerprint(&first), sound_fingerprint(&reordered));
+    }
+
+    #[test]
+    fn tool_schemas_define_required_properties_locally() {
+        fn check(value: &JsonValue) {
+            match value {
+                JsonValue::Object(object) => {
+                    if let Some(required) = object.get("required").and_then(JsonValue::as_array) {
+                        for field in required {
+                            let name = field.as_str().expect("required property name");
+                            assert!(
+                                object.get("properties").and_then(|p| p.get(name)).is_some(),
+                                "required property {name} must be declared in the same schema: {value}"
+                            );
+                        }
+                    }
+                    object.values().for_each(check);
+                }
+                JsonValue::Array(values) => values.iter().for_each(check),
+                _ => {}
+            }
+        }
+        for group in [None, Some(ToolGroup::Arrangement), Some(ToolGroup::Sound)] {
+            dynamic_tool_declarations(group).iter().for_each(check);
+        }
     }
 
     #[test]

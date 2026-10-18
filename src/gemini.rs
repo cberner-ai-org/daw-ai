@@ -1905,6 +1905,39 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Gemini API credentials and makes billable requests"]
+    fn live_api_accepts_each_tool_group_schema() {
+        let api_key = load_api_key().expect("Gemini API credentials");
+        let endpoint = std::env::var("DAW_AI_GEMINI_ENDPOINT")
+            .unwrap_or_else(|_| DEFAULT_INTERACTIONS_ENDPOINT.to_owned());
+        let session = EditSession::create(&Project::demo(), "schema smoke test", 0.0, 1.0)
+            .expect("smoke test session");
+        for (index, group) in [None, Some(ToolGroup::Arrangement), Some(ToolGroup::Sound)]
+            .into_iter()
+            .enumerate()
+        {
+            let response = call_interactions(
+                &session,
+                &format!("schema-{index}"),
+                &serde_json::json!({
+                    "model": GEMINI_MODEL,
+                    "input": "Reply OK without calling any tools.",
+                    "tools": dynamic_tool_declarations(group),
+                    "store": false
+                }),
+                &api_key,
+                &endpoint,
+                Duration::from_secs(120),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap_or_else(|error| panic!("Gemini rejected tool group {group:?}: {error:?}"));
+            let response: JsonValue = serde_json::from_str(&response).expect("interaction JSON");
+            assert_eq!(response["status"], "completed", "{response}");
+            eprintln!("Gemini accepted tool group {group:?}");
+        }
+    }
+
+    #[test]
     fn cancelled_interaction_terminates_its_transport() {
         let session = EditSession::create(&Project::demo(), "cancel", 0.0, 4.0).expect("session");
         let cancellation = Arc::new(AtomicBool::new(true));
