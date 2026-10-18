@@ -1340,13 +1340,24 @@ main {
 }
 
 .debug-settings strong,
+.debug-settings > div > label,
 .debug-settings span {
   display: block;
 }
 
-.debug-settings strong {
+.debug-settings strong,
+.debug-settings > div > label {
   margin-bottom: 4px;
   font-size: 11px;
+}
+
+.debug-settings select {
+  max-width: 100%;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-raised);
 }
 
 .debug-settings span {

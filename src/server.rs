@@ -236,6 +236,7 @@ impl PlannerGate {
 }
 
 struct EditRequest {
+    model: crate::gemini::GeminiModel,
     operation_id: String,
     prompt: String,
     start: f32,
@@ -883,6 +884,13 @@ impl Router {
             Ok(value) => value,
             Err(message) => return Response::json(422, error_json(message)),
         };
+        let model = match form.get("model") {
+            Some(value) => match crate::gemini::GeminiModel::parse(value) {
+                Ok(model) => model,
+                Err(message) => return Response::json(422, error_json(message)),
+            },
+            None => crate::gemini::GeminiModel::default(),
+        };
         let project = {
             let state = self.lock_project();
             if let Err(error) = state.studio().validate_edit(start, end, prompt) {
@@ -936,6 +944,7 @@ impl Router {
                 .expect("an existing edit job has a response");
         }
         let edit = EditRequest {
+            model,
             operation_id: operation_id.clone(),
             prompt: prompt.to_owned(),
             start,
@@ -1322,6 +1331,7 @@ impl Router {
             edit.end,
             &edit.project,
             edit.new_prompt,
+            edit.model,
             deadline,
             cancellation,
             |request| self.render_gemini_audio(job_id, request, &render_cancellation, deadline),

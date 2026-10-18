@@ -2,7 +2,7 @@
 
 DAW-AI is a local, prompt-driven music studio for making music without learning a traditional DAW. Select a region of the timeline, describe the change in everyday language, and hear the arrangement update immediately.
 
-The project is a small Rust server with a responsive browser client. Surge XT renders instruments, effects, modulation, and routing, and the browser only plays the resulting WAV. Prompted edits use Gemini 3.6 Flash.
+The project is a small Rust server with a responsive browser client. Surge XT renders instruments, effects, modulation, and routing, and the browser only plays the resulting WAV. Prompted edits default to Gemini 4 Argon. The Debug page can select Gemini 4 Argon, Gemini 3.8 Flash, or Gemini 3.6 Flash. This browser preference applies to new edits; running and retried edits keep their original model, which is recorded in the AI session log.
 
 ## Run it
 
@@ -10,7 +10,7 @@ Prerequisites:
 
 - Rust 1.97 or newer
 - Git, used to fetch the pinned Surge XT source and its recursive submodules
-- A [Gemini API key](https://ai.google.dev/gemini-api/docs/api-key)
+- A [Gemini API key](https://ai.google.dev/gemini-api/docs/api-key) with paid-tier access for the default Gemini 4 Argon model ([availability](https://ai.google.dev/gemini-api/docs/latest-model#pricing)). Choose a model available to your key in Debug before submitting edits.
 - `just` (optional, but recommended)
 
 Set the standard environment variable:

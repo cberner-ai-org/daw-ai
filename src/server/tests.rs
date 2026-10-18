@@ -553,6 +553,34 @@ fn validates_the_optional_prompt_experiment() {
 }
 
 #[test]
+fn edit_model_selection_is_validated_before_starting_a_job() {
+    for model in ["", "gemini-unknown", "gpt-unknown"] {
+        let router = Router::demo();
+        let response = router.handle(&request(
+            "POST",
+            "/api/edits",
+            &format!("prompt=increase+volume&start=0&end=4&model={model}"),
+        ));
+        assert_eq!(response.status, 422);
+        assert!(response.body.contains("unsupported Gemini model"));
+    }
+    for model in [
+        None,
+        Some("gemini-4-argon"),
+        Some("gemini-3.8-flash"),
+        Some("gemini-3.6-flash"),
+    ] {
+        let router = Router::demo();
+        let mut body = "prompt=increase+volume&start=0&end=4".to_owned();
+        if let Some(model) = model {
+            body.push_str(&format!("&model={model}"));
+        }
+        let response = router.handle(&request("POST", "/api/edits", &body));
+        assert_eq!(wait_for_edit(&router, &response)["status"], "completed");
+    }
+}
+
+#[test]
 fn rejects_untrusted_audio_requests() {
     let router = Router::demo();
     assert_eq!(

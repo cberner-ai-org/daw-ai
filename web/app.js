@@ -44,6 +44,7 @@
     copyDebug: document.querySelector("#copy-debug"),
     clearDebug: document.querySelector("#clear-debug"),
     newPrompt: document.querySelector("#new-prompt"),
+    model: document.querySelector("#gemini-model"),
     refreshGeminiSessions: document.querySelector("#refresh-gemini-sessions"),
     geminiSessionList: document.querySelector("#gemini-session-list"),
     sessionHistoryList: document.querySelector("#session-history-list"),
@@ -77,6 +78,9 @@
   const RECONCILED_REQUEST_TIMEOUT_MS = 2000;
   const EDIT_ACCEPTANCE_TIMEOUT_MS = 10_000;
   const PENDING_EDIT_STORAGE_KEY = "daw-ai.pending-edit.v1";
+  const MODEL_STORAGE_KEY = "daw-ai.gemini-model.v1";
+  const DEFAULT_MODEL = elements.model.value;
+  const SUPPORTED_MODELS = new Set([...elements.model.options].map((option) => option.value));
   const NEW_PROMPT_STORAGE_KEY = "daw-ai.new-prompt.v1";
   const TOAST_DISMISS_MS = 4200;
   const ERROR_TOAST_DISMISS_MS = 60_000;
@@ -686,7 +690,10 @@
           pending.acceptedJob.operationId === pending.operationId);
       const validPromptSetting =
         pending.newPrompt === undefined || typeof pending.newPrompt === "boolean";
-      if (validOperationId && validRequest && validJob && validPromptSetting) {
+      const validModel = pending.model === undefined || SUPPORTED_MODELS.has(pending.model);
+      if (validOperationId && validRequest && validJob && validPromptSetting && validModel) {
+        // Pending edits without a model were submitted using Gemini 3.6 Flash.
+        pending.model = pending.model ?? "gemini-3.6-flash";
         pending.newPrompt = pending.newPrompt === true;
         return pending;
       }
@@ -1042,6 +1049,7 @@
           start: String(selectionStart),
           end: String(selectionEnd),
         });
+        editBody.set("model", pending.model);
         editBody.set("new_prompt", String(pending.newPrompt === true));
         accepted = await acceptEdit(
           clientOperationId,
@@ -1141,6 +1149,7 @@
         end: state.selectionEnd,
         acceptedJob: null,
         newPrompt: elements.newPrompt.checked,
+        model: elements.model.value,
       };
       persistPendingEdit(pending);
       handedOff = true;
@@ -1261,6 +1270,7 @@
       `AI edit: ${state.promptPending ? "pending" : "idle"}`,
       `AI sessions: ${state.geminiSessions.length} retained locally`,
       "Gemini policy: dynamic tools and arrangement feedback always enabled",
+      `AI model for new edits: ${elements.model.value}`,
       `New Gemini prompt: ${elements.newPrompt.checked ? "enabled" : "disabled"}`,
       `Selection: ${state.selectionStart.toFixed(1)}s - ${state.selectionEnd.toFixed(1)}s`,
     ];
@@ -1433,6 +1443,14 @@
   elements.copyDebug.addEventListener("click", () => void copyDebugReport());
   elements.clearDebug.addEventListener("click", clearDebugIssues);
   elements.refreshGeminiSessions.addEventListener("click", () => void loadGeminiSessions());
+  elements.model.addEventListener("change", () => {
+    try {
+      window.localStorage.setItem(MODEL_STORAGE_KEY, elements.model.value);
+    } catch (_error) {
+      // Unavailable storage must not prevent selecting a model.
+    }
+    renderDebug();
+  });
   elements.newPrompt.addEventListener("change", () => {
     try {
       window.localStorage.setItem(NEW_PROMPT_STORAGE_KEY, String(elements.newPrompt.checked));
@@ -1479,6 +1497,12 @@
   });
 
   async function initialize() {
+    try {
+      const savedModel = window.localStorage.getItem(MODEL_STORAGE_KEY);
+      elements.model.value = SUPPORTED_MODELS.has(savedModel) ? savedModel : DEFAULT_MODEL;
+    } catch (_error) {
+      elements.model.value = DEFAULT_MODEL;
+    }
     try {
       elements.newPrompt.checked =
         window.localStorage.getItem(NEW_PROMPT_STORAGE_KEY) === "true";

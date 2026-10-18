@@ -154,6 +154,17 @@
           </div>
         </div>
         <p class="debug-intro">Copy this report into a coding assistant when you need help. Backend warnings and errors are also written to the server's stderr.</p>
+        <section class="debug-settings" aria-labelledby="model-heading">
+          <div>
+            <label id="model-heading" for="gemini-model">AI model</label>
+            <span>Used for new edits. Saved in this browser; running edits keep their model.</span>
+          </div>
+          <select id="gemini-model">
+            <option value="gemini-4-argon" selected>Gemini 4 Argon</option>
+            <option value="gemini-3.8-flash">Gemini 3.8 Flash</option>
+            <option value="gemini-3.6-flash">Gemini 3.6 Flash</option>
+          </select>
+        </section>
         <section class="debug-settings" aria-labelledby="new-prompt-heading">
           <div>
             <strong id="new-prompt-heading">New Gemini prompt</strong>
