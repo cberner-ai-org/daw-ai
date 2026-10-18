@@ -164,6 +164,39 @@ async function run() {
       "track unmute control",
     );
     await cdp.send("Target.closeTarget", { targetId: startupPage.targetId });
+    const rackPage = await openPageWithScript(cdp, appUrl, `(() => {
+      const originalFetch = window.fetch;
+      window.fetch = async function(resource, options) {
+        const response = await originalFetch(resource, options);
+        if (resource !== '/api/project') return response;
+        const project = await response.json();
+        project.instrumentRacks = project.tracks.map((track, index) => ({
+          id: 9000 + index, name: 'Independent ' + index, type: 'instrumentRack',
+          keyZones: [{ id: 9100 + index, lowNote: 0, highNote: 127, instrumentId: track.instrument.id }],
+        }));
+        project.instrumentRacks[2].keyZones.push({ id: 9200, lowNote: 60, highNote: 60, instrumentId: project.tracks[0].instrument.id });
+        project.instrumentRacks[2].keyZones.push({ id: 9201, lowNote: 60, highNote: 60, instrumentId: project.tracks[0].instrument.id });
+        project.clips = project.tracks.map((track, index) => ({
+          id: 9300 + index, rackId: 9000 + index, label: 'Part ' + index,
+          start: 0, end: 1, sourceStart: 0, playback: { mode: 'once', lengthBeats: 1 },
+          events: [{ id: 9400 + index, pitch: 60, time: 0, duration: 0.5, velocity: 0.8 }],
+        }));
+        return new Response(JSON.stringify(project), { headers: { 'Content-Type': 'application/json' } });
+      };
+    })()`);
+    await waitFor(async () => evaluate(cdp, rackPage.sessionId,
+      "document.querySelectorAll('.track-row').length === 3"), "rack-scoped timeline");
+    assert.deepEqual(await evaluate(cdp, rackPage.sessionId, `
+      [...document.querySelectorAll('.track-row')].map((row) => ({
+        clips: [...row.querySelectorAll('.clip-name')].map((clip) => clip.textContent),
+        notes: row.querySelectorAll('.timeline-midi i').length,
+      }))`), [
+      { clips: ['Part 0', 'Part 2'], notes: 2 },
+      { clips: ['Part 1'], notes: 1 },
+      { clips: ['Part 2'], notes: 1 },
+    ], "same-pitch parts stay isolated and intentional layers appear only once");
+    await cdp.send("Target.closeTarget", { targetId: rackPage.targetId });
+
     const playbackPriorityPage = await openPageWithScript(cdp, appUrl, `(() => {
       const originalFetch = window.fetch;
       HTMLMediaElement.prototype.play = function play() {

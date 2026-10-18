@@ -347,7 +347,7 @@
   }
 
   function routedClipEvents(track, clip) {
-    const zones = state.project.instrumentRack?.keyZones ?? [];
+    const zones = state.project.instrumentRacks.find((rack) => rack.id === clip.rackId)?.keyZones ?? [];
     const ranges = zones.filter((zone) => zone.instrumentId === track.instrument.id);
     return clip.events.filter((event) =>
       ranges.some((zone) => event.pitch >= zone.lowNote && event.pitch <= zone.highNote),

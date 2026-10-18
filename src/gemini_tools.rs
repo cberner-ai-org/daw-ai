@@ -171,6 +171,9 @@ const ALWAYS_AVAILABLE_TOOL_NAMES: &[&str] = &[
     SOUND_TOOL_PARAMETER_TOOL_NAME,
 ];
 const ARRANGEMENT_TOOL_NAMES: &[&str] = &[
+    "add_instrument_rack",
+    "update_instrument_rack",
+    "delete_instrument_rack",
     "new_track",
     "delete_track",
     "set_track_identity",
@@ -217,7 +220,7 @@ pub(crate) fn tool_declarations() -> Vec<JsonValue> {
                 "properties": {
                     "nodeId": {
                         "type":"string",
-                        "pattern":"^(master|rack|track:[1-9][0-9]*|instrument:[1-9][0-9]*|clip:[1-9][0-9]*|zone:[1-9][0-9]*|effect:[1-9][0-9]*|modulator:[1-9][0-9]*)$",
+                        "pattern":"^(master|rack:[1-9][0-9]*|track:[1-9][0-9]*|instrument:[1-9][0-9]*|clip:[1-9][0-9]*|zone:[1-9][0-9]*|effect:[1-9][0-9]*|modulator:[1-9][0-9]*)$",
                         "maxLength":64,
                         "description":"Exact nodeId returned by a topology read. Omit for compact topology."
                     }
@@ -400,6 +403,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
     };
     let clip_properties = || {
         serde_json::json!({
+            "rackId":id(),
             "label":{"type":"string","minLength":1,"maxLength":64},
             "startBeat":{"type":"number","minimum":0,"description":"Absolute beat from the start of the project."},
             "durationBeats":{"type":"number","minimum":0.25,"maximum":MAX_ONCE_PLAYBACK_BEATS},
@@ -411,6 +415,27 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
         })
     };
     let mut tools = vec![
+        function(
+            "add_instrument_rack",
+            "Create a named rack with no key zones. Clips explicitly select a rack; only that rack's zones route their notes.",
+            object_schema(
+                serde_json::json!({"name":{"type":"string","minLength":1,"maxLength":64}}),
+                &["name"],
+            ),
+        ),
+        function(
+            "update_instrument_rack",
+            "Rename a rack without changing its routing.",
+            object_schema(
+                serde_json::json!({"rackId":id(),"name":{"type":"string","minLength":1,"maxLength":64}}),
+                &["rackId", "name"],
+            ),
+        ),
+        function(
+            "delete_instrument_rack",
+            "Delete a rack and its zones, preserving instruments. Rejected while any clip references it; reassign or delete those clips first.",
+            object_schema(serde_json::json!({"rackId":id()}), &["rackId"]),
+        ),
         function(
             "new_track",
             "Create one Surge XT track with Init and no effects, modulators, or Rack key zones. Choose a short descriptive name and a color from the palette. Returns its stable ID.",
@@ -444,25 +469,34 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             "Atomically copy an audition slot's exact instrument, effects, and modulators into a new arrangement track and add its first Rack key zone. Returns advisory warnings when the current sound or zone was not auditioned.",
             object_schema(
                 serde_json::json!({
+                    "rackId":id(),
                     "auditionId":{"type":"integer","minimum":1},
                     "description":{"type":"string","minLength":1,"maxLength":16},
                     "color":{"type":"string","enum":TRACK_COLOR_PALETTE},
                     "lowNote":{"type":"integer","minimum":0,"maximum":127,"description":"Inclusive MIDI note; 60 is C4."},
                     "highNote":{"type":"integer","minimum":0,"maximum":127,"description":"Inclusive MIDI note; 60 is C4."}
                 }),
-                &["auditionId", "description", "color", "lowNote", "highNote"],
+                &[
+                    "rackId",
+                    "auditionId",
+                    "description",
+                    "color",
+                    "lowNote",
+                    "highNote",
+                ],
             ),
         ),
         function(
             "add_key_zone",
-            "Add an inclusive MIDI-note range to the shared Instrument Rack. Every distinct Instrument with a matching zone receives the original note event.",
+            "Add an inclusive MIDI-note range to the specified rack. Only clips selecting that rack reach its zones. Matching instruments receive unchanged notes, once per event even when zones overlap.",
             object_schema(
                 serde_json::json!({
+                    "rackId":id(),
                     "instrumentId":id(),
                     "lowNote":{"type":"integer","minimum":0,"maximum":127,"description":"Inclusive MIDI note; 60 is C4."},
                     "highNote":{"type":"integer","minimum":0,"maximum":127,"description":"Inclusive MIDI note; 60 is C4."}
                 }),
-                &["instrumentId", "lowNote", "highNote"],
+                &["rackId", "instrumentId", "lowNote", "highNote"],
             ),
         ),
         function(
@@ -497,12 +531,19 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
             "Add a beat-positioned MIDI clip without changing other clips. Returns note names plus advisory warnings for silent routing or notes not auditioned on each receiving sound.",
             object_schema(
                 clip_properties(),
-                &["label", "startBeat", "durationBeats", "playback", "events"],
+                &[
+                    "rackId",
+                    "label",
+                    "startBeat",
+                    "durationBeats",
+                    "playback",
+                    "events",
+                ],
             ),
         ),
         function(
             "update_midi_clip",
-            "Replace all fields and events of one existing MIDI clip. Returns note names plus advisory audition and routing warnings. This changes the whole clip; to preserve material outside an edit region, keep it and add a separate regional clip, or explicitly split it into clips that preserve the surrounding material.",
+            "Replace one MIDI clip within the selected edit region, including its destination rack. Retained sections outside the replacement keep their original rack. Returns note names plus advisory audition and routing warnings.",
             object_schema(
                 {
                     let mut p = clip_properties();
@@ -511,6 +552,7 @@ fn mutation_tool_declarations() -> Vec<JsonValue> {
                 },
                 &[
                     "clipId",
+                    "rackId",
                     "label",
                     "startBeat",
                     "durationBeats",
@@ -698,18 +740,21 @@ pub(crate) fn read_sound_graph(
 }
 
 fn sound_graph_topology(project: &Project) -> JsonValue {
-    let mut nodes = vec![
-        serde_json::json!({"nodeId":"master","type":"master","name":project.name}),
-        serde_json::json!({"nodeId":"rack","type":"instrumentRack","keyZoneCount":project.key_zones.len()}),
-    ];
+    let mut nodes =
+        vec![serde_json::json!({"nodeId":"master","type":"master","name":project.name})];
     let mut connections = Vec::new();
+    for rack in &project.racks {
+        nodes.push(serde_json::json!({"nodeId":format!("rack:{}", rack.id), "id":rack.id,"name":rack.name,"type":"instrumentRack","keyZoneCount":project.key_zones.iter().filter(|zone| zone.rack_id == rack.id).count()}));
+    }
     for clip in &project.clips {
         let node_id = format!("clip:{}", clip.id);
         nodes.push(serde_json::json!({
-            "nodeId":node_id,"type":"midiClip","label":clip.label,
+            "nodeId":node_id,"type":"midiClip","label":clip.label,"rackId":clip.rack_id,
             "start":clip.start,"end":clip.end,"eventCount":clip.events.len()
         }));
-        connections.push(serde_json::json!({"from":node_id,"to":"rack","type":"midi"}));
+        connections.push(
+            serde_json::json!({"from":node_id,"to":format!("rack:{}", clip.rack_id),"type":"midi"}),
+        );
     }
     for track in &project.tracks {
         let track_node = format!("track:{}", track.id);
@@ -788,9 +833,11 @@ fn sound_graph_topology(project: &Project) -> JsonValue {
             "nodeId":node_id,"type":"keyZone","lowNote":zone.low_note,
             "lowNoteName":midi_note_name(zone.low_note),
             "highNote":zone.high_note,"highNoteName":midi_note_name(zone.high_note),
-            "instrumentId":zone.instrument_id
+            "instrumentId":zone.instrument_id,"rackId":zone.rack_id
         }));
-        connections.push(serde_json::json!({"from":"rack","to":node_id,"type":"owns"}));
+        connections.push(
+            serde_json::json!({"from":format!("rack:{}", zone.rack_id),"to":node_id,"type":"owns"}),
+        );
         connections.push(serde_json::json!({
             "from":node_id,"to":instrument_node,"type":"midi",
             "lowNote":zone.low_note,"lowNoteName":midi_note_name(zone.low_note),
@@ -821,18 +868,6 @@ fn read_sound_node(
             "controls":[{"parameter":"bpm","value":project.bpm,"minimum":60,"maximum":180,"mutationTool":"set_tempo"}]
         }));
     }
-    if node_id == "rack" {
-        return Ok(serde_json::json!({
-            "nodeId":"rack","type":"instrumentRack",
-            "clips":project.clips.iter().map(|clip| format!("clip:{}", clip.id)).collect::<Vec<_>>(),
-            "keyZones":project.key_zones.iter().map(|zone| serde_json::json!({
-                "nodeId":format!("zone:{}", zone.id),"id":zone.id,
-                "lowNote":zone.low_note,"lowNoteName":midi_note_name(zone.low_note),
-                "highNote":zone.high_note,"highNoteName":midi_note_name(zone.high_note),
-                "instrumentId":zone.instrument_id
-            })).collect::<Vec<_>>()
-        }));
-    }
     let (kind, id) = node_id
         .split_once(':')
         .ok_or_else(|| "nodeId must be copied from read_sound_graph topology".to_owned())?;
@@ -841,6 +876,23 @@ fn read_sound_node(
         .ok()
         .filter(|id| *id > 0)
         .ok_or_else(|| "nodeId must contain a positive stable ID".to_owned())?;
+    if kind == "rack" {
+        let rack = project
+            .racks
+            .iter()
+            .find(|rack| rack.id == id)
+            .ok_or_else(|| format!("rack {id} does not exist"))?;
+        return Ok(serde_json::json!({
+            "nodeId":node_id,"type":"instrumentRack","id":rack.id,"name":rack.name,
+            "clips":project.clips.iter().filter(|clip| clip.rack_id == id).map(|clip| format!("clip:{}", clip.id)).collect::<Vec<_>>(),
+            "keyZones":project.key_zones.iter().filter(|zone| zone.rack_id == id).map(|zone| serde_json::json!({
+                "nodeId":format!("zone:{}", zone.id),"id":zone.id,
+                "lowNote":zone.low_note,"lowNoteName":midi_note_name(zone.low_note),
+                "highNote":zone.high_note,"highNoteName":midi_note_name(zone.high_note),
+                "instrumentId":zone.instrument_id,"rackId":zone.rack_id
+            })).collect::<Vec<_>>()
+        }));
+    }
     if kind == "clip" {
         let clip = project
             .clips
@@ -849,7 +901,7 @@ fn read_sound_node(
             .ok_or_else(|| format!("clip {id} does not exist"))?;
         let beats_per_second = f32::from(project.bpm) / 60.0;
         return Ok(serde_json::json!({
-            "nodeId":node_id,"type":"midiClip","id":id,
+            "nodeId":node_id,"type":"midiClip","id":id,"rackId":clip.rack_id,
             "label":clip.label,"startBeat":clip.start * beats_per_second,
             "durationBeats":(clip.end - clip.start) * beats_per_second,
             "playback":if clip.playback_mode == "loop" {
@@ -872,7 +924,7 @@ fn read_sound_node(
             "nodeId":node_id,"type":"keyZone","id":zone.id,
             "lowNote":zone.low_note,"lowNoteName":midi_note_name(zone.low_note),
             "highNote":zone.high_note,"highNoteName":midi_note_name(zone.high_note),
-            "instrumentId":zone.instrument_id
+            "instrumentId":zone.instrument_id,"rackId":zone.rack_id
         }));
     }
     for track in &project.tracks {
@@ -1565,6 +1617,32 @@ pub(crate) fn apply_agent_mutation(
     let mut result_zone_id = None;
     let mut midi_context = None;
     let summary = match name {
+        "add_instrument_rack" => {
+            let id = studio
+                .create_instrument_rack(required_string(object, "name")?)
+                .map_err(studio_error_message)?;
+            result_id = Some(id);
+            format!("Created rack {id}")
+        }
+        "update_instrument_rack" => {
+            let id = required_id(object, "rackId")?;
+            studio
+                .update_instrument_rack(id, required_string(object, "name")?)
+                .map_err(studio_error_message)?;
+            format!("Renamed rack {id}")
+        }
+        "delete_instrument_rack" => {
+            let id = required_id(object, "rackId")?;
+            if studio.project().clips.iter().any(|clip| clip.rack_id == id) {
+                return Err(format!(
+                    "rack {id} is used by MIDI clips; reassign or delete those clips before deleting the rack"
+                ));
+            }
+            studio
+                .delete_instrument_rack(id)
+                .map_err(studio_error_message)?;
+            format!("Deleted rack {id}")
+        }
         "new_track" => {
             let description = required_string(object, "description")?;
             let color = required_string(object, "color")?;
@@ -1613,7 +1691,14 @@ pub(crate) fn apply_agent_mutation(
                 .first()
                 .ok_or_else(|| format!("audition slot {audition_id} has no instrument"))?;
             let (track_id, zone_id) = studio
-                .add_configured_channel(source, description, color, low_note, high_note)
+                .add_configured_channel(
+                    required_id(object, "rackId")?,
+                    source,
+                    description,
+                    color,
+                    low_note,
+                    high_note,
+                )
                 .map_err(studio_error_message)?;
             result_id = Some(track_id);
             result_zone_id = Some(zone_id);
@@ -1628,7 +1713,12 @@ pub(crate) fn apply_agent_mutation(
             let low_note = required_midi_note(object, "lowNote")?;
             let high_note = required_midi_note(object, "highNote")?;
             let id = studio
-                .create_key_zone(instrument_id, low_note, high_note)
+                .create_key_zone(
+                    required_id(object, "rackId")?,
+                    instrument_id,
+                    low_note,
+                    high_note,
+                )
                 .map_err(studio_error_message)?;
             result_id = Some(id);
             format!(
@@ -1705,7 +1795,7 @@ pub(crate) fn apply_agent_mutation(
                 .create_midi_clip(&spec)
                 .map_err(studio_error_message)?;
             result_id = Some(id);
-            format!("Added MIDI clip {id} to the shared Instrument Rack")
+            format!("Added MIDI clip {id} to rack {}", spec.rack_id)
         }
         "update_midi_clip" => {
             let clip_id = required_id(object, "clipId")?;
@@ -2015,6 +2105,7 @@ pub(crate) fn apply_agent_mutation(
         "version": studio.project().version,
         "id": result_id,
         "channels": sound_tool_inventory(studio.project()),
+        "racks": studio.project().racks.iter().map(|rack| serde_json::json!({"id":rack.id,"name":rack.name})).collect::<Vec<_>>(),
         "selection": mutation_selection(
             studio.project(),
             response_selection_start,
@@ -2376,6 +2467,7 @@ fn clip_arguments(object: &Map<String, JsonValue>, bpm: u16) -> Result<MidiClipS
     }
     let seconds_per_beat = 60.0 / f32::from(bpm);
     Ok(MidiClipSpec {
+        rack_id: required_id(object, "rackId")?,
         label: label.to_owned(),
         start: start_beat * seconds_per_beat,
         end: (start_beat + duration_beats) * seconds_per_beat,
@@ -2688,6 +2780,7 @@ pub(crate) fn prepare_instrument_audition(
     let track_id = studio.project().tracks[0].id;
     let mut clip = object.clone();
     clip.insert("label".to_owned(), "Audition".into());
+    clip.insert("rackId".to_owned(), studio.project().racks[0].id.into());
     clip.insert("startBeat".to_owned(), 0.into());
     clip.insert("playback".to_owned(), serde_json::json!({"mode":"once"}));
     let spec = clip_arguments(&clip, current.bpm)?;
@@ -3209,7 +3302,13 @@ fn audition_warnings_for_mutation(
         let instruments = project
             .tracks
             .iter()
-            .filter(|track| project.track_receives_pitch(track, note))
+            .filter(|track| {
+                project.track_receives_pitch(
+                    object["rackId"].as_u64().expect("validated clip rack"),
+                    track,
+                    note,
+                )
+            })
             .map(|track| track.instrument.id)
             .collect::<BTreeSet<_>>();
         if instruments.is_empty() {
@@ -3355,7 +3454,7 @@ pub(crate) fn create_audition_slot(
     }
     let audition_instrument_id = studio.project().tracks[0].instrument.id;
     studio
-        .create_key_zone(audition_instrument_id, 0, 127)
+        .create_key_zone(studio.project().racks[0].id, audition_instrument_id, 0, 127)
         .map_err(studio_error_message)?;
     let (audition_id, path) = reserve_audition_slot(session_path)?;
     let result = (|| {
@@ -3734,7 +3833,7 @@ fn sound_tool_inventory(project: &Project) -> Vec<JsonValue> {
                 }).collect::<Vec<_>>(),
                 "keyZones": project.key_zones.iter().filter(|zone| zone.instrument_id == track.instrument.id).map(|zone| {
                     serde_json::json!({
-                        "id":zone.id,
+                        "id":zone.id,"rackId":zone.rack_id,
                         "lowNote":zone.low_note,
                         "lowNoteName":midi_note_name(zone.low_note),
                         "highNote":zone.high_note,
@@ -4136,7 +4235,14 @@ mod tests {
         assert!(!initial.iter().any(|tool| tool["name"] == "new_track"));
 
         let arrangement = dynamic_tool_declarations(Some(ToolGroup::Arrangement));
-        assert!(arrangement.len() <= 25);
+        assert!(arrangement.len() <= 28);
+        for name in [
+            "add_instrument_rack",
+            "update_instrument_rack",
+            "delete_instrument_rack",
+        ] {
+            assert!(arrangement.iter().any(|tool| tool["name"] == name));
+        }
         assert!(
             arrangement
                 .iter()
@@ -4157,7 +4263,11 @@ mod tests {
 
     #[test]
     fn disposable_audition_builds_audio_request_without_mutating_session() {
-        let original = Project::initial();
+        let mut studio = Studio::from_project(Project::initial());
+        studio
+            .delete_instrument_rack(studio.project().racks[0].id)
+            .unwrap();
+        let original = studio.project().clone();
         let session = EditSession::create(&original, "audition a lead", 0.0, 4.0).expect("session");
         let created: JsonValue = serde_json::from_str(
             &create_audition_slot(session.path(), &serde_json::json!({}))
@@ -4201,6 +4311,10 @@ mod tests {
             "Factory/Leads/Classic Lead 1"
         );
         assert_eq!(request.project.clips.len(), 1);
+        assert_eq!(
+            request.project.clips[0].rack_id,
+            request.project.racks[0].id
+        );
         assert_eq!(request.project.tracks[0].effects.len(), 1);
         assert_eq!(request.end, 1.0);
         let saved = current_project(&audition_slot_path(session.path(), audition_id).unwrap())
@@ -4212,6 +4326,14 @@ mod tests {
             original.to_json()
         );
 
+        apply_agent_mutation(
+            session.path(),
+            "add_instrument_rack",
+            &serde_json::json!({"name":"Replacement rack"}),
+        )
+        .unwrap();
+        let replacement = session.take_update().unwrap().unwrap().1;
+        assert_ne!(replacement.racks[0].id, request.project.racks[0].id);
         apply_audition_mutation(
             session.path(),
             "set_surge_preset",
@@ -4234,11 +4356,123 @@ mod tests {
             wavetable_request.project.tracks[0].instrument.preset,
             "Factory/FX/Space Adventure 1"
         );
+        assert_eq!(
+            current_project(session.path()).unwrap().to_json(),
+            replacement.to_json()
+        );
+    }
+
+    #[test]
+    fn rack_tools_route_clips_and_undo_destination_changes() {
+        let project = Project::demo();
+        let session = EditSession::create(&project, "independent lead", 0.0, 32.0).unwrap();
+        let mutate = |name: &str, args: JsonValue| -> JsonValue {
+            let response = apply_agent_mutation(session.path(), name, &args).unwrap();
+            session.take_update().unwrap().expect("published mutation");
+            serde_json::from_str(&response).unwrap()
+        };
+        let rack_id = mutate("add_instrument_rack", serde_json::json!({"name":"Lead"}))["id"]
+            .as_u64()
+            .unwrap();
+        mutate(
+            "update_instrument_rack",
+            serde_json::json!({"rackId":rack_id,"name":"Lead only"}),
+        );
+        mutate(
+            "add_key_zone",
+            serde_json::json!({"rackId":rack_id,"instrumentId":project.tracks[2].instrument.id,"lowNote":0,"highNote":127}),
+        );
+        let added = mutate(
+            "add_midi_clip",
+            serde_json::json!({
+                "rackId":rack_id,"label":"Independent","startBeat":0,"durationBeats":4,
+                "playback":{"mode":"once"},"events":[{"time":0,"duration":1,"pitch":48,"velocity":0.8}]
+            }),
+        );
+        let clip_id = added["id"].as_u64().unwrap();
+        let warnings = added["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Track 3 ")
+        );
+        let current = current_project(session.path()).unwrap();
+        let clip = current
+            .clips
+            .iter()
+            .find(|clip| clip.id == clip_id)
+            .unwrap();
+        assert!(!current.track_receives_pitch(clip.rack_id, &current.tracks[1], 48));
+        assert!(current.track_receives_pitch(clip.rack_id, &current.tracks[2], 48));
+        let topology = sound_graph_topology(&current);
+        assert!(
+            topology["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|edge| edge["from"] == format!("clip:{clip_id}")
+                    && edge["to"] == format!("rack:{rack_id}"))
+        );
+        let rack = read_sound_node(session.path(), &current, &format!("rack:{rack_id}")).unwrap();
+        assert_eq!(rack["name"], "Lead only");
+        assert_eq!(
+            rack["clips"],
+            serde_json::json!([format!("clip:{clip_id}")])
+        );
+        assert!(
+            apply_agent_mutation(
+                session.path(),
+                "delete_instrument_rack",
+                &serde_json::json!({"rackId":rack_id})
+            )
+            .unwrap_err()
+            .contains("reassign")
+        );
+        let mut args =
+            read_sound_node(session.path(), &current, &format!("clip:{clip_id}")).unwrap();
+        args["clipId"] = clip_id.into();
+        args["rackId"] = 4.into();
+        mutate("update_midi_clip", args);
+        assert_eq!(
+            current_project(session.path())
+                .unwrap()
+                .clips
+                .iter()
+                .find(|clip| clip.id == clip_id)
+                .unwrap()
+                .rack_id,
+            4
+        );
+        mutate("undo", serde_json::json!({}));
+        assert_eq!(
+            current_project(session.path())
+                .unwrap()
+                .clips
+                .iter()
+                .find(|clip| clip.id == clip_id)
+                .unwrap()
+                .rack_id,
+            rack_id
+        );
+        mutate("delete_midi_clip", serde_json::json!({"clipId":clip_id}));
+        mutate(
+            "delete_instrument_rack",
+            serde_json::json!({"rackId":rack_id}),
+        );
+        let current = current_project(session.path()).unwrap();
+        assert_eq!(current.tracks.len(), project.tracks.len());
+        assert!(!current.key_zones.iter().any(|zone| zone.rack_id == rack_id));
     }
 
     #[test]
     fn audition_slot_sound_edits_commit_atomically_with_a_first_zone() {
-        let original = Project::initial();
+        let mut studio = Studio::from_project(Project::initial());
+        let rack_id = studio
+            .create_instrument_rack("Audition destination")
+            .unwrap();
+        let original = studio.project().clone();
         let session =
             EditSession::create(&original, "prepare a sound", 0.0, 4.0).expect("edit session");
         let created: JsonValue = serde_json::from_str(
@@ -4304,7 +4538,7 @@ mod tests {
                     "auditionId":audition_id,
                     "description":"Lead",
                     "color":"#8ca9ff",
-                    "lowNote":60,
+                    "rackId":rack_id,"lowNote":60,
                     "highNote":72
                 }),
             )
@@ -4345,6 +4579,7 @@ mod tests {
             .expect("committed key zone");
         assert_eq!((zone.low_note, zone.high_note), (60, 72));
         assert_eq!(zone.instrument_id, track.instrument.id);
+        assert_eq!(zone.rack_id, rack_id);
         assert!(session.take_update().unwrap().is_none());
         read_audition_slot(
             session.path(),
@@ -4396,7 +4631,7 @@ mod tests {
                     "auditionId":audition_id,
                     "description":"Lead",
                     "color":"#8ca9ff",
-                    "lowNote":60,
+                    "rackId":4,"lowNote":60,
                     "highNote":72
                 }),
             )
@@ -4422,7 +4657,7 @@ mod tests {
                 session.path(),
                 "add_midi_clip",
                 &serde_json::json!({
-                    "label":"Pitch check",
+                    "rackId":4,"label":"Pitch check",
                     "startBeat":0,
                     "durationBeats":2,
                     "playback":{"mode":"once"},
@@ -5384,7 +5619,7 @@ mod tests {
             "add_midi_clip",
             &serde_json::json!({
                 "trackId":track_id,
-                "label":"Multiple pitches",
+                "rackId":4,"label":"Multiple pitches",
                 "startBeat":0,
                 "durationBeats":4,
                 "playback":{"mode":"loop","lengthBeats":4},
@@ -5508,7 +5743,7 @@ mod tests {
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
-                "label":"Sixteen-bar melody",
+                "rackId":4,"label":"Sixteen-bar melody",
                 "startBeat":0,
                 "durationBeats":32,
                 "playback":{"mode":"once"},
@@ -5537,7 +5772,7 @@ mod tests {
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
-                "label":"Oversized loop",
+                "rackId":4,"label":"Oversized loop",
                 "startBeat":0,
                 "durationBeats":4,
                 "playback":{"mode":"loop","lengthBeats":4},
@@ -5559,7 +5794,7 @@ mod tests {
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
-                "label":"Long phrase",
+                "rackId":4,"label":"Long phrase",
                 "startBeat":0,
                 "durationBeats":66,
                 "playback":{"mode":"once"},
@@ -5574,7 +5809,7 @@ mod tests {
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
-                "label":"Too long",
+                "rackId":4,"label":"Too long",
                 "startBeat":0,
                 "durationBeats":257,
                 "playback":{"mode":"once"},
@@ -5589,7 +5824,7 @@ mod tests {
             "add_midi_clip",
             &serde_json::json!({
                 "trackId":3,
-                "label":"Too long loop",
+                "rackId":4,"label":"Too long loop",
                 "startBeat":0,
                 "durationBeats":32,
                 "playback":{"mode":"loop","lengthBeats":17},
@@ -5622,7 +5857,7 @@ mod tests {
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
-                "label":"Dense roll",
+                "rackId":4,"label":"Dense roll",
                 "startBeat":0,
                 "durationBeats":4,
                 "playback":{"mode":"once"},
@@ -5755,7 +5990,7 @@ mod tests {
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
-                "label":"Restored phrase",
+                "rackId":4,"label":"Restored phrase",
                 "startBeat":undo["selection"]["startBeats"],
                 "durationBeats":undo["selection"]["durationBeats"],
                 "playback":{"mode":"once"},
@@ -5788,7 +6023,7 @@ mod tests {
             session.path(),
             "update_midi_clip",
             &serde_json::json!({
-                "clipId":11,"label":"Updated drums","startBeat":0,
+                "clipId":11,"rackId":4,"label":"Updated drums","startBeat":0,
                 "durationBeats":16.0 * 112.0 / 120.0,
                 "playback":{"mode":"loop","lengthBeats":4},"events":[
                     {"time":0,"duration":0.25,"pitch":36,"velocity":0.9}
@@ -5826,7 +6061,7 @@ mod tests {
             session.path(),
             "add_midi_clip",
             &serde_json::json!({
-                "label":"Outside selection","startBeat":16,
+                "rackId":4,"label":"Outside selection","startBeat":16,
                 "durationBeats":8,"playback":{"mode":"loop","lengthBeats":4},"events":[]
             }),
         )

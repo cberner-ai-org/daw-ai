@@ -261,7 +261,7 @@ fn clip_recipient_track_ids(project: &Project, clip: &Clip) -> BTreeSet<u64> {
         .filter_map(|track| {
             clip.events
                 .iter()
-                .any(|event| project.track_receives_pitch(track, event.pitch))
+                .any(|event| project.track_receives_pitch(clip.rack_id, track, event.pitch))
                 .then_some(track.id)
         })
         .collect()
@@ -2218,6 +2218,30 @@ mod tests {
             32.0,
         );
         assert_eq!(clip_requirement.track_ids, BTreeSet::from([2, 3]));
+        let mut rerouted = crate::model::Studio::from_project(before_clip.clone());
+        let rack_id = rerouted
+            .create_instrument_rack("Alternate bass sound")
+            .unwrap();
+        rerouted
+            .create_key_zone(rack_id, before_clip.tracks[2].instrument.id, 0, 127)
+            .unwrap();
+        let mut after_reroute = rerouted.project().clone();
+        after_reroute
+            .clips
+            .iter_mut()
+            .find(|clip| clip.id == 12)
+            .unwrap()
+            .rack_id = rack_id;
+        let reroute_requirement = arrangement_listen_requirement(
+            "update_midi_clip",
+            &serde_json::json!({"clipId":12,"rackId":rack_id}),
+            &clip_result,
+            rerouted.project(),
+            &after_reroute,
+            0.0,
+            32.0,
+        );
+        assert_eq!(reroute_requirement.track_ids, BTreeSet::from([2, 3]));
 
         let before_zone = Project::demo();
         let mut after_zone = before_zone.clone();
