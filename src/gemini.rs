@@ -540,12 +540,20 @@ fn run_session_with_transport_options(
             .ok_or(PlannerError::TimedOut)?;
         sequence += 1;
         let tools = dynamic_tool_declarations(loaded_tool_group);
+        let project = current_project(session.path()).map_err(|message| invalid(&message))?;
+        let selection = crate::gemini_tools::edit_selection(session.path())
+            .map_err(|message| invalid(&message))?;
+        let instruction = format!(
+            "{}\n\n{}",
+            system_instruction(options.new_prompt),
+            session_progress_guidance(&project, selection, &state, started.elapsed(), remaining)
+        );
         let mut request = serde_json::json!({
             "model": options.model.as_str(),
             "input": input,
             "tools": &tools,
-            "system_instruction": system_instruction(options.new_prompt),
-            "generation_config": {"thinking_level": "high"},
+            "system_instruction": instruction,
+            "generation_config": {"thinking_level": interaction_thinking_level(&input)},
             "store": true
         });
         if let Some(previous) = &previous_interaction_id {
@@ -1302,6 +1310,64 @@ fn planner_task(prompt: &str, start: f32, end: f32, new_prompt: bool) -> String 
     )
 }
 
+fn interaction_thinking_level(input: &JsonValue) -> &'static str {
+    let Some(parts) = input.as_array() else {
+        return "high";
+    };
+    let needs_musical_reasoning = parts.iter().any(|part| {
+        (part["type"] == "function_result"
+            && (part["name"] == READ_TOOL_NAME || part["name"] == READ_AUDITION_TOOL_NAME))
+            || part["content"]
+                .as_array()
+                .is_some_and(|content| content.iter().any(|item| item["type"] == "audio"))
+    });
+    if needs_musical_reasoning {
+        "high"
+    } else {
+        "low"
+    }
+}
+
+fn session_progress_guidance(
+    project: &Project,
+    selection: (f32, f32),
+    state: &LoopState,
+    elapsed: Duration,
+    remaining: Duration,
+) -> String {
+    let routed_clips =
+        crate::audio_analysis::routed_clips_in_window(project, selection.0, selection.1);
+    let mut guidance = format!(
+        "Live session progress: {} seconds elapsed; {} seconds remain until the request timeout. \
+         Published project edits: {}. Arrangement MIDI clips: {}; clips in the selected region routing notes to \
+         unmuted instruments with nonzero volume: {routed_clips}. Isolated sound auditions: {}. \
+         Routing is not proof of audible output or completion; verify the requested result by listening.",
+        elapsed.as_secs(),
+        remaining.as_secs(),
+        state.plans.len(),
+        project.clips.len(),
+        state.auditions,
+    );
+    if routed_clips == 0 {
+        guidance.push_str(
+            " There are no routed arrangement notes in the selected region yet. If the request calls for composing music, \
+             prioritize publishing a usable instrument, its Rack routing, and MIDI now. Tempo changes \
+             and isolated auditions do not put music on the timeline. Commit a promising audition \
+             or use an existing instrument; refine sounds after arranging. For sound-only requests \
+             or intentional silence, keep the requested scope instead.",
+        );
+    }
+    if remaining <= Duration::from_secs(300) {
+        guidance.push_str(
+            " The request is nearing its timeout. Move into final review now: finish essential \
+             arrangement changes, render the arrangement, and return your completion response. \
+             Defer optional new sounds, cosmetic cleanup, and further polish. Allow time for the \
+             final model response after listening; rendering alone does not complete the request.",
+        );
+    }
+    guidance
+}
+
 fn system_instruction(new_prompt: bool) -> String {
     let mut instruction = if new_prompt {
         format!(
@@ -1590,6 +1656,14 @@ mod tests {
             &|| false,
             &mut |sequence, request, _| {
                 assert_eq!(request["model"], "gemini-4-argon");
+                assert_eq!(
+                    request["generation_config"]["thinking_level"],
+                    if sequence == 1 || sequence == 6 {
+                        "high"
+                    } else {
+                        "low"
+                    }
+                );
                 if sequence == 2 {
                     saw_retry_message = request
                         .to_string()
@@ -2118,6 +2192,130 @@ mod tests {
     }
 
     #[test]
+    fn progress_guidance_distinguishes_arrangement_notes_from_sound_exploration() {
+        let mut project = Project::demo();
+        let state = LoopState {
+            auditions: 12,
+            ..LoopState::default()
+        };
+        let guidance = |project: &Project, remaining| {
+            session_progress_guidance(
+                project,
+                (0.0, 4.0),
+                &state,
+                Duration::from_secs(900),
+                remaining,
+            )
+        };
+        let normal = guidance(&project, Duration::from_secs(301));
+        assert!(normal.contains("900 seconds elapsed; 301 seconds remain"));
+        assert!(normal.contains("nonzero volume: 3"));
+        assert!(!normal.contains("no routed arrangement notes"));
+        assert!(!normal.contains("nearing its timeout"));
+        for clip in &mut project.clips {
+            clip.start = 4.0;
+        }
+        assert!(guidance(&project, Duration::from_secs(301)).contains("nonzero volume: 0"));
+        for clip in &mut project.clips {
+            clip.start = 0.0;
+        }
+        for (mode, expected) in [("once", 0), ("loop", 3)] {
+            for clip in &mut project.clips {
+                clip.playback_mode = mode.to_owned();
+            }
+            let later = session_progress_guidance(
+                &project,
+                (8.0, 12.0),
+                &state,
+                Duration::ZERO,
+                Duration::from_secs(301),
+            );
+            assert!(later.contains(&format!("nonzero volume: {expected}")));
+        }
+        project.tracks[0].muted = true;
+        project.tracks[1].volume = 0.0;
+        project.key_zones.retain(|zone| zone.id != 302);
+        let stalled = guidance(&project, Duration::from_secs(120));
+        assert!(stalled.contains("Arrangement MIDI clips: 3"));
+        assert!(stalled.contains("nonzero volume: 0"));
+        assert!(stalled.contains("Isolated sound auditions: 12"));
+        assert!(stalled.contains("prioritize publishing"));
+        assert!(stalled.contains("sound-only requests or intentional silence"));
+        assert!(stalled.contains("nearing its timeout"));
+        project.clips.clear();
+        assert!(
+            guidance(&project, Duration::from_secs(120)).contains("no routed arrangement notes")
+        );
+    }
+
+    #[test]
+    fn graph_inspection_and_audio_keep_high_thinking_effort() {
+        for part in [
+            serde_json::json!({"type":"function_result","name":READ_TOOL_NAME}),
+            serde_json::json!({"type":"function_result","name":READ_AUDITION_TOOL_NAME}),
+            serde_json::json!({"type":"user_input","content":[{"type":"audio"}]}),
+        ] {
+            assert_eq!(
+                interaction_thinking_level(&serde_json::json!([
+                    {"type":"function_result","name":LOAD_TOOL_GROUP_NAME}, part
+                ])),
+                "high"
+            );
+        }
+    }
+
+    #[test]
+    fn composition_progress_refreshes_after_published_midi_not_just_tempo() {
+        let mut project = Project::demo();
+        for clip in &mut project.clips {
+            clip.start = 8.0;
+        }
+        let session = EditSession::create(&project, "compose a track", 0.0, 4.0).unwrap();
+        let calls = [
+            (
+                LOAD_TOOL_GROUP_NAME,
+                serde_json::json!({"group":"arrangement"}),
+            ),
+            ("set_tempo", serde_json::json!({"bpm":140})),
+            (
+                "add_midi_clip",
+                serde_json::json!({
+                    "rackId":4,"label":"First part","startBeat":0,"durationBeats":2,
+                    "playback":{"mode":"loop","lengthBeats":2},
+                    "events":[{"time":0,"duration":1,"pitch":48,"velocity":0.8}]
+                }),
+            ),
+            (
+                AUDIO_TOOL_NAME,
+                serde_json::json!({"tracks":"all","start":0,"end":1}),
+            ),
+        ];
+        let result = run_session_with_transport(
+            &session, "compose a track", 0.0, 4.0,
+            &mut render_audio_request, &mut |edit| Ok(edit.project), &|| false,
+            &mut |sequence, request, _| {
+                let instruction = request["system_instruction"].as_str().unwrap();
+                assert!(instruction.contains("seconds remain until the request timeout"));
+                assert_eq!(instruction.contains("no routed arrangement notes"), sequence <= 3);
+                if sequence == 3 {
+                    assert!(instruction.contains("Published project edits: 1"));
+                    assert!(instruction.contains("Arrangement MIDI clips: 3"));
+                }
+                if sequence == 4 {
+                    assert!(instruction.contains("Published project edits: 2"));
+                    assert!(instruction.contains("nonzero volume: 1"));
+                }
+                let steps = calls.get(sequence - 1).map_or_else(Vec::new, |(name, arguments)| {
+                    vec![serde_json::json!({"type":"function_call","id":format!("call-{sequence}"),"name":name,"arguments":arguments})]
+                });
+                Ok(serde_json::json!({"id":format!("response-{sequence}"),"steps":steps}).to_string())
+            },
+        ).unwrap();
+        assert_eq!(result.project.clips.len(), 4);
+        assert_eq!(session.stats().unwrap(), (2, 1));
+    }
+
+    #[test]
     fn gemini_prompt_explains_mechanics_without_composition_prescriptions() {
         let task = planner_task("make the bass hit harder", 4.0, 8.0, false);
         let instruction = system_instruction(false);
@@ -2148,6 +2346,10 @@ mod tests {
         assert!(instruction.contains(AUDIO_TOOL_NAME));
         assert!(instruction.contains("does not satisfy this final-listen requirement"));
         let new_instruction = system_instruction(true);
+        for variant in [&instruction, &new_instruction] {
+            assert!(variant.contains("Publish that playable part before exploring sounds"));
+            assert!(variant.contains("Sound-only requests and intentional silence"));
+        }
         assert!(new_instruction.contains("examples explain mechanics"));
         assert!(new_instruction.contains("follow-up requests as edits to that current state"));
         assert!(new_instruction.contains("preserve material the user did not ask to change"));
