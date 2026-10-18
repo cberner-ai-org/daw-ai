@@ -69,10 +69,12 @@ impl ProjectHistory {
         self.snapshots.iter().map(|snapshot| &snapshot.entry)
     }
 
-    pub(crate) fn update_current_metadata(&mut self, project: &Project) {
+    pub(crate) fn update_current_metadata(&mut self, project: &Project) -> io::Result<()> {
+        validate_snapshot_source(&self.snapshots[self.current], &history_source(project))?;
         let entry = &mut self.snapshots[self.current].entry;
         entry.version = project.version;
         entry.edit_count = project.edits.len();
+        Ok(())
     }
 
     pub(crate) fn push(&mut self, current: &Project, project: &Project) -> io::Result<()> {
@@ -388,13 +390,12 @@ pub(crate) fn load_project_history(path: &Path, project: &Project) -> io::Result
         })
         .collect::<io::Result<Vec<_>>>()?;
     validate_compact_snapshots(&snapshots, current)?;
-    validate_snapshot_source(&snapshots[current], &history_source(project))?;
     let mut loaded = ProjectHistory {
         snapshots,
         parents,
         current,
     };
-    loaded.update_current_metadata(project);
+    loaded.update_current_metadata(project)?;
     if loaded.maximum_persisted_bytes(project)? as u64 > MAX_PROJECT_DOCUMENT_BYTES {
         return Err(invalid_data(
             "project history can exceed the document limit after checkout",
@@ -1002,7 +1003,9 @@ mod tests {
                 .expect("lazy one-step checkout");
             history = selected_history;
             restored.version = current.version + 1;
-            history.update_current_metadata(&restored);
+            history
+                .update_current_metadata(&restored)
+                .expect("checkout metadata");
             current = restored;
         }
         let retained = history.len();

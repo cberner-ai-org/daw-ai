@@ -1,23 +1,18 @@
+mod transport;
+
+pub use transport::run;
+use transport::streaming_body;
+
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::fs;
-use std::future::Future;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use http::{Request as HttpRequest, Response as HttpResponse};
-use http_body_util::BodyExt;
-use hyper::body::{Body as HyperBody, Bytes, Frame, Incoming};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::io::AsyncWriteExt;
+use http::Response as HttpResponse;
 
 use crate::audio_analysis;
 use crate::audio_renderer::{AudioRenderError, AudioRenderPriority, AudioRenderer};
@@ -31,30 +26,17 @@ use crate::gemini::{EDIT_TIMEOUT_SECONDS, GeminiEdit, GeminiPlanner, PlannerErro
 use crate::gemini_session::session_root;
 use crate::gemini_session::{session_root_for_project, session_summaries_in};
 use crate::gemini_tools::render_audio_request_cancellable;
+use crate::http::{HttpBody, Request, Response, empty_body, full_body, response_with_body};
 #[cfg(test)]
-use crate::http::valid_user_id;
-#[cfg(test)]
-use crate::http::{AUDIO_REQUEST_HEADER, authority};
-use crate::http::{
-    HttpBody, MAX_REQUEST_BYTES, Request, Response, empty_body, full_body, response_with_body,
-};
-use crate::model::{Project, Studio, StudioError, valid_operation_id};
-use crate::project_history::{
-    ProjectHistory, open_project_with_history, project_document, save_project_state,
-};
+use crate::model::Studio;
+use crate::model::{Project, StudioError, valid_operation_id};
+use crate::project_state::ProjectState;
 #[cfg(debug_assertions)]
 use crate::prompt::EditPlan;
-use crate::storage::{ProjectStore, read_bounded_file, replace_file, replace_text_file};
+use crate::storage::{read_bounded_file, replace_file};
 
 const MAX_ACTIVE_EDIT_JOBS: usize = 4;
-const MAX_ACTIVE_HTTP_CONNECTIONS: usize = 64;
 const MAX_ACTIVE_HTTP_STREAMS: usize = 64;
-const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
-const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
-const OVERLOAD_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
-const HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const AUDIO_RANGE_SAMPLES: usize =
     (audio_analysis::MAX_REGION_SECONDS * audio_analysis::SAMPLE_RATE as f32) as usize;
 const PLAYBACK_CHUNK_SAMPLES: usize = audio_analysis::SAMPLE_RATE as usize * 2;
@@ -81,295 +63,6 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const AUDIO_ENGINE_JS: &str = include_str!("../web/audio-engine.js");
 const APP_JS: &str = include_str!("../web/app.js");
-static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Copy)]
-struct BodyReadLimits {
-    idle_timeout: Duration,
-    timeout: Duration,
-}
-
-#[derive(Clone, Copy)]
-struct HttpServerConfig {
-    max_connections: usize,
-    header_timeout: Duration,
-    body_limits: BodyReadLimits,
-    shutdown_grace_timeout: Duration,
-}
-
-impl Default for HttpServerConfig {
-    fn default() -> Self {
-        Self {
-            max_connections: MAX_ACTIVE_HTTP_CONNECTIONS,
-            header_timeout: REQUEST_HEADER_TIMEOUT,
-            body_limits: BodyReadLimits {
-                idle_timeout: REQUEST_BODY_IDLE_TIMEOUT,
-                timeout: REQUEST_BODY_TIMEOUT,
-            },
-            shutdown_grace_timeout: SHUTDOWN_GRACE_TIMEOUT,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct HttpState {
-    router: Router,
-    body_limits: BodyReadLimits,
-}
-
-pub async fn run(port: u16) -> io::Result<()> {
-    let router = Router::new(port)?;
-    let address = format!("127.0.0.1:{port}");
-    let listener = tokio::net::TcpListener::bind(&address).await?;
-    println!("DAW-AI is ready at http://{address}");
-    println!("Sound graph: {}", router.project_path().display());
-    serve_http(
-        listener,
-        router,
-        shutdown_signal(),
-        HttpServerConfig::default(),
-    )
-    .await
-}
-
-async fn serve_http(
-    listener: tokio::net::TcpListener,
-    router: Router,
-    shutdown: impl Future<Output = ()> + Send,
-    config: HttpServerConfig,
-) -> io::Result<()> {
-    let connection_limiter = Limiter::new(config.max_connections);
-    serve_http_with_limiter(listener, router, shutdown, config, connection_limiter).await
-}
-
-async fn serve_http_with_limiter(
-    listener: tokio::net::TcpListener,
-    router: Router,
-    shutdown: impl Future<Output = ()> + Send,
-    config: HttpServerConfig,
-    connection_limiter: Arc<Limiter>,
-) -> io::Result<()> {
-    let state = HttpState {
-        router,
-        body_limits: config.body_limits,
-    };
-    let mut connection_tasks = tokio::task::JoinSet::new();
-    let (connection_shutdown, _) = tokio::sync::watch::channel(false);
-    tokio::pin!(shutdown);
-
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => break,
-            accepted = listener.accept() => {
-                let (stream, _) = match accepted {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        eprintln!("warning: failed to accept HTTP connection: {error}");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                };
-                let Some(connection_permit) = connection_limiter.acquire() else {
-                    reject_overloaded_connection(stream).await;
-                    continue;
-                };
-                let state = state.clone();
-                let header_timeout = config.header_timeout;
-                let mut shutdown = connection_shutdown.subscribe();
-                connection_tasks.spawn(async move {
-                    let _connection_permit = connection_permit;
-                    let service = service_fn(move |request| {
-                        let state = state.clone();
-                        async move {
-                            Ok::<_, Infallible>(serve_request(state, request).await)
-                        }
-                    });
-                    let mut builder = http1::Builder::new();
-                    builder
-                        .timer(TokioTimer::new())
-                        .header_read_timeout(header_timeout)
-                        .keep_alive(false)
-                        .max_buf_size(HTTP_BUFFER_BYTES);
-                    let connection = builder.serve_connection(TokioIo::new(stream), service);
-                    tokio::pin!(connection);
-                    tokio::select! {
-                        _ = shutdown.changed() => {
-                            connection.as_mut().graceful_shutdown();
-                            let _ = connection.await;
-                        }
-                        _ = connection.as_mut() => {}
-                    }
-                });
-            }
-            completed = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    eprintln!("error: HTTP connection worker failed: {error}");
-                }
-            }
-        }
-    }
-
-    let _ = connection_shutdown.send(true);
-    let drain = async {
-        while let Some(completed) = connection_tasks.join_next().await {
-            if let Err(error) = completed {
-                eprintln!("error: HTTP connection worker failed during shutdown: {error}");
-            }
-        }
-    };
-    if tokio::time::timeout(config.shutdown_grace_timeout, drain)
-        .await
-        .is_err()
-    {
-        connection_tasks.abort_all();
-        while let Some(completed) = connection_tasks.join_next().await {
-            if let Err(error) = completed
-                && error.is_panic()
-            {
-                eprintln!("error: HTTP connection worker panicked during shutdown: {error}");
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn reject_overloaded_connection(mut stream: tokio::net::TcpStream) {
-    const BODY: &str = "{\"error\":\"server connection limit reached\"}";
-    let response = format!(
-        concat!(
-            "HTTP/1.1 503 Service Unavailable\r\n",
-            "Content-Type: application/json; charset=utf-8\r\n",
-            "Content-Length: {}\r\n",
-            "Cache-Control: no-store\r\n",
-            "Connection: close\r\n",
-            "\r\n",
-            "{}"
-        ),
-        BODY.len(),
-        BODY
-    );
-    let write = async {
-        stream.write_all(response.as_bytes()).await?;
-        stream.shutdown().await
-    };
-    let _ = tokio::time::timeout(OVERLOAD_WRITE_TIMEOUT, write).await;
-}
-
-#[cfg(unix)]
-async fn shutdown_signal() {
-    let Ok(mut terminate) =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    else {
-        let _ = tokio::signal::ctrl_c().await;
-        return;
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = terminate.recv() => {}
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-}
-
-async fn serve_request(state: HttpState, request: HttpRequest<Incoming>) -> HttpResponse<HttpBody> {
-    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    let started = Instant::now();
-    let (parts, body) = request.into_parts();
-    let body = match read_request_body(body, state.body_limits).await {
-        Ok(body) => body,
-        Err(error) => {
-            eprintln!(
-                "warning: http request_id={request_id} outcome=rejected latency_ms={} error={}",
-                started.elapsed().as_millis(),
-                single_line(error.message())
-            );
-            return Response::json(error.status(), error_json(error.message())).into_http();
-        }
-    };
-    let request = match Request::from_http(parts, &body) {
-        Ok(request) => request,
-        Err(error) => {
-            eprintln!(
-                "warning: http request_id={request_id} outcome=rejected latency_ms={} error={}",
-                started.elapsed().as_millis(),
-                single_line(&error)
-            );
-            return Response::json(400, error_json(&error)).into_http();
-        }
-    };
-    match tokio::task::spawn_blocking(move || {
-        dispatch_request(state.router, request, request_id, started)
-    })
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            eprintln!("error: HTTP request worker failed: {error}");
-            Response::json(500, error_json("request processing failed")).into_http()
-        }
-    }
-}
-
-enum RequestBodyReadError {
-    TimedOut,
-    TooLarge,
-    Read,
-}
-
-impl RequestBodyReadError {
-    fn status(&self) -> u16 {
-        match self {
-            Self::TimedOut => 408,
-            Self::TooLarge => 413,
-            Self::Read => 400,
-        }
-    }
-
-    fn message(&self) -> &str {
-        match self {
-            Self::TimedOut => "request body timed out",
-            Self::TooLarge => "request is too large",
-            Self::Read => "could not read request body",
-        }
-    }
-}
-
-async fn read_request_body<B>(
-    mut body: B,
-    limits: BodyReadLimits,
-) -> Result<Bytes, RequestBodyReadError>
-where
-    B: hyper::body::Body<Data = Bytes> + Unpin,
-{
-    let deadline = tokio::time::Instant::now() + limits.timeout;
-    let mut bytes = Vec::new();
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(RequestBodyReadError::TimedOut);
-        }
-        let next = tokio::time::timeout(limits.idle_timeout.min(remaining), body.frame())
-            .await
-            .map_err(|_| RequestBodyReadError::TimedOut)?;
-        let Some(frame) = next else {
-            return Ok(Bytes::from(bytes));
-        };
-        let frame = frame.map_err(|_| RequestBodyReadError::Read)?;
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        let Some(length) = bytes.len().checked_add(data.len()) else {
-            return Err(RequestBodyReadError::TooLarge);
-        };
-        if length > MAX_REQUEST_BYTES {
-            return Err(RequestBodyReadError::TooLarge);
-        }
-        bytes.extend_from_slice(&data);
-    }
-}
 
 fn dispatch_request(
     router: Router,
@@ -424,8 +117,7 @@ fn audio_byte_range(value: &str, total_length: usize) -> Result<ByteRange, ()> {
 
 #[derive(Clone)]
 struct Router {
-    studio: Arc<Mutex<Studio>>,
-    store: Option<ProjectStore>,
+    project: Arc<Mutex<ProjectState>>,
     ai: Ai,
     edit_jobs: Arc<EditJobs>,
     edit_limiter: Arc<Limiter>,
@@ -434,7 +126,6 @@ struct Router {
     spectrum_cache: Arc<Mutex<()>>,
     audio_token: Arc<String>,
     users: Option<Arc<UserRegistry>>,
-    history: Arc<Mutex<ProjectHistory>>,
 }
 
 struct UserRegistry {
@@ -491,7 +182,7 @@ fn expire_and_bound_user_cache(users: &mut HashMap<String, CachedUser>) {
 
 impl CachedUser {
     fn can_evict(&self) -> bool {
-        Arc::strong_count(&self.router.studio) == 1 && !self.router.edit_jobs.has_active()
+        Arc::strong_count(&self.router.project) == 1 && !self.router.edit_jobs.has_active()
     }
 }
 
@@ -617,6 +308,14 @@ enum TrackSpectrumPreparation {
 }
 
 impl TrackSpectrumPlan {
+    fn cache_key(&self) -> [u8; 24] {
+        let mut key = [0; 24];
+        key[..8].copy_from_slice(&self.version.to_le_bytes());
+        key[8..16].copy_from_slice(&self.start_milliseconds.to_le_bytes());
+        key[16..].copy_from_slice(&(self.end_sample as u64).to_le_bytes());
+        key
+    }
+
     fn response_length(&self) -> usize {
         32 + self.project.tracks.len() * 8
             + self.frame_count * self.project.tracks.len() * SPECTRUM_BANDS
@@ -639,80 +338,6 @@ impl BinaryResponse {
             full_body(self.body),
         )
     }
-}
-
-struct ChannelWriter {
-    sender: tokio::sync::mpsc::Sender<Result<Bytes, io::Error>>,
-}
-
-struct ReceiverBody {
-    receiver: tokio::sync::mpsc::Receiver<Result<Bytes, io::Error>>,
-    permit: Option<Permit>,
-}
-
-impl HyperBody for ReceiverBody {
-    type Data = Bytes;
-    type Error = io::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
-        let body = self.get_mut();
-        match body.receiver.poll_recv(context) {
-            Poll::Ready(Some(result)) => Poll::Ready(Some(result.map(Frame::data))),
-            Poll::Ready(None) => {
-                body.permit.take();
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Write for ChannelWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        const STREAM_CHUNK_BYTES: usize = 64 * 1024;
-        let length = buffer.len().min(STREAM_CHUNK_BYTES);
-        if length == 0 {
-            return Ok(0);
-        }
-        self.sender
-            .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..length])))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "HTTP client disconnected"))?;
-        Ok(length)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn streaming_body(
-    permit: Permit,
-    produce: impl FnOnce(&mut ChannelWriter, &dyn Fn() -> bool) -> io::Result<()> + Send + 'static,
-) -> HttpBody {
-    let (sender, receiver) = tokio::sync::mpsc::channel(2);
-    let cancellation = sender.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut output = ChannelWriter { sender };
-        let cancelled = || cancellation.is_closed();
-        if let Err(error) = produce(&mut output, &cancelled) {
-            if error.kind() != io::ErrorKind::BrokenPipe {
-                eprintln!("streaming response failed: {error}");
-            }
-            let kind = error.kind();
-            let message = error.to_string();
-            let _ = output
-                .sender
-                .blocking_send(Err(io::Error::new(kind, message)));
-        }
-    });
-    ReceiverBody {
-        receiver,
-        permit: Some(permit),
-    }
-    .boxed_unsync()
 }
 
 fn stream_overload_response(set_cookie: Option<&str>) -> HttpResponse<HttpBody> {
@@ -798,7 +423,7 @@ impl Router {
                 error_json("cross-origin audio request rejected"),
             ));
         }
-        let project = self.lock_studio().project().clone();
+        let project = self.lock_project().project().clone();
         if version != project.version {
             return Err(Response::json(
                 409,
@@ -820,24 +445,26 @@ impl Router {
         );
         let end_sample = (start_sample + window_samples).min(project_end_sample);
         let frame_count = (end_sample - start_sample).div_ceil(SPECTRUM_FRAME_SAMPLES);
-        let cache_path = self.spectrum_cache_path(start_milliseconds, window_samples as u64);
-        if let Some(path) = &cache_path {
-            let expected_length = 8usize
-                .saturating_add(32)
-                .saturating_add(project.tracks.len().saturating_mul(8))
-                .saturating_add(
-                    frame_count
-                        .saturating_mul(project.tracks.len())
-                        .saturating_mul(SPECTRUM_BANDS),
-                );
+        let plan = TrackSpectrumPlan {
+            project,
+            version,
+            start_milliseconds,
+            start_sample,
+            end_sample,
+            frame_count,
+            cache_path: self.spectrum_cache_path(),
+        };
+        let cache_key = plan.cache_key();
+        if let Some(path) = &plan.cache_path {
+            let expected_length = cache_key.len() + plan.response_length();
             let cached = {
                 let _cache_guard = self.spectrum_cache.lock().recover_poison();
                 read_bounded_file(path, expected_length as u64, "track spectrum cache")
             };
             if let Ok(cached) = cached
                 && cached.len() == expected_length
-                && cached[..8] == version.to_le_bytes()
-                && cached[8..16] == *TRACK_SPECTRUM_MAGIC
+                && cached[..cache_key.len()] == cache_key
+                && cached[cache_key.len()..].starts_with(TRACK_SPECTRUM_MAGIC)
             {
                 return Ok(TrackSpectrumPreparation::Ready(BinaryResponse {
                     status: 200,
@@ -846,19 +473,11 @@ impl Router {
                         "Cache-Control".to_owned(),
                         "private, max-age=31536000, immutable".to_owned(),
                     )],
-                    body: cached[8..].to_vec(),
+                    body: cached[cache_key.len()..].to_vec(),
                 }));
             }
         }
-        Ok(TrackSpectrumPreparation::Render(TrackSpectrumPlan {
-            project,
-            version,
-            start_milliseconds,
-            start_sample,
-            end_sample,
-            frame_count,
-            cache_path,
-        }))
+        Ok(TrackSpectrumPreparation::Render(plan))
     }
 
     fn render_track_spectrum(
@@ -867,7 +486,7 @@ impl Router {
         is_cancelled: &(impl Fn() -> bool + ?Sized),
     ) -> Result<Option<BinaryResponse>, Response> {
         let request_cancelled =
-            || is_cancelled() || self.lock_studio().project().version != plan.version;
+            || is_cancelled() || self.lock_project().project().version != plan.version;
         let mut body = Vec::with_capacity(plan.response_length());
         body.extend_from_slice(TRACK_SPECTRUM_MAGIC);
         body.extend_from_slice(&(plan.project.tracks.len() as u32).to_le_bytes());
@@ -920,8 +539,9 @@ impl Router {
         }
         if let Some(path) = &plan.cache_path {
             let _cache_guard = self.spectrum_cache.lock().recover_poison();
-            let mut cached = Vec::with_capacity(8 + body.len());
-            cached.extend_from_slice(&plan.version.to_le_bytes());
+            let cache_key = plan.cache_key();
+            let mut cached = Vec::with_capacity(cache_key.len() + body.len());
+            cached.extend_from_slice(&cache_key);
             cached.extend_from_slice(&body);
             if let Err(error) = replace_file(path, &cached) {
                 eprintln!("warning: could not persist track spectrum cache: {error}");
@@ -955,7 +575,7 @@ impl Router {
             return Response::json(403, error_json("cross-origin export request rejected"))
                 .into_http();
         }
-        let project = self.lock_studio().project().clone();
+        let project = self.lock_project().project().clone();
         let sample_count = audio_analysis::playback_sample_count(0.0, project.duration);
         let total_length = WAV_HEADER_BYTES.saturating_add(sample_count.saturating_mul(4));
         let Some(stream_permit) = self.stream_limiter.acquire() else {
@@ -1016,7 +636,7 @@ impl Router {
         Ok(())
     }
 
-    fn new(_port: u16) -> io::Result<Self> {
+    fn new() -> io::Result<Self> {
         #[cfg(debug_assertions)]
         let ai = match std::env::var("DAW_AI_TEST_AI") {
             Ok(value) if value == "deterministic" => Ai::Deterministic(Duration::from_secs(2)),
@@ -1034,8 +654,8 @@ impl Router {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("users");
         fs::create_dir_all(&root)?;
-        let (store, studio, history) = open_project_with_history(project_path)?;
-        save_project_state(&store, studio.project(), &history)?;
+        let project = ProjectState::open(project_path.clone())?;
+        discard_obsolete_spectrum_caches(&project_path);
         let edit_limiter = Limiter::new(MAX_ACTIVE_EDIT_JOBS);
         let stream_limiter = Limiter::new(MAX_ACTIVE_HTTP_STREAMS);
         let audio_renderer = Arc::new(AudioRenderer::default());
@@ -1048,9 +668,7 @@ impl Router {
             users: Mutex::new(HashMap::new()),
         });
         Ok(Self {
-            history: Arc::new(Mutex::new(history)),
-            studio: Arc::new(Mutex::new(studio)),
-            store: Some(store),
+            project: Arc::new(Mutex::new(project)),
             ai,
             edit_jobs: Arc::new(EditJobs::new()),
             edit_limiter,
@@ -1065,11 +683,7 @@ impl Router {
     #[cfg(test)]
     fn demo() -> Self {
         Self {
-            history: Arc::new(Mutex::new(ProjectHistory::new(
-                Studio::new().project().clone(),
-            ))),
-            studio: Arc::new(Mutex::new(Studio::new())),
-            store: None,
+            project: Arc::new(Mutex::new(ProjectState::in_memory(Studio::new()))),
             ai: Ai::Deterministic(Duration::ZERO),
             edit_jobs: Arc::new(EditJobs::new()),
             edit_limiter: Limiter::new(MAX_ACTIVE_EDIT_JOBS),
@@ -1129,17 +743,10 @@ impl Router {
         }
         fs::create_dir_all(&directory)?;
         let project_path = directory.join("sound-graph.json");
-        if !project_path.exists() {
-            let studio = Studio::new();
-            let history = ProjectHistory::new(studio.project().clone());
-            replace_text_file(&project_path, &project_document(studio.project(), &history))?;
-        }
-        let (store, studio, history) = open_project_with_history(project_path)?;
-        save_project_state(&store, studio.project(), &history)?;
+        let project = ProjectState::open_user(project_path.clone())?;
+        discard_obsolete_spectrum_caches(&project_path);
         let router = Self {
-            history: Arc::new(Mutex::new(history)),
-            studio: Arc::new(Mutex::new(studio)),
-            store: Some(store),
+            project: Arc::new(Mutex::new(project)),
             ai: registry.ai.clone(),
             edit_jobs: Arc::new(EditJobs::new()),
             edit_limiter: Arc::clone(&registry.edit_limiter),
@@ -1223,8 +830,8 @@ impl Router {
             ("GET", "/app.js") => Response::static_asset("text/javascript; charset=utf-8", APP_JS),
             ("GET", "/api/health") => Response::json(200, "{\"status\":\"ok\"}".to_owned()),
             ("GET", "/api/project") => {
-                let studio = self.lock_studio();
-                self.project_response(&studio)
+                let state = self.lock_project();
+                self.project_response(&state)
             }
             ("GET", "/api/gemini-sessions") => self.gemini_sessions(),
             ("GET", "/api/history") => self.history_response(),
@@ -1277,11 +884,11 @@ impl Router {
             Err(message) => return Response::json(422, error_json(message)),
         };
         let project = {
-            let studio = self.lock_studio();
-            if let Err(error) = studio.validate_edit(start, end, prompt) {
+            let state = self.lock_project();
+            if let Err(error) = state.studio().validate_edit(start, end, prompt) {
                 return Response::json(422, studio_error(error));
             }
-            studio.project().clone()
+            state.project().clone()
         };
         if let Some(operation_id) = operation_id
             && let Some(operation) = project
@@ -1373,7 +980,7 @@ impl Router {
             ));
         }
 
-        let project = self.lock_studio().project().clone();
+        let project = self.lock_project().project().clone();
         if version != project.version {
             return Err(Response::json(
                 409,
@@ -1625,7 +1232,7 @@ impl Router {
         if let Some(response) = self.edit_jobs.response_for_operation(operation_id) {
             return response;
         }
-        self.lock_studio()
+        self.lock_project()
             .project()
             .edit_operations
             .iter()
@@ -1671,14 +1278,14 @@ impl Router {
     }
 
     fn persist_failed_operation(&self, operation_id: &str, interrupted: bool, message: &str) {
-        let mut studio = self.lock_studio();
-        let mut candidate = studio.clone();
+        let mut state = self.lock_project();
+        let mut candidate = state.studio().clone();
         if !candidate.mark_operation_failed(operation_id, interrupted, message) {
             return;
         }
-        if self.commit_metadata(&mut studio, candidate).is_err() {
+        if let Err(error) = state.commit_metadata(candidate) {
             eprintln!(
-                "error: operation_id={} could not persist terminal partial-edit state",
+                "error: operation_id={} could not persist terminal partial-edit state: {error}",
                 operation_id
             );
         }
@@ -1827,11 +1434,11 @@ impl Router {
             return Err(PlannerError::Interrupted);
         }
         let summary = graph_edit.plan.summary.clone();
-        let mut studio = self.lock_studio();
-        if studio.project().version != *expected_version {
+        let mut state = self.lock_project();
+        if state.project().version != *expected_version {
             return Err(PlannerError::ProjectChanged);
         }
-        let mut candidate = studio.clone();
+        let mut candidate = state.studio().clone();
         candidate
             .replace_graph(
                 graph_edit.project,
@@ -1846,13 +1453,15 @@ impl Router {
                 "could not record the published edit operation".to_owned(),
             ));
         }
-        self.commit(&mut studio, candidate)
-            .map_err(|_| PlannerError::SaveFailed)?;
-        *expected_version = studio.project().version;
+        state.commit(candidate).map_err(|error| {
+            project_save_error(error);
+            PlannerError::SaveFailed
+        })?;
+        *expected_version = state.project().version;
         *published_update = true;
         self.edit_jobs
             .publish_update(job_id, *expected_version, &summary);
-        Ok(studio.project().clone())
+        Ok(state.project().clone())
     }
 
     fn complete_gemini_operation(
@@ -1862,22 +1471,24 @@ impl Router {
         expected_version: &mut u64,
         message: &str,
     ) -> Result<(), PlannerError> {
-        let mut studio = self.lock_studio();
+        let mut state = self.lock_project();
         if self.edit_jobs.is_interrupted(job_id) {
             return Err(PlannerError::Interrupted);
         }
-        if studio.project().version != *expected_version {
+        if state.project().version != *expected_version {
             return Err(PlannerError::ProjectChanged);
         }
-        let mut candidate = studio.clone();
+        let mut candidate = state.studio().clone();
         if !candidate.mark_operation_complete(&edit.operation_id, message) {
             return Err(PlannerError::InvalidOutput(
                 "could not mark the completed edit operation".to_owned(),
             ));
         }
-        self.commit_metadata(&mut studio, candidate)
-            .map_err(|_| PlannerError::SaveFailed)?;
-        *expected_version = studio.project().version;
+        state.commit_metadata(candidate).map_err(|error| {
+            project_save_error(error);
+            PlannerError::SaveFailed
+        })?;
+        *expected_version = state.project().version;
         self.edit_jobs.finalize_updates(job_id, *expected_version);
         Ok(())
     }
@@ -1890,12 +1501,12 @@ impl Router {
         else {
             return Response::json(422, error_json("duration is required"));
         };
-        let mut studio = self.lock_studio();
-        let mut candidate = studio.clone();
+        let mut state = self.lock_project();
+        let mut candidate = state.studio().clone();
         match candidate.set_duration(duration) {
-            Ok(()) => match self.commit(&mut studio, candidate) {
-                Ok(()) => self.project_response(&studio),
-                Err(response) => response,
+            Ok(()) => match state.commit(candidate) {
+                Ok(()) => self.project_response(&state),
+                Err(error) => project_save_error(error),
             },
             Err(error) => Response::json(422, studio_error(error)),
         }
@@ -1914,12 +1525,12 @@ impl Router {
             Some("false") => false,
             _ => return Response::json(422, error_json("muted must be true or false")),
         };
-        let mut studio = self.lock_studio();
-        let mut candidate = studio.clone();
+        let mut state = self.lock_project();
+        let mut candidate = state.studio().clone();
         match candidate.set_mix(track_id, None, Some(muted)) {
-            Ok(()) => match self.commit(&mut studio, candidate) {
-                Ok(()) => self.project_response(&studio),
-                Err(response) => response,
+            Ok(()) => match state.commit(candidate) {
+                Ok(()) => self.project_response(&state),
+                Err(error) => project_save_error(error),
             },
             Err(error) => Response::json(422, studio_error(error)),
         }
@@ -1968,49 +1579,29 @@ impl Router {
     }
 
     fn undo(&self) -> Response {
-        let mut studio = self.lock_studio();
-        let mut history = self.history.lock().recover_poison();
-        let Some(previous_index) = history.parent(history.current) else {
+        let mut state = self.lock_project();
+        let Some(index) = state.history().parent(state.history().current) else {
             return Response::json(409, error_json("nothing to undo"));
         };
-        let Some(version) = studio.project().version.checked_add(1) else {
-            return Response::json(500, error_json("project revision limit reached"));
-        };
-        let (mut candidate_history, mut project) =
-            match history.clone().checkout(previous_index, studio.project()) {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!("error: could not materialize undone project state: {error}");
-                    return Response::json(500, error_json("could not undo project change"));
-                }
-            };
-        project.version = version;
-        project.edit_operations = studio.project().edit_operations.clone();
-        candidate_history.update_current_metadata(&project);
-        if let Err(error) = self.save_state(&project, &mut candidate_history) {
-            eprintln!("error: could not save undone project state: {error}");
-            return Response::json(500, error_json("could not undo project change"));
+        match state.checkout(index) {
+            Ok(()) => self.project_response(&state),
+            Err(error) => project_save_error(error),
         }
-        *history = candidate_history;
-        *studio = Studio::from_project(project);
-        Response::json(
-            200,
-            studio.to_json_with_can_undo(history.parent(history.current).is_some()),
-        )
     }
 
     fn reset(&self) -> Response {
-        let mut studio = self.lock_studio();
-        let mut candidate = studio.clone();
+        let mut state = self.lock_project();
+        let mut candidate = state.studio().clone();
         candidate.reset();
-        match self.commit(&mut studio, candidate) {
-            Ok(()) => self.project_response(&studio),
-            Err(response) => response,
+        match state.commit(candidate) {
+            Ok(()) => self.project_response(&state),
+            Err(error) => project_save_error(error),
         }
     }
 
     fn history_response(&self) -> Response {
-        let history = self.history.lock().recover_poison();
+        let state = self.lock_project();
+        let history = state.history();
         let entries = history
             .entries()
             .enumerate()
@@ -2048,112 +1639,39 @@ impl Router {
         else {
             return Response::json(422, error_json("history index is required"));
         };
-        let mut studio = self.lock_studio();
-        let mut history = self.history.lock().recover_poison();
-        if index >= history.len() {
+        let mut state = self.lock_project();
+        if index >= state.history().len() {
             return Response::json(404, error_json("history state not found"));
         }
-        let Some(version) = studio.project().version.checked_add(1) else {
-            return Response::json(500, error_json("project revision limit reached"));
-        };
-        let (mut candidate_history, mut project) =
-            match history.clone().checkout(index, studio.project()) {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!("error: could not materialize selected history state: {error}");
-                    return Response::json(500, error_json("could not select history state"));
-                }
-            };
-        project.version = version;
-        project.edit_operations = studio.project().edit_operations.clone();
-        candidate_history.update_current_metadata(&project);
-        if let Err(error) = self.save_state(&project, &mut candidate_history) {
-            eprintln!("error: could not save selected history state: {error}");
-            return Response::json(500, error_json("could not select history state"));
+        match state.checkout(index) {
+            Ok(()) => self.project_response(&state),
+            Err(error) => project_save_error(error),
         }
-        *history = candidate_history;
-        *studio = Studio::from_project(project);
-        Response::json(
-            200,
-            studio.to_json_with_can_undo(history.parent(history.current).is_some()),
-        )
     }
 
-    fn project_response(&self, studio: &Studio) -> Response {
-        let history = self.history.lock().recover_poison();
-        let can_undo = history.parent(history.current).is_some();
-        Response::json(200, studio.to_json_with_can_undo(can_undo))
+    fn project_response(&self, state: &ProjectState) -> Response {
+        Response::json(200, state.project_json())
     }
 
-    fn commit(
-        &self,
-        studio: &mut std::sync::MutexGuard<'_, Studio>,
-        candidate: Studio,
-    ) -> Result<(), Response> {
-        let mut history = self.history.lock().recover_poison().clone();
-        history
-            .push(studio.project(), candidate.project())
-            .map_err(|error| {
-                eprintln!("error: could not extend project history: {error}");
-                Response::json(500, error_json("could not save project history"))
-            })?;
-        if let Err(error) = self.save_state(candidate.project(), &mut history) {
-            eprintln!("error: could not save project history: {error}");
-            return Err(Response::json(
-                500,
-                error_json("could not save project history"),
-            ));
-        }
-        **studio = candidate;
-        *self.history.lock().recover_poison() = history;
-        Ok(())
-    }
-
-    fn commit_metadata(
-        &self,
-        studio: &mut std::sync::MutexGuard<'_, Studio>,
-        candidate: Studio,
-    ) -> Result<(), Response> {
-        let mut history = self.history.lock().recover_poison().clone();
-        history.update_current_metadata(candidate.project());
-        if let Err(error) = self.save_state(candidate.project(), &mut history) {
-            eprintln!("error: could not save project history metadata: {error}");
-            return Err(Response::json(
-                500,
-                error_json("could not save project history"),
-            ));
-        }
-        **studio = candidate;
-        *self.history.lock().recover_poison() = history;
-        Ok(())
-    }
-
-    fn save_state(&self, project: &Project, history: &mut ProjectHistory) -> io::Result<()> {
-        let Some(store) = &self.store else {
-            return Ok(());
-        };
-        save_project_state(store, project, history)
-    }
-
-    fn project_path(&self) -> &std::path::Path {
-        self.store
-            .as_ref()
-            .expect("production router has a project store")
+    fn project_path(&self) -> PathBuf {
+        self.lock_project()
             .path()
+            .expect("production router has a project store")
+            .to_owned()
     }
 
-    fn spectrum_cache_path(&self, start_milliseconds: u64, window_samples: u64) -> Option<PathBuf> {
-        let project_path = self.store.as_ref()?.path();
+    fn spectrum_cache_path(&self) -> Option<PathBuf> {
+        let state = self.lock_project();
+        let project_path = state.path()?;
         let parent = project_path.parent()?;
         let project_name = project_path.file_name()?.to_string_lossy();
-        Some(parent.join(format!(
-            ".{project_name}.track-spectrum-{start_milliseconds}-{window_samples}.cache"
-        )))
+        // One replaceable window bounds disk usage across arbitrary seek positions.
+        Some(parent.join(format!(".{project_name}.track-spectrum.cache")))
     }
 
     fn gemini_session_root(&self) -> PathBuf {
-        if let Some(store) = &self.store {
-            return session_root_for_project(store.path());
+        if let Some(path) = self.lock_project().path() {
+            return session_root_for_project(path);
         }
         #[cfg(test)]
         return session_root();
@@ -2161,8 +1679,44 @@ impl Router {
         unreachable!("production routers always have project storage")
     }
 
-    fn lock_studio(&self) -> std::sync::MutexGuard<'_, Studio> {
-        self.studio.lock().recover_poison()
+    fn lock_project(&self) -> std::sync::MutexGuard<'_, ProjectState> {
+        self.project.lock().recover_poison()
+    }
+}
+
+fn discard_obsolete_spectrum_caches(project_path: &std::path::Path) {
+    let parent = project_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let Some(project_name) = project_path.file_name() else {
+        return;
+    };
+    let prefix = format!(".{}.track-spectrum-", project_name.to_string_lossy());
+    let cleanup = || -> io::Result<()> {
+        for entry in fs::read_dir(parent)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some((start, window)) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|name| name.strip_suffix(".cache"))
+                .and_then(|range| range.split_once('-'))
+            else {
+                continue;
+            };
+            if [start, window]
+                .iter()
+                .all(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+                && entry.file_type()?.is_file()
+            {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    };
+    if let Err(error) = cleanup() {
+        eprintln!("warning: could not discard obsolete track spectrum caches: {error}");
     }
 }
 
@@ -2288,6 +1842,11 @@ fn parse_optional_boolean(
     }
 }
 
+fn project_save_error(error: io::Error) -> Response {
+    eprintln!("error: could not save project state: {error}");
+    Response::json(500, error_json("could not save project history"))
+}
+
 fn error_json(message: &str) -> String {
     serde_json::json!({"error":message}).to_string()
 }
@@ -2344,1566 +1903,4 @@ const fn studio_error_message(error: StudioError) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::Project;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use tokio::io::AsyncReadExt;
-
-    static TEST_FILE_ID: AtomicU64 = AtomicU64::new(1);
-
-    fn request(method: &str, path: &str, body: &str) -> Request {
-        Request {
-            method: method.to_owned(),
-            path: path.to_owned(),
-            headers: HashMap::from([("host".to_owned(), "127.0.0.1:8888".to_owned())]),
-            body: body.to_owned(),
-        }
-    }
-
-    fn framework_request(
-        method: &str,
-        path: &str,
-        headers: &[(&str, &str)],
-        body: &[u8],
-    ) -> Result<Request, String> {
-        let mut builder = HttpRequest::builder().method(method).uri(path);
-        for (name, value) in headers {
-            builder = builder.header(*name, *value);
-        }
-        let request = builder.body(()).expect("framework request");
-        let (parts, ()) = request.into_parts();
-        Request::from_http(parts, body)
-    }
-
-    fn audio_request(path: &str) -> Request {
-        let mut request = request("GET", path, "");
-        request
-            .headers
-            .insert(AUDIO_REQUEST_HEADER.to_owned(), "1".to_owned());
-        request
-    }
-
-    fn wait_for_edit(router: &Router, accepted: &Response) -> serde_json::Value {
-        assert_eq!(accepted.status, 202);
-        let accepted: serde_json::Value =
-            serde_json::from_str(&accepted.body).expect("accepted edit JSON");
-        assert_eq!(accepted["status"], "queued");
-        assert_eq!(accepted["timeoutSeconds"], EDIT_TIMEOUT_SECONDS);
-        assert!(
-            accepted["operationId"]
-                .as_str()
-                .is_some_and(|id| !id.is_empty())
-        );
-        let path = format!(
-            "/api/edits/{}",
-            accepted["id"].as_str().expect("edit job ID")
-        );
-        for _ in 0..200 {
-            let response = router.handle(&request("GET", &path, ""));
-            assert_eq!(response.status, 200);
-            let job: serde_json::Value =
-                serde_json::from_str(&response.body).expect("edit status JSON");
-            if matches!(job["status"].as_str(), Some("completed" | "failed")) {
-                return job;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        panic!("edit job did not finish");
-    }
-
-    fn persisted_demo() -> (Router, std::path::PathBuf) {
-        let id = TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "daw-ai-server-test-{}-{id}.json",
-            std::process::id()
-        ));
-        let (store, _) = ProjectStore::open(path.clone()).expect("test project store");
-        let studio = Studio::from_project(Project::demo());
-        store.save(studio.project()).expect("save demo fixture");
-        (open_persisted_router(path.clone()), path)
-    }
-
-    fn open_persisted_router(path: std::path::PathBuf) -> Router {
-        let (store, studio, history) =
-            open_project_with_history(path).expect("open persisted test project");
-        Router {
-            history: Arc::new(Mutex::new(history)),
-            studio: Arc::new(Mutex::new(studio)),
-            store: Some(store),
-            ai: Ai::Deterministic(Duration::ZERO),
-            edit_jobs: Arc::new(EditJobs::new()),
-            edit_limiter: Limiter::new(MAX_ACTIVE_EDIT_JOBS),
-            stream_limiter: Limiter::new(MAX_ACTIVE_HTTP_STREAMS),
-            audio_renderer: Arc::new(AudioRenderer::default()),
-            spectrum_cache: Arc::new(Mutex::new(())),
-            audio_token: Arc::new("test-audio-token".to_owned()),
-            users: None,
-        }
-    }
-
-    #[test]
-    fn recovers_an_invalid_persisted_project_and_preserves_the_source() {
-        let id = TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "daw-ai-server-invalid-{}-{id}.json",
-            std::process::id()
-        ));
-        fs::write(&path, "{not json}\n").expect("invalid graph fixture");
-
-        let (_, studio, history) =
-            open_project_with_history(path.clone()).expect("recovered project");
-
-        assert_eq!(history.len(), 1);
-        assert_eq!(
-            history
-                .checkout(0, studio.project())
-                .expect("initial history state")
-                .1
-                .to_json(),
-            studio.project().to_json()
-        );
-        ProjectStore::open(path.clone()).expect("replacement project is valid");
-        let prefix = format!("{}.invalid-", path.file_name().unwrap().to_string_lossy());
-        let quarantined = fs::read_dir(path.parent().unwrap())
-            .expect("temporary directory")
-            .filter_map(Result::ok)
-            .find(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-            .expect("quarantined invalid graph")
-            .path();
-        assert_eq!(
-            fs::read_to_string(&quarantined).expect("quarantined graph"),
-            "{not json}\n"
-        );
-        fs::remove_file(path).expect("remove replacement project");
-        fs::remove_file(quarantined).expect("remove quarantine");
-    }
-
-    #[test]
-    fn serves_the_app_and_project_api() {
-        let router = Router::demo();
-        let page = router.handle(&request("GET", "/", ""));
-        assert_eq!(page.status, 200);
-        assert!(page.body.contains("DAW-AI"));
-        assert!(page.headers.contains(&(
-            "Cache-Control",
-            "no-store, no-cache, must-revalidate, max-age=0"
-        )));
-        let script = router.handle(&request("GET", "/app.js", ""));
-        assert_eq!(script.status, 200);
-        assert!(script.headers.contains(&(
-            "Cache-Control",
-            "no-store, no-cache, must-revalidate, max-age=0"
-        )));
-        let audio_engine = router.handle(&request("GET", "/audio-engine.js", ""));
-        assert_eq!(audio_engine.status, 200);
-        assert!(audio_engine.body.contains("createDawAiAudioEngine"));
-        let project = router.handle(&request("GET", "/api/project", ""));
-        assert_eq!(project.status, 200);
-        assert!(project.body.contains("\"tracks\""));
-    }
-
-    #[test]
-    fn changes_project_duration_with_server_side_bounds() {
-        let router = Router::demo();
-        let changed = router.handle(&request("POST", "/api/duration", "duration=300"));
-        assert_eq!(changed.status, 200);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&changed.body).expect("duration response")["duration"],
-            300.0
-        );
-        assert_eq!(
-            router
-                .handle(&request("POST", "/api/duration", "duration=301"))
-                .status,
-            422
-        );
-        assert_eq!(
-            router
-                .handle(&request("POST", "/api/duration", "duration=0.5"))
-                .status,
-            422
-        );
-    }
-
-    #[test]
-    fn reset_is_undoable_without_losing_edit_idempotency() {
-        let (router, path) = persisted_demo();
-        let edit_body = "operation_id=reset-operation&start=4&end=8&prompt=increase+volume";
-        let accepted = router.handle(&request("POST", "/api/edits", edit_body));
-        let completed = wait_for_edit(&router, &accepted);
-        assert_eq!(completed["status"], "completed");
-        assert_eq!(completed["operationId"], "reset-operation");
-        let original: serde_json::Value =
-            serde_json::from_str(&router.handle(&request("GET", "/api/project", "")).body)
-                .expect("initial project response");
-        assert_eq!(original["edits"].as_array().map(Vec::len), Some(1));
-        assert_eq!(original["editOperations"].as_array().map(Vec::len), Some(1));
-
-        let reset = router.handle(&request("POST", "/api/reset", ""));
-        assert_eq!(reset.status, 200);
-        let reset: serde_json::Value = serde_json::from_str(&reset.body).expect("reset response");
-        assert_eq!(reset["tracks"].as_array().map(Vec::len), Some(1));
-        assert_eq!(reset["clips"].as_array().map(Vec::len), Some(0));
-        assert_eq!(reset["edits"].as_array().map(Vec::len), Some(0));
-        assert_eq!(reset["editOperations"], original["editOperations"]);
-        assert_eq!(reset["canUndo"], true);
-
-        drop(router);
-        let reloaded = open_persisted_router(path.clone());
-        let persisted_reset: serde_json::Value =
-            serde_json::from_str(&reloaded.handle(&request("GET", "/api/project", "")).body)
-                .expect("persisted reset project");
-        assert_eq!(persisted_reset["tracks"].as_array().map(Vec::len), Some(1));
-        assert_eq!(
-            persisted_reset["editOperations"],
-            original["editOperations"]
-        );
-
-        let undone = reloaded.handle(&request("POST", "/api/undo", ""));
-        assert_eq!(undone.status, 200);
-        let undone: serde_json::Value = serde_json::from_str(&undone.body).expect("undo response");
-        assert_eq!(undone["canUndo"], true);
-        for field in [
-            "name",
-            "bpm",
-            "duration",
-            "instrumentRack",
-            "clips",
-            "tracks",
-            "edits",
-            "editOperations",
-        ] {
-            assert_eq!(undone[field], original[field], "restored {field}");
-        }
-
-        drop(reloaded);
-        let restarted = open_persisted_router(path.clone());
-        let recovered = restarted.handle(&request("POST", "/api/edits", edit_body));
-        assert_eq!(recovered.status, 200);
-        let recovered: serde_json::Value =
-            serde_json::from_str(&recovered.body).expect("recovered operation response");
-        assert_eq!(recovered["status"], "completed");
-        assert_eq!(recovered["operationId"], "reset-operation");
-        assert_eq!(
-            restarted.lock_studio().project().edits.len(),
-            1,
-            "recovering a completed operation must not queue another edit"
-        );
-        fs::remove_file(path).expect("remove test graph");
-    }
-
-    #[test]
-    fn changes_track_mute_with_server_side_validation() {
-        let router = Router::demo();
-        let project: serde_json::Value =
-            serde_json::from_str(&router.handle(&request("GET", "/api/project", "")).body)
-                .expect("project response");
-        let track_id = project["tracks"][0]["id"].as_u64().expect("track ID");
-        let mut hostile = request(
-            "POST",
-            "/api/mix",
-            &format!("track_id={track_id}&muted=true"),
-        );
-        hostile
-            .headers
-            .insert("origin".to_owned(), "http://attacker.invalid".to_owned());
-        assert_eq!(router.handle(&hostile).status, 403);
-        let changed = router.handle(&request(
-            "POST",
-            "/api/mix",
-            &format!("track_id={track_id}&muted=true"),
-        ));
-        assert_eq!(changed.status, 200);
-        let changed: serde_json::Value = serde_json::from_str(&changed.body).expect("mix response");
-        assert_eq!(changed["tracks"][0]["muted"], true);
-        assert_eq!(
-            router
-                .handle(&request("POST", "/api/mix", "track_id=0&muted=true"))
-                .status,
-            422
-        );
-        assert_eq!(
-            router
-                .handle(&request(
-                    "POST",
-                    "/api/mix",
-                    &format!("track_id={track_id}&muted=yes")
-                ))
-                .status,
-            422
-        );
-    }
-
-    #[test]
-    fn history_checkout_requires_a_trusted_origin() {
-        let router = Router::demo();
-        let mut hostile = request("POST", "/api/history", "index=0");
-        hostile
-            .headers
-            .insert("origin".to_owned(), "http://attacker.invalid".to_owned());
-
-        assert_eq!(router.handle(&hostile).status, 403);
-    }
-
-    #[test]
-    fn gemini_sessions_are_always_persistent_and_listed_for_debugging() {
-        let router = Router::demo();
-        let response = router.handle(&request("GET", "/api/gemini-sessions", ""));
-        assert_eq!(response.status, 200);
-        let body: serde_json::Value =
-            serde_json::from_str(&response.body).expect("Gemini session list JSON");
-        assert!(body["sessions"].is_array());
-        assert_eq!(
-            router
-                .handle(&request("POST", "/api/gemini-sessions", ""))
-                .status,
-            405
-        );
-    }
-
-    #[test]
-    fn edit_job_status_reports_phase_progress_and_failures() {
-        let jobs = EditJobs::new();
-        let (id, operation_id, created) = jobs.create(750, None).expect("edit job");
-        assert!(created);
-        jobs.set_running(id, "planning", "Gemini is arranging the requested change");
-        let running: serde_json::Value =
-            serde_json::from_str(&jobs.response(id).expect("running job response").body)
-                .expect("running job JSON");
-        assert_eq!(running["status"], "running");
-        assert_eq!(running["phase"], "planning");
-        assert_eq!(
-            running["detail"],
-            "Gemini is arranging the requested change"
-        );
-        assert_eq!(running["pollAfterMs"], 750);
-        assert_eq!(running["operationId"], operation_id);
-        assert_eq!(running["appliedSteps"], 0);
-        assert!(running["projectVersion"].is_null());
-
-        jobs.publish_update(id, 7, "Added a bass layer");
-        let updated: serde_json::Value =
-            serde_json::from_str(&jobs.response(id).expect("updated job response").body)
-                .expect("updated job JSON");
-        assert_eq!(updated["phase"], "editing");
-        assert_eq!(updated["detail"], "Applied step 1: Added a bass layer");
-        assert_eq!(updated["appliedSteps"], 1);
-        assert_eq!(updated["projectVersion"], 7);
-
-        jobs.fail(id, 503, "Gemini timed out".to_owned());
-        let failed: serde_json::Value =
-            serde_json::from_str(&jobs.response(id).expect("failed job response").body)
-                .expect("failed job JSON");
-        assert_eq!(failed["status"], "failed");
-        assert_eq!(failed["errorStatus"], 503);
-        assert_eq!(failed["error"], "Gemini timed out");
-    }
-
-    #[test]
-    fn edit_jobs_allow_one_active_edit_per_project() {
-        let jobs = EditJobs::new();
-        let active = jobs.create(750, None).expect("active edit job").0;
-        assert!(jobs.create(750, None).is_err());
-
-        jobs.fail(active, 503, "planner stopped".to_owned());
-        assert!(jobs.create(750, None).is_ok());
-    }
-
-    #[test]
-    fn edit_api_updates_the_shared_project() {
-        let router = Router::demo();
-        let response = router.handle(&request(
-            "POST",
-            "/api/edits",
-            "start=4&end=8&prompt=increase+volume",
-        ));
-        let completed = wait_for_edit(&router, &response);
-        assert_eq!(completed["status"], "completed");
-        assert_eq!(completed["message"], "Applied deterministic test edit");
-        assert!(completed.get("project").is_none());
-
-        let project = router.handle(&request("GET", "/api/project", ""));
-        assert!(project.body.contains("increase volume"));
-        assert_eq!(
-            router
-                .handle(&request("GET", "/api/edits/999999", ""))
-                .status,
-            404
-        );
-        assert_eq!(
-            router.handle(&request("POST", "/api/edits/1", "")).status,
-            405
-        );
-    }
-
-    #[test]
-    fn accepts_bounded_client_error_and_warning_logs() {
-        let router = Router::demo();
-        let error = router.handle(&request(
-            "POST",
-            "/api/logs",
-            "level=error&context=starting+audio&message=Media+playback+failed",
-        ));
-        assert_eq!(error.status, 200);
-        assert_eq!(error.body, "{\"status\":\"logged\"}");
-
-        let warning = router.handle(&request(
-            "POST",
-            "/api/logs",
-            "level=warning&message=Recovered+from+an+invalid+node",
-        ));
-        assert_eq!(warning.status, 200);
-        assert_eq!(
-            router
-                .handle(&request("POST", "/api/logs", "level=info&message=no"))
-                .status,
-            422
-        );
-        assert_eq!(router.handle(&request("GET", "/api/logs", "")).status, 405);
-    }
-
-    #[test]
-    fn completed_async_edits_persist_the_sound_graph() {
-        let (router, path) = persisted_demo();
-        let accepted = router.handle(&request(
-            "POST",
-            "/api/edits",
-            "operation_id=persisted-operation&start=4&end=8&prompt=increase+volume",
-        ));
-        let operation_id = serde_json::from_str::<serde_json::Value>(&accepted.body)
-            .expect("accepted edit JSON")["operationId"]
-            .as_str()
-            .expect("operation ID")
-            .to_owned();
-        let completed = wait_for_edit(&router, &accepted);
-        assert_eq!(completed["status"], "completed");
-
-        let recovered = router.handle(&request(
-            "POST",
-            "/api/edits",
-            "operation_id=persisted-operation&start=4&end=8&prompt=increase+volume",
-        ));
-        assert_eq!(recovered.status, 200);
-        let recovered: serde_json::Value =
-            serde_json::from_str(&recovered.body).expect("recovered edit JSON");
-        assert_eq!(recovered["status"], "completed");
-        assert_eq!(recovered["operationId"], operation_id);
-
-        let saved = ProjectStore::open(path.clone()).expect("saved project").1;
-        assert_eq!(saved.project().edits.len(), 1);
-        assert_eq!(saved.project().edits[0].prompt, "increase volume");
-        std::fs::remove_file(path).expect("remove test graph");
-    }
-
-    #[test]
-    fn repeated_operation_id_reuses_the_active_edit_job() {
-        let gate = Arc::new(PlannerGate::new());
-        let mut router = Router::demo();
-        router.ai = Ai::GatedDeterministic(gate.clone());
-        let body = "operation_id=client-operation&start=4&end=8&prompt=increase+volume";
-        let accepted = router.handle(&request("POST", "/api/edits", body));
-        gate.wait_until_started();
-
-        let duplicate = router.handle(&request("POST", "/api/edits", body));
-        assert_eq!(duplicate.status, 200);
-        let accepted_json: serde_json::Value =
-            serde_json::from_str(&accepted.body).expect("accepted edit JSON");
-        let duplicate_json: serde_json::Value =
-            serde_json::from_str(&duplicate.body).expect("duplicate edit JSON");
-        assert_eq!(duplicate_json["id"], accepted_json["id"]);
-        assert_eq!(duplicate_json["operationId"], "client-operation");
-        assert_eq!(duplicate_json["status"], "running");
-
-        gate.release();
-        let completed = wait_for_edit(&router, &accepted);
-        assert_eq!(completed["status"], "completed");
-        let project: serde_json::Value =
-            serde_json::from_str(&router.handle(&request("GET", "/api/project", "")).body)
-                .expect("project JSON");
-        assert_eq!(project["edits"].as_array().expect("project edits").len(), 1);
-        assert!(project["edits"][0]["operationId"].is_null());
-    }
-
-    #[test]
-    fn exhausted_process_capacity_does_not_publish_an_edit_job() {
-        let mut router = Router::demo();
-        let limiter = Limiter::new(1);
-        let held_permit = limiter.acquire().expect("held edit permit");
-        router.edit_limiter = limiter;
-        let body = "operation_id=capacity-operation&start=4&end=8&prompt=increase+volume";
-
-        let rejected = router.handle(&request("POST", "/api/edits", body));
-        assert_eq!(rejected.status, 503);
-        assert!(
-            router
-                .edit_jobs
-                .response_for_operation("capacity-operation")
-                .is_none()
-        );
-
-        drop(held_permit);
-        let accepted = router.handle(&request("POST", "/api/edits", body));
-        assert_eq!(accepted.status, 202);
-        let completed = wait_for_edit(&router, &accepted);
-        assert_eq!(completed["status"], "completed");
-        assert_eq!(completed["operationId"], "capacity-operation");
-    }
-
-    #[test]
-    fn converts_framework_requests_and_decodes_forms() {
-        let body = "prompt=warm+%26+wide&start=0&end=4";
-        let parsed = framework_request(
-            "POST",
-            "/api/edits?source=test",
-            &[("host", "localhost")],
-            body.as_bytes(),
-        )
-        .expect("valid request");
-        assert_eq!(parsed.path, "/api/edits");
-        assert_eq!(parsed.headers["host"], "localhost");
-        assert_eq!(parse_form(&parsed.body)["prompt"], "warm & wide");
-    }
-
-    #[test]
-    fn rejects_ambiguous_unbounded_or_absolute_framework_requests() {
-        assert!(
-            framework_request(
-                "POST",
-                "/api/logs",
-                &[("content-length", "0"), ("content-length", "1")],
-                b"",
-            )
-            .is_err()
-        );
-        assert!(
-            framework_request("GET", "http://localhost/", &[("host", "localhost")], b"",).is_err()
-        );
-        let oversized = "x".repeat(crate::http::MAX_REQUEST_HEADER_BYTES);
-        assert!(
-            framework_request(
-                "GET",
-                "/",
-                &[("host", "localhost"), ("x-fill", &oversized)],
-                b""
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn validates_the_optional_prompt_experiment() {
-        assert!(!parse_optional_boolean(&HashMap::new(), "new_prompt").unwrap());
-        assert!(parse_optional_boolean(&parse_form("new_prompt=true"), "new_prompt").unwrap());
-        assert_eq!(
-            parse_optional_boolean(&parse_form("new_prompt=enabled"), "new_prompt").unwrap_err(),
-            "boolean setting must be true or false"
-        );
-    }
-
-    #[test]
-    fn rejects_untrusted_audio_requests() {
-        let router = Router::demo();
-        assert_eq!(
-            router
-                .handle(&request("GET", "/api/audio-access", ""))
-                .status,
-            403
-        );
-
-        let mut hostile = audio_request("/api/audio-access");
-        hostile
-            .headers
-            .insert("origin".to_owned(), "http://127.0.0.1:18867".to_owned());
-        hostile
-            .headers
-            .insert("sec-fetch-site".to_owned(), "cross-site".to_owned());
-        assert_eq!(router.handle(&hostile).status, 403);
-    }
-
-    #[test]
-    fn streams_one_continuous_wav_through_the_reusable_media_endpoint() {
-        let router = Router::demo();
-        let mut project = router.lock_studio().project().clone();
-        project.duration = audio_analysis::MAX_REGION_SECONDS + 0.125;
-        project.bpm = 113;
-        project.tracks.truncate(1);
-        *router.lock_studio() = Studio::from_project(project);
-        let access = router.handle(&audio_request("/api/audio-access"));
-        assert_eq!(access.status, 200);
-        let access: serde_json::Value =
-            serde_json::from_str(&access.body).expect("audio access JSON");
-        assert_eq!(access["streamToken"], "test-audio-token");
-
-        let version = router.lock_studio().project().version;
-        let stream_request = request(
-            "GET",
-            &format!("/api/audio-stream/test-audio-token/{version}/0"),
-            "",
-        );
-        let plan = router
-            .playback_plan(&stream_request)
-            .expect("continuous playback plan");
-        assert!(matches!(plan.selection, PlaybackSelection::Full));
-        let mut body = Vec::new();
-        router
-            .write_playback_body(&plan, &mut body, &|| false, PlaybackPacing::Unpaced)
-            .expect("continuous WAV stream");
-        let expected_samples =
-            audio_analysis::playback_sample_count(0.0, router.lock_studio().project().duration);
-
-        assert_eq!(plan.total_length, body.len());
-        assert_eq!(body.len(), 44 + expected_samples * 4);
-        assert_eq!(&body[..4], b"RIFF");
-        assert_eq!(&body[8..12], b"WAVE");
-        assert_eq!(
-            u32::from_le_bytes(body[40..44].try_into().expect("WAV data length")) as usize,
-            expected_samples * 4
-        );
-        let render_boundary = 44
-            + (audio_analysis::MAX_REGION_SECONDS * audio_analysis::SAMPLE_RATE as f32) as usize
-                * 4;
-        assert_ne!(&body[render_boundary..render_boundary + 4], b"RIFF");
-
-        let rejected = router
-            .playback_plan(&request(
-                "GET",
-                &format!("/api/audio-stream/wrong-token/{version}/0"),
-                "",
-            ))
-            .expect_err("wrong token must be rejected");
-        assert_eq!(rejected.status, 403);
-    }
-
-    #[test]
-    fn track_spectrum_paths_accept_an_optional_startup_window() {
-        assert_eq!(
-            track_spectrum_stream("/api/track-spectrum/token/42/1500/2000"),
-            Some(("token", 42, 1500, Some(2000)))
-        );
-        assert!(track_spectrum_stream("/api/track-spectrum/token/42/1500/nope").is_none());
-    }
-
-    #[test]
-    fn backend_spectrum_reports_audible_tone_energy() {
-        let frames = 2048;
-        let mut samples = Vec::with_capacity(frames * 2);
-        for frame in 0..frames {
-            let sample = (2.0 * std::f32::consts::PI * 440.0 * frame as f32
-                / audio_analysis::SAMPLE_RATE as f32)
-                .sin()
-                * 0.25;
-            samples.extend_from_slice(&[sample, sample]);
-        }
-        assert!(
-            spectrum_levels(&samples, 1024)
-                .into_iter()
-                .max()
-                .unwrap_or(0)
-                > 128
-        );
-    }
-
-    #[test]
-    fn persisted_spectrum_is_served_without_entering_the_renderer() {
-        let (router, project_path) = persisted_demo();
-        let mut project = router.lock_studio().project().clone();
-        project.duration = 0.25;
-        *router.lock_studio() = Studio::from_project(project.clone());
-        let path = format!("/api/track-spectrum/test-audio-token/{}/0", project.version);
-        let first = router
-            .track_spectrum_data(&request("GET", &path, ""), || false)
-            .expect("cold spectrum request")
-            .expect("cold spectrum response")
-            .body;
-        let cache_path = router
-            .spectrum_cache_path(
-                0,
-                audio_analysis::playback_start_sample_milliseconds(MAX_TRACK_SPECTRUM_WINDOW_MS)
-                    as u64,
-            )
-            .expect("spectrum cache path");
-        assert!(cache_path.is_file());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            assert_eq!(
-                fs::metadata(&cache_path)
-                    .expect("spectrum cache metadata")
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-
-        router.audio_renderer.occupy_for_test();
-        let cold_router = router.clone();
-        let cold_path = format!(
-            "/api/track-spectrum/test-audio-token/{}/100",
-            project.version
-        );
-        let cold = thread::spawn(move || {
-            cold_router.track_spectrum_data(&request("GET", &cold_path, ""), || false)
-        });
-        router
-            .audio_renderer
-            .wait_until_queued_for_test(AudioRenderPriority::Background);
-        let second = router
-            .track_spectrum_data(&request("GET", &path, ""), || false)
-            .expect("cached spectrum request")
-            .expect("cached spectrum response")
-            .body;
-        assert_eq!(first, second);
-
-        router.audio_renderer.release_for_test();
-        cold.join()
-            .expect("cold spectrum worker")
-            .expect("unrelated cold spectrum request")
-            .expect("unrelated cold spectrum response");
-
-        fs::remove_file(cache_path).expect("remove spectrum cache");
-        let cold_cache_path = router
-            .spectrum_cache_path(
-                100,
-                audio_analysis::playback_start_sample_milliseconds(MAX_TRACK_SPECTRUM_WINDOW_MS)
-                    as u64,
-            )
-            .expect("cold spectrum cache path");
-        fs::remove_file(cold_cache_path).expect("remove cold spectrum cache");
-        fs::remove_file(project_path).expect("remove project fixture");
-    }
-
-    #[test]
-    fn export_streams_wav_bytes() {
-        let router = Router::demo();
-        let mut project = router.lock_studio().project().clone();
-        project.duration = 0.5;
-        *router.lock_studio() = Studio::from_project(project);
-        let project = router.lock_studio().project().clone();
-        let expected_samples = audio_analysis::playback_sample_count(0.0, 0.5);
-        let mut body = Vec::new();
-        router
-            .write_export_body(&project, expected_samples, &mut body, &|| false)
-            .expect("streamed export");
-
-        assert_eq!(body.len(), WAV_HEADER_BYTES + expected_samples * 4);
-        assert_eq!(&body[..4], b"RIFF");
-    }
-
-    #[test]
-    fn serves_bounded_byte_ranges_for_maximum_wav_audio() {
-        let router = Router::demo();
-        let mut project = router.lock_studio().project().clone();
-        project.duration = audio_analysis::MAX_WAV_SECONDS;
-        *router.lock_studio() = Studio::from_project(project);
-        let version = router.lock_studio().project().version;
-        let mut range_request = request(
-            "GET",
-            &format!("/api/audio-stream/test-audio-token/{version}/0"),
-            "",
-        );
-        range_request
-            .headers
-            .insert("range".to_owned(), "bytes=0-99".to_owned());
-        let plan = router
-            .playback_plan(&range_request)
-            .expect("partial playback plan");
-        let total_length = WAV_HEADER_BYTES
-            + audio_analysis::playback_sample_count(0.0, audio_analysis::MAX_WAV_SECONDS) * 4;
-        assert_eq!(plan.total_length, total_length);
-        let PlaybackSelection::Range(range) = plan.selection else {
-            panic!("expected a byte range");
-        };
-        assert_eq!(range, ByteRange { start: 0, end: 99 });
-        let mut body = Vec::new();
-        router
-            .write_playback_byte_range(
-                &plan.project,
-                plan.stream_start_sample,
-                plan.sample_count,
-                range,
-                &mut body,
-                &|| false,
-            )
-            .expect("partial WAV response");
-        assert_eq!(body.len(), 100);
-        assert_eq!(&body[..4], b"RIFF");
-
-        let open_range = audio_byte_range("bytes=44-", total_length).expect("open byte range");
-        assert_eq!(open_range.len(), AUDIO_RANGE_SAMPLES * 4);
-    }
-
-    #[test]
-    fn cancelled_stream_leaves_the_render_queue_without_rendering() {
-        let renderer = Arc::new(AudioRenderer::default());
-        let project = Project::demo();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let checked = Arc::new(std::sync::Barrier::new(2));
-        renderer.occupy_for_test();
-
-        let second_renderer = Arc::clone(&renderer);
-        let second_cancelled = Arc::clone(&cancelled);
-        let second_checked = Arc::clone(&checked);
-        let second = thread::spawn(move || {
-            let first_check = AtomicBool::new(true);
-            second_renderer.stream_region_with(
-                &project,
-                1,
-                2,
-                &|| {
-                    if first_check.swap(false, Ordering::SeqCst) {
-                        second_checked.wait();
-                    }
-                    second_cancelled.load(Ordering::SeqCst)
-                },
-                AudioRenderPriority::Background,
-                |_, _, _| -> Result<audio_analysis::AudioRegion, String> {
-                    panic!("a cancelled queued stream must not render")
-                },
-            )
-        });
-
-        checked.wait();
-        cancelled.store(true, Ordering::SeqCst);
-        renderer.release_for_test();
-        assert!(matches!(
-            second.join().expect("cancelled stream thread"),
-            Err(AudioRenderError::Cancelled)
-        ));
-    }
-
-    #[test]
-    fn queued_gemini_render_stops_at_the_edit_deadline() {
-        let router = Router::demo();
-        router.audio_renderer.occupy_for_test();
-        let (job_id, _, _) = router
-            .edit_jobs
-            .create(TEST_AI_POLL_INTERVAL_MS, Some("render-deadline"))
-            .expect("edit job");
-        let cancellation = router.edit_jobs.cancellation(job_id);
-        let request = crate::gemini_tools::AudioRenderRequest {
-            project: Project::demo(),
-            track_ids: Vec::new(),
-            start: 0.0,
-            end: 1.0,
-            description: "deadline test".to_owned(),
-            require_audible_output: false,
-        };
-        let deadline = Instant::now() + Duration::from_millis(150);
-        let worker_router = router.clone();
-        let (completed, completion) = std::sync::mpsc::channel();
-        let worker = thread::spawn(move || {
-            let result =
-                worker_router.render_gemini_audio(job_id, request, &cancellation, deadline);
-            completed.send(result).expect("completion receiver");
-        });
-        router
-            .audio_renderer
-            .wait_until_queued_for_test(AudioRenderPriority::Foreground);
-
-        let error = completion
-            .recv_timeout(Duration::from_secs(1))
-            .expect("deadline must cancel the queued render")
-            .expect_err("queued render must not run");
-        assert_eq!(error, "audio render deadline expired");
-        assert_eq!(
-            router
-                .audio_renderer
-                .queued_for_test(AudioRenderPriority::Foreground),
-            0
-        );
-
-        router.audio_renderer.release_for_test();
-        worker.join().expect("queued render worker");
-    }
-
-    #[test]
-    fn interrupted_gemini_render_keeps_the_job_terminal() {
-        let router = Router::demo();
-        router.audio_renderer.occupy_for_test();
-        let (job_id, _, _) = router
-            .edit_jobs
-            .create(TEST_AI_POLL_INTERVAL_MS, Some("render-interrupt"))
-            .expect("edit job");
-        let cancellation = router.edit_jobs.cancellation(job_id);
-        let request = crate::gemini_tools::AudioRenderRequest {
-            project: Project::demo(),
-            track_ids: Vec::new(),
-            start: 0.0,
-            end: 1.0,
-            description: "interrupt test".to_owned(),
-            require_audible_output: false,
-        };
-        let worker_router = router.clone();
-        let (completed, completion) = std::sync::mpsc::channel();
-        let worker = thread::spawn(move || {
-            let result = worker_router.render_gemini_audio(
-                job_id,
-                request,
-                &cancellation,
-                Instant::now() + Duration::from_secs(1),
-            );
-            completed.send(result).expect("completion receiver");
-        });
-        router
-            .audio_renderer
-            .wait_until_queued_for_test(AudioRenderPriority::Foreground);
-
-        assert!(router.edit_jobs.interrupt(job_id));
-        router.audio_renderer.wake_waiters();
-        let error = completion
-            .recv_timeout(Duration::from_secs(1))
-            .expect("interruption must cancel the queued render")
-            .expect_err("interrupted render must not run");
-        assert_eq!(error, "audio render interrupted");
-        let response = router.edit_jobs.response(job_id).expect("interrupted job");
-        let body: serde_json::Value =
-            serde_json::from_str(&response.body).expect("interrupted job JSON");
-        assert_eq!(body["status"], "failed");
-        assert_eq!(body["errorStatus"], 409);
-
-        router.audio_renderer.release_for_test();
-        worker.join().expect("queued render worker");
-    }
-
-    #[test]
-    fn panicking_render_releases_the_render_queue() {
-        let renderer = AudioRenderer::default();
-        let project = Project::demo();
-
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = renderer.stream_region_with(
-                &project,
-                0,
-                1,
-                &|| false,
-                AudioRenderPriority::Foreground,
-                |_, _, _| -> Result<(), String> { panic!("simulated renderer panic") },
-            );
-        }));
-        assert!(panic.is_err());
-
-        assert!(matches!(
-            renderer.stream_region_with(
-                &project,
-                0,
-                1,
-                &|| false,
-                AudioRenderPriority::Foreground,
-                |_, _, _| Ok(())
-            ),
-            Ok(())
-        ));
-    }
-
-    #[test]
-    fn panicking_cancellation_check_releases_a_queued_waiter() {
-        let renderer = AudioRenderer::default();
-        let project = Project::demo();
-        renderer.occupy_for_test();
-
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let first_check = AtomicBool::new(true);
-            let _ = renderer.stream_region_with(
-                &project,
-                0,
-                1,
-                &|| {
-                    if first_check.swap(false, Ordering::SeqCst) {
-                        false
-                    } else {
-                        panic!("simulated cancellation panic")
-                    }
-                },
-                AudioRenderPriority::Background,
-                |_, _, _| Ok(()),
-            );
-        }));
-        assert!(panic.is_err());
-
-        assert_eq!(renderer.queued_for_test(AudioRenderPriority::Background), 0);
-    }
-
-    #[test]
-    fn playback_render_precedes_queued_spectrum_work() {
-        let renderer = Arc::new(AudioRenderer::default());
-        renderer.occupy_for_test();
-        let project = Project::demo();
-        let (completed, order) = std::sync::mpsc::channel();
-
-        let background_renderer = Arc::clone(&renderer);
-        let background_project = project.clone();
-        let background_completed = completed.clone();
-        let background = thread::spawn(move || {
-            background_renderer.stream_region_with(
-                &background_project,
-                1,
-                2,
-                &|| false,
-                AudioRenderPriority::Background,
-                |_, _, _| {
-                    background_completed
-                        .send("spectrum")
-                        .expect("test receiver");
-                    Ok(())
-                },
-            )
-        });
-        renderer.wait_until_queued_for_test(AudioRenderPriority::Background);
-
-        let foreground_renderer = Arc::clone(&renderer);
-        let foreground_completed = completed.clone();
-        let foreground = thread::spawn(move || {
-            foreground_renderer.stream_region_with(
-                &project,
-                1,
-                2,
-                &|| false,
-                AudioRenderPriority::Foreground,
-                |_, _, _| {
-                    foreground_completed
-                        .send("playback")
-                        .expect("test receiver");
-                    Ok(())
-                },
-            )
-        });
-        renderer.wait_until_queued_for_test(AudioRenderPriority::Foreground);
-        renderer.release_for_test();
-
-        assert_eq!(
-            order
-                .recv_timeout(Duration::from_secs(2))
-                .expect("first render"),
-            "playback"
-        );
-        assert!(matches!(foreground.join(), Ok(Ok(()))));
-        assert!(matches!(background.join(), Ok(Ok(()))));
-    }
-
-    #[test]
-    fn queued_spectrum_render_stops_when_its_project_version_is_stale() {
-        let router = Router::demo();
-        router.audio_renderer.occupy_for_test();
-        let version = router.lock_studio().project().version;
-        let request = request(
-            "GET",
-            &format!("/api/track-spectrum/test-audio-token/{version}/0/1000"),
-            "",
-        );
-        let worker_router = router.clone();
-        let worker = thread::spawn(move || worker_router.track_spectrum_data(&request, || false));
-
-        router
-            .audio_renderer
-            .wait_until_queued_for_test(AudioRenderPriority::Background);
-        let mut project = router.lock_studio().project().clone();
-        project.version += 1;
-        *router.lock_studio() = Studio::from_project(project);
-        router.audio_renderer.release_for_test();
-
-        let result = worker.join().expect("spectrum worker");
-        assert!(matches!(result, Ok(None)));
-    }
-
-    #[test]
-    fn rejects_non_utf8_request_bodies() {
-        let error = framework_request("POST", "/api/edits", &[("host", "localhost")], &[0xff])
-            .expect_err("non-UTF-8 body must be rejected");
-        assert_eq!(error, "request body must be UTF-8");
-    }
-
-    #[test]
-    fn rejects_malformed_host_authorities() {
-        let router = Router::demo();
-        let mut invalid = request("GET", "/api/project", "");
-        invalid
-            .headers
-            .insert("host".to_owned(), "studio.example/path".to_owned());
-
-        let response = router.handle(&invalid);
-        assert_eq!(response.status, 400);
-        assert!(!response.body.contains("Neon First Light"));
-    }
-
-    #[test]
-    fn parses_public_and_ipv6_authorities() {
-        let public = authority("studio.example:8443").expect("public authority");
-        assert_eq!(public.host(), "studio.example");
-        assert_eq!(public.port_u16(), Some(8443));
-        let ipv6 = authority("[::1]:8888").expect("IPv6 authority");
-        assert_eq!(ipv6.host(), "[::1]");
-        assert_eq!(ipv6.port_u16(), Some(8888));
-        assert!(authority("studio.example/path").is_none());
-
-        let mut request = request("POST", "/api/mix", "");
-        request
-            .headers
-            .insert("host".to_owned(), "[::1]:8888".to_owned());
-        request
-            .headers
-            .insert("origin".to_owned(), "http://[::1]:8888".to_owned());
-        assert!(request.is_trusted_request("[::1]:8888"));
-
-        request
-            .headers
-            .insert("origin".to_owned(), "http://[::1]:8888/path".to_owned());
-        assert!(!request.is_trusted_request("[::1]:8888"));
-    }
-
-    #[test]
-    fn response_contains_security_and_length_headers() {
-        let mut response = Response::json(200, "{\"ok\":true}".to_owned());
-        response.set_cookie =
-            Some("daw_ai_user=0123456789abcdef0123456789abcdef; Path=/".to_owned());
-        let response = response.into_http();
-        assert_eq!(response.headers()["content-length"], "11");
-        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert_eq!(
-            response.headers()["set-cookie"],
-            "daw_ai_user=0123456789abcdef0123456789abcdef; Path=/"
-        );
-    }
-
-    #[tokio::test]
-    async fn total_body_deadline_bounds_clients_that_keep_trickling_data() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let producer = tokio::spawn(async move {
-            loop {
-                if sender
-                    .send(Ok::<_, io::Error>(Bytes::from_static(b"x")))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
-        let body = ReceiverBody {
-            receiver,
-            permit: None,
-        }
-        .boxed_unsync();
-        let result = read_request_body(
-            body,
-            BodyReadLimits {
-                idle_timeout: Duration::from_millis(50),
-                timeout: Duration::from_millis(75),
-            },
-        )
-        .await;
-        assert!(matches!(result, Err(RequestBodyReadError::TimedOut)));
-        producer.await.expect("body producer");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn connection_header_and_body_timeouts_preserve_capacity() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test listener");
-        let address = listener.local_addr().expect("test address");
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let connection_limiter = Limiter::new(1);
-        let server = tokio::spawn(serve_http_with_limiter(
-            listener,
-            Router::demo(),
-            async move {
-                let _ = stopped.await;
-            },
-            HttpServerConfig {
-                max_connections: 1,
-                header_timeout: Duration::from_millis(75),
-                body_limits: BodyReadLimits {
-                    idle_timeout: Duration::from_millis(75),
-                    timeout: Duration::from_millis(250),
-                },
-                shutdown_grace_timeout: Duration::from_millis(75),
-            },
-            Arc::clone(&connection_limiter),
-        ));
-
-        let mut missing_headers = tokio::net::TcpStream::connect(address)
-            .await
-            .expect("header-stalled connection");
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        let mut header_overload = tokio::net::TcpStream::connect(address)
-            .await
-            .expect("header overload connection");
-        let header_overload = read_test_connection(&mut header_overload).await;
-        assert!(header_overload.starts_with("HTTP/1.1 503"));
-        assert!(
-            read_test_connection(&mut missing_headers).await.is_empty(),
-            "an incomplete header cannot receive an HTTP response"
-        );
-        wait_for_test_capacity(&connection_limiter).await;
-
-        let mut missing_body = tokio::net::TcpStream::connect(address)
-            .await
-            .expect("body-stalled connection");
-        missing_body
-            .write_all(b"POST /api/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1\r\n\r\n")
-            .await
-            .expect("partial request");
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        let mut body_overload = tokio::net::TcpStream::connect(address)
-            .await
-            .expect("body overload connection");
-        let body_overload = read_test_connection(&mut body_overload).await;
-        assert!(body_overload.starts_with("HTTP/1.1 503"));
-        let timed_out = read_test_connection(&mut missing_body).await;
-        assert!(timed_out.starts_with("HTTP/1.1 408"));
-        wait_for_test_capacity(&connection_limiter).await;
-
-        let mut health = tokio::net::TcpStream::connect(address)
-            .await
-            .expect("health connection");
-        health
-            .write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-            .await
-            .expect("health request");
-        let health = read_test_connection(&mut health).await;
-        assert!(health.starts_with("HTTP/1.1 200"));
-
-        shutdown.send(()).expect("stop test server");
-        server
-            .await
-            .expect("test server task")
-            .expect("test server result");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_cancels_a_long_lived_stream_after_the_grace_period() {
-        let mut router = Router::demo();
-        let limiter = Limiter::new(1);
-        router.stream_limiter = Arc::clone(&limiter);
-        let mut project = router.lock_studio().project().clone();
-        project.duration = 300.0;
-        let version = project.version;
-        *router.lock_studio() = Studio::from_project(project);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test listener");
-        let address = listener.local_addr().expect("test address");
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve_http(
-            listener,
-            router,
-            async move {
-                let _ = stopped.await;
-            },
-            HttpServerConfig {
-                max_connections: 1,
-                header_timeout: Duration::from_secs(1),
-                body_limits: BodyReadLimits {
-                    idle_timeout: Duration::from_secs(1),
-                    timeout: Duration::from_secs(2),
-                },
-                shutdown_grace_timeout: Duration::from_millis(75),
-            },
-        ));
-
-        let mut stream = tokio::net::TcpStream::connect(address)
-            .await
-            .expect("playback connection");
-        stream
-            .write_all(
-                format!(
-                    "GET /api/audio-stream/test-audio-token/{version}/0 HTTP/1.1\r\n\
-                     Host: 127.0.0.1\r\n\r\n"
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("playback request");
-        let mut response = [0_u8; 1024];
-        let response_length =
-            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response))
-                .await
-                .expect("playback response timed out")
-                .expect("playback response");
-        assert!(response[..response_length].starts_with(b"HTTP/1.1 200"));
-        assert!(limiter.acquire().is_none());
-
-        let started = tokio::time::Instant::now();
-        shutdown.send(()).expect("stop test server");
-        tokio::time::timeout(Duration::from_secs(1), server)
-            .await
-            .expect("server shutdown exceeded its bound")
-            .expect("test server task")
-            .expect("test server result");
-        assert!(started.elapsed() < Duration::from_millis(500));
-        assert!(limiter.acquire().is_some());
-    }
-
-    async fn read_test_connection(stream: &mut tokio::net::TcpStream) -> String {
-        let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
-            .await
-            .expect("HTTP connection timed out")
-            .expect("read HTTP connection");
-        String::from_utf8(response).expect("ASCII HTTP response")
-    }
-
-    async fn wait_for_test_capacity(limiter: &Arc<Limiter>) {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some(permit) = limiter.acquire() {
-                    drop(permit);
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("HTTP connection capacity was not released");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropping_a_streaming_response_cancels_its_producer() {
-        let (events, received) = std::sync::mpsc::channel();
-        let limiter = Limiter::new(1);
-        let permit = limiter.acquire().expect("stream permit");
-        let body = streaming_body(permit, move |_, is_cancelled| {
-            events.send("started").expect("event receiver");
-            while !is_cancelled() {
-                thread::sleep(Duration::from_millis(1));
-            }
-            events.send("cancelled").expect("event receiver");
-            Ok(())
-        });
-        assert_eq!(received.recv_timeout(Duration::from_secs(1)), Ok("started"));
-        assert!(limiter.acquire().is_none());
-        drop(body);
-        assert_eq!(
-            received.recv_timeout(Duration::from_secs(1)),
-            Ok("cancelled")
-        );
-        assert!(limiter.acquire().is_some());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn streaming_capacity_rejects_overload_and_releases_on_drop() {
-        let mut router = Router::demo();
-        let limiter = Limiter::new(1);
-        let held = limiter.acquire().expect("held stream permit");
-        router.stream_limiter = Arc::clone(&limiter);
-        let version = router.lock_studio().project().version;
-        let mut stream_request = request(
-            "GET",
-            &format!("/api/audio-stream/test-audio-token/{version}/0"),
-            "",
-        );
-        stream_request
-            .headers
-            .insert("range".to_owned(), "bytes=0-43".to_owned());
-
-        let overloaded = router.playback_response(&stream_request, None);
-        assert_eq!(overloaded.status(), 503);
-        drop(held);
-
-        let response = router.playback_response(&stream_request, None);
-        assert_eq!(response.status(), 206);
-        assert!(limiter.acquire().is_none());
-        drop(response);
-        assert!(limiter.acquire().is_some());
-    }
-
-    #[test]
-    fn history_keeps_every_committed_state() {
-        let mut current = Studio::new().project().clone();
-        let mut history = ProjectHistory::new(current.clone());
-        for index in 0..8 {
-            let mut project = Studio::new().project().clone();
-            project.name = index.to_string();
-            project.version += index + 1;
-            history
-                .push(&current, &project)
-                .expect("append project history");
-            current = project;
-        }
-        assert_eq!(history.len(), 9);
-        assert_eq!(history.current, 8);
-    }
-
-    #[test]
-    fn static_requests_do_not_create_users_and_user_storage_is_bounded() {
-        assert!(!request_needs_user_scope(&request("GET", "/", "")));
-        assert!(!request_needs_user_scope(&request("GET", "/app.js", "")));
-        assert!(!request_needs_user_scope(&request(
-            "GET",
-            "/audio-engine.js",
-            ""
-        )));
-        assert!(!request_needs_user_scope(&request("GET", "/missing", "")));
-        assert!(!request_needs_user_scope(&request(
-            "GET",
-            "/api/missing",
-            ""
-        )));
-        let mut audio_stream = request("GET", "/api/audio-stream/token/1/0", "");
-        assert!(!request_needs_user_scope(&audio_stream));
-        audio_stream.headers.insert(
-            "cookie".to_owned(),
-            "daw_ai_user=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        );
-        assert!(request_needs_user_scope(&audio_stream));
-        assert!(request_needs_user_scope(&request(
-            "GET",
-            "/api/project",
-            ""
-        )));
-
-        let mut cache = HashMap::new();
-        let active_router = Router::demo();
-        active_router
-            .edit_jobs
-            .create(100, None)
-            .expect("active cached edit");
-        cache.insert(
-            "expired".to_owned(),
-            CachedUser {
-                router: active_router,
-                last_used: Instant::now() - USER_CACHE_IDLE - Duration::from_secs(1),
-            },
-        );
-        for index in 0..MAX_CACHED_USERS {
-            cache.insert(
-                index.to_string(),
-                CachedUser {
-                    router: Router::demo(),
-                    last_used: Instant::now(),
-                },
-            );
-        }
-        expire_and_bound_user_cache(&mut cache);
-        assert!(cache.contains_key("expired"));
-        assert!(cache.len() < MAX_CACHED_USERS);
-
-        let id = TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "daw-ai-user-limit-test-{}-{id}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).expect("user limit root");
-        for index in 0..MAX_PERSISTED_USERS {
-            fs::create_dir(root.join(format!("{index:032x}"))).expect("bounded user directory");
-        }
-        let edit_limiter = Limiter::new(MAX_ACTIVE_EDIT_JOBS);
-        let stream_limiter = Limiter::new(MAX_ACTIVE_HTTP_STREAMS);
-        let audio_renderer = Arc::new(AudioRenderer::default());
-        let base = Router {
-            users: Some(Arc::new(UserRegistry {
-                root: root.clone(),
-                ai: Ai::Deterministic(Duration::ZERO),
-                edit_limiter,
-                stream_limiter,
-                audio_renderer,
-                users: Mutex::new(HashMap::new()),
-            })),
-            ..Router::demo()
-        };
-        let mut forged_user = request("GET", "/api/project", "");
-        forged_user.headers.insert(
-            "cookie".to_owned(),
-            "daw_ai_user=ffffffffffffffffffffffffffffffff".to_owned(),
-        );
-        let error = match base.scoped(&forged_user) {
-            Ok(_) => panic!("a client-chosen user ID must not allocate storage"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        let response = scope_error_response(&error);
-        assert_eq!(response.status, 401);
-        assert!(
-            response
-                .set_cookie
-                .is_some_and(|cookie| cookie.contains("Max-Age=0"))
-        );
-        let error = match base.scoped(&request("GET", "/api/project", "")) {
-            Ok(_) => panic!("new persistent user must be rejected at the bound"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
-        assert_eq!(scope_error_response(&error).status, 507);
-        assert!(root.join(format!("{:032x}", 0)).is_dir());
-        fs::remove_dir_all(root).expect("remove user limit root");
-    }
-
-    #[test]
-    fn user_routers_share_process_wide_edit_and_render_limits() {
-        let root = std::env::temp_dir().join(format!(
-            "daw-ai-shared-resources-{}-{}",
-            std::process::id(),
-            crate::storage::unique_test_id()
-        ));
-        fs::create_dir(&root).expect("shared resource root");
-        let edit_limiter = Limiter::new(MAX_ACTIVE_EDIT_JOBS);
-        let stream_limiter = Limiter::new(MAX_ACTIVE_HTTP_STREAMS);
-        let audio_renderer = Arc::new(AudioRenderer::default());
-        let base = Router {
-            edit_limiter: Arc::clone(&edit_limiter),
-            stream_limiter: Arc::clone(&stream_limiter),
-            audio_renderer: Arc::clone(&audio_renderer),
-            users: Some(Arc::new(UserRegistry {
-                root: root.clone(),
-                ai: Ai::Deterministic(Duration::ZERO),
-                edit_limiter,
-                stream_limiter,
-                audio_renderer,
-                users: Mutex::new(HashMap::new()),
-            })),
-            ..Router::demo()
-        };
-
-        let (first, _) = base
-            .scoped(&request("GET", "/api/project", ""))
-            .expect("first user");
-        let (second, _) = base
-            .scoped(&request("GET", "/api/project", ""))
-            .expect("second user");
-
-        assert!(Arc::ptr_eq(&first.edit_limiter, &second.edit_limiter));
-        assert!(Arc::ptr_eq(&first.stream_limiter, &second.stream_limiter));
-        assert!(Arc::ptr_eq(&first.audio_renderer, &second.audio_renderer));
-        fs::remove_dir_all(root).expect("remove shared resource root");
-    }
-
-    #[test]
-    fn interrupt_is_terminal_and_blocks_late_completion() {
-        let jobs = EditJobs::new();
-        let (id, _, _) = jobs.create(100, None).expect("job");
-        assert!(jobs.create(100, None).is_err());
-        let cancellation = jobs.cancellation(id);
-        jobs.set_running(id, "editing", "working");
-        assert!(jobs.interrupt(id));
-        assert!(cancellation.load(Ordering::SeqCst));
-        jobs.set_running(id, "rendering", "too late");
-        jobs.publish_update(id, 2, "too late");
-        jobs.finalize_updates(id, 3);
-        jobs.complete(id, "too late".to_owned());
-        jobs.fail(id, 500, "too late".to_owned());
-        let response = jobs.response(id).expect("interrupted response");
-        let body: serde_json::Value = serde_json::from_str(&response.body).expect("job JSON");
-        assert_eq!(body["status"], "failed");
-        assert_eq!(body["errorStatus"], 409);
-        assert_eq!(body["appliedSteps"], 0);
-        assert_eq!(body["projectVersion"], serde_json::Value::Null);
-        assert!(jobs.is_interrupted(id));
-        assert!(jobs.create(100, None).is_err());
-        jobs.worker_finished(id);
-        assert!(jobs.create(100, None).is_ok());
-    }
-
-    #[test]
-    fn random_user_ids_preserve_the_cookie_contract() {
-        let first = new_operation_id().expect("first random ID");
-        let second = new_operation_id().expect("second random ID");
-        assert!(valid_user_id(&first));
-        assert!(valid_user_id(&second));
-        assert_ne!(first, second);
-    }
-}
+mod tests;
