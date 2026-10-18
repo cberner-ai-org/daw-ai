@@ -504,6 +504,32 @@ fn scheduled_midi_events_for_block<'a>(
     &midi[start..*event_index]
 }
 
+pub(crate) fn routed_clips_in_window(project: &Project, start: f32, end: f32) -> usize {
+    let routing = RackRoutingIndex::new(project);
+    project
+        .clips
+        .iter()
+        .filter(|clip| {
+            clip.start < end
+                && clip.end > start
+                && project.tracks.iter().any(|track| {
+                    !track.muted
+                        && track.volume > 0.0
+                        && clip_occurrences_in_window(
+                            project,
+                            track,
+                            &routing,
+                            clip,
+                            f64::from(start),
+                            f64::from(end),
+                        )
+                        .next()
+                        .is_some()
+                })
+        })
+        .count()
+}
+
 fn clip_events_in_window<'a>(
     project: &Project,
     track: &Track,
@@ -512,52 +538,58 @@ fn clip_events_in_window<'a>(
     window_start: f64,
     window_end: f64,
 ) -> Vec<ClipOccurrence<'a>> {
-    let beat_duration = 60.0 / f64::from(project.bpm);
-    let loop_duration = f64::from(clip.loop_beats) * beat_duration;
-    if loop_duration <= 0.0 || window_end <= window_start {
-        return Vec::new();
-    }
-    if clip.events.is_empty() {
-        return Vec::new();
-    }
-    let first_cycle = if clip.playback_mode == "once" {
-        0
-    } else {
-        ((((window_start - f64::from(clip.source_start)) / loop_duration).floor() as i64) - 1)
-            .max(0)
-    };
-    let last_cycle = if clip.playback_mode == "once" {
-        0
-    } else {
-        (((window_end - f64::from(clip.source_start)) / loop_duration).floor() as i64).max(0)
-    };
-    let mut occurrences = Vec::new();
-    for cycle in first_cycle..=last_cycle {
-        for event in &clip.events {
-            if !routing.track_receives_pitch(clip.rack_id, track, event.pitch) {
-                continue;
-            }
-            let time = f64::from(clip.source_start)
-                + cycle as f64 * loop_duration
-                + f64::from(event.time) * beat_duration;
-            if time < f64::from(clip.start) || time >= f64::from(clip.end) {
-                continue;
-            }
-            if time < window_start - 0.000_001 || time >= window_end - 0.000_001 {
-                continue;
-            }
-            occurrences.push(ClipOccurrence {
-                event,
-                time,
-                duration: event
-                    .duration
-                    .min(((f64::from(clip.end) - time) / beat_duration).max(0.0) as f32),
-                velocity: event.velocity,
-            });
-        }
-    }
+    let mut occurrences =
+        clip_occurrences_in_window(project, track, routing, clip, window_start, window_end)
+            .collect::<Vec<_>>();
     occurrences.sort_by(|left, right| left.time.total_cmp(&right.time));
     occurrences
+}
+
+fn clip_occurrences_in_window<'a>(
+    project: &Project,
+    track: &Track,
+    routing: &RackRoutingIndex,
+    clip: &'a Clip,
+    window_start: f64,
+    window_end: f64,
+) -> impl Iterator<Item = ClipOccurrence<'a>> {
+    let beat_duration = 60.0 / f64::from(project.bpm);
+    let loop_duration = f64::from(clip.loop_beats) * beat_duration;
+    let (first_cycle, last_cycle) = if loop_duration <= 0.0 || window_end <= window_start {
+        (0, -1)
+    } else if clip.playback_mode == "once" {
+        (0, 0)
+    } else {
+        (
+            ((((window_start - f64::from(clip.source_start)) / loop_duration).floor() as i64) - 1)
+                .max(0),
+            (((window_end - f64::from(clip.source_start)) / loop_duration).floor() as i64).max(0),
+        )
+    };
+    clip.events
+        .iter()
+        .filter(move |event| routing.track_receives_pitch(clip.rack_id, track, event.pitch))
+        .flat_map(move |event| {
+            (first_cycle..=last_cycle).filter_map(move |cycle| {
+                let time = f64::from(clip.source_start)
+                    + cycle as f64 * loop_duration
+                    + f64::from(event.time) * beat_duration;
+                if time < f64::from(clip.start) || time >= f64::from(clip.end) {
+                    return None;
+                }
+                if time < window_start - 0.000_001 || time >= window_end - 0.000_001 {
+                    return None;
+                }
+                Some(ClipOccurrence {
+                    event,
+                    time,
+                    duration: event
+                        .duration
+                        .min(((f64::from(clip.end) - time) / beat_duration).max(0.0) as f32),
+                    velocity: event.velocity,
+                })
+            })
+        })
 }
 
 impl<'a> TrackRenderState<'a> {
@@ -861,6 +893,33 @@ mod tests {
 
         assert_eq!(looped, 2);
         assert_eq!(once, 1);
+    }
+
+    #[test]
+    fn progress_checks_dense_loop_clips_without_expanding_them() {
+        let mut project = Project::demo();
+        project.clips.truncate(1);
+        project.bpm = 60;
+        let clip = &mut project.clips[0];
+        clip.end = 256.0;
+        clip.loop_beats = 0.25;
+        let event = clip.events[0].clone();
+        clip.events = (0..1024)
+            .map(|index| {
+                let mut event = event.clone();
+                event.id = index + 1;
+                event.time = index as f32 / 4096.0;
+                event.duration = 0.0001;
+                event
+            })
+            .collect();
+        assert_eq!(routed_clips_in_window(&project, 0.0, 256.0), 1);
+        assert_eq!(routed_clips_in_window(&project, 255.0, 256.0), 1);
+        project.clips[0].playback_mode = "once".to_owned();
+        assert_eq!(routed_clips_in_window(&project, 255.0, 256.0), 0);
+        project.clips[0].playback_mode = "loop".to_owned();
+        project.key_zones.clear();
+        assert_eq!(routed_clips_in_window(&project, 0.0, 256.0), 0);
     }
 
     #[test]
