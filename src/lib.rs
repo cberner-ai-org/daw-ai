@@ -10,6 +10,7 @@ mod http;
 pub mod model;
 mod project_file;
 mod project_history;
+mod project_state;
 pub mod prompt;
 pub mod server;
 mod spectrum;
