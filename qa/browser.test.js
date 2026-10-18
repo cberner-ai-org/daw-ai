@@ -164,6 +164,52 @@ async function run() {
       "track unmute control",
     );
     await cdp.send("Target.closeTarget", { targetId: startupPage.targetId });
+    const modelPage = await openPageWithScript(cdp, appUrl, `(() => {
+      const originalFetch = window.fetch;
+      window.fetch = function(resource, options) {
+        if (resource === '/api/edits') {
+          window.__retriedModel = new URLSearchParams(options.body).get('model');
+          return Promise.resolve(new Response(JSON.stringify({ error: 'Model retry checked' }), {
+            status: 422, headers: { 'Content-Type': 'application/json' },
+          }));
+        }
+        return originalFetch(resource, options);
+      };
+    })()`);
+    await waitFor(async () => evaluate(cdp, modelPage.sessionId,
+      "document.querySelectorAll('.track-row').length === 3"), "model settings page");
+    assert.equal(await evaluate(cdp, modelPage.sessionId,
+      "document.querySelector('#gemini-model').value"), "gemini-4-argon");
+    for (const model of ['gemini-4-argon', undefined]) {
+      const expected = model ?? 'gemini-3.6-flash';
+      await evaluate(cdp, modelPage.sessionId, `(() => {
+        const select = document.querySelector('#gemini-model');
+        select.value = 'gemini-3.8-flash';
+        select.dispatchEvent(new Event('change'));
+        window.__retriedModel = null;
+        localStorage.setItem('daw-ai.pending-edit.v1', JSON.stringify({
+          operationId: 'model-retry', prompt: 'retry an edit', submittedText: 'retry an edit',
+          start: 0, end: 4, acceptedJob: null, model: ${JSON.stringify(model)},
+        }));
+      })()`);
+      await cdp.send("Page.reload", { ignoreCache: true }, modelPage.sessionId);
+      await waitFor(async () => evaluate(cdp, modelPage.sessionId,
+        `window.__retriedModel === ${JSON.stringify(expected)} && localStorage.getItem('daw-ai.pending-edit.v1') === null`),
+        "retried edits retain their original model across reloads, including edits without an explicit model");
+      assert.equal(await evaluate(cdp, modelPage.sessionId,
+        "document.querySelector('#gemini-model').value"), "gemini-3.8-flash",
+        "the saved preference applies to new edits, independently of recovered edits");
+    }
+    await evaluate(cdp, modelPage.sessionId,
+      "localStorage.setItem('daw-ai.gemini-model.v1', 'unavailable-model')");
+    await cdp.send("Page.reload", { ignoreCache: true }, modelPage.sessionId);
+    await waitFor(async () => evaluate(cdp, modelPage.sessionId,
+      "document.querySelectorAll('.track-row').length === 3 && document.querySelector('#gemini-model').value === 'gemini-4-argon'"), "invalid model preference recovery");
+    assert.equal(await evaluate(cdp, modelPage.sessionId,
+      "document.querySelector('#gemini-model').value"), "gemini-4-argon");
+    await evaluate(cdp, modelPage.sessionId, "localStorage.removeItem('daw-ai.gemini-model.v1')");
+    await cdp.send("Target.closeTarget", { targetId: modelPage.targetId });
+
     const rackPage = await openPageWithScript(cdp, appUrl, `(() => {
       const originalFetch = window.fetch;
       window.fetch = async function(resource, options) {
@@ -1039,6 +1085,7 @@ async function run() {
         reportHeight: document.querySelector('#debug-report').getBoundingClientRect().height,
         settingsDisplay: getComputedStyle(document.querySelector('.debug-settings')).display,
         newPrompt: document.querySelector('#new-prompt').checked,
+        model: document.querySelector('#gemini-model').value,
         removedPolicyToggles: document.querySelector('#require-analysis, #dynamic-tools'),
       };
     })()`);
@@ -1051,6 +1098,8 @@ async function run() {
       "the two chartered studio views must be exposed as tabs",
     );
     assert.equal(debugView.debugVisible && debugView.aiHidden, true, "Debug must replace the AI Mode panel");
+    assert.equal(debugView.model, "gemini-4-argon", "Gemini 4 is the default model");
+    assert.match(debugView.report, /AI model for new edits: gemini-4-argon/);
     assert.equal(debugView.newPrompt, false, "the new prompt experiment must default off");
     assert.equal(debugView.removedPolicyToggles, null, "always-on policies must not have toggles");
     assert.ok(
@@ -1400,6 +1449,7 @@ async function run() {
           window.__refusedEditBody = options.body.toString();
           const pending = JSON.parse(localStorage.getItem('daw-ai.pending-edit.v1'));
           window.__persistedNewPromptAtRequest = pending.newPrompt;
+          window.__persistedModelAtRequest = pending.model;
           return Promise.resolve(new Response(JSON.stringify({ error: 'Edit request refused' }), {
             status: 422,
             headers: { 'Content-Type': 'application/json' },
@@ -1441,6 +1491,8 @@ async function run() {
       undefined,
       "the removed required-analysis setting must not travel with the edit request",
     );
+    assert.equal(refusedEditBody.model, "gemini-4-argon");
+    assert.equal(await evaluate(cdp, appSession, "window.__persistedModelAtRequest"), "gemini-4-argon");
     assert.equal(
       refusedEditBody.new_prompt,
       "true",

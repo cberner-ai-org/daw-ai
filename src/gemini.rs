@@ -28,7 +28,35 @@ use crate::prompt::EditPlan;
 use crate::storage::read_bounded_text_following_links;
 
 const STUDIO_CONTRACT: &str = include_str!("../gemini/STUDIO.md");
-pub(crate) const GEMINI_MODEL: &str = "gemini-3.6-flash";
+pub(crate) const GEMINI_MODEL: &str = "gemini-4-argon";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GeminiModel {
+    #[default]
+    Argon4,
+    Flash38,
+    Flash36,
+}
+
+impl GeminiModel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Argon4 => GEMINI_MODEL,
+            Self::Flash38 => "gemini-3.8-flash",
+            Self::Flash36 => "gemini-3.6-flash",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            GEMINI_MODEL => Ok(Self::Argon4),
+            "gemini-3.8-flash" => Ok(Self::Flash38),
+            "gemini-3.6-flash" => Ok(Self::Flash36),
+            _ => Err("unsupported Gemini model; choose a model from Debug settings"),
+        }
+    }
+}
+
 const DEFAULT_INTERACTIONS_ENDPOINT: &str =
     "https://generativelanguage.googleapis.com/v1beta/interactions";
 const SYSTEMD_CREDENTIAL_NAME: &str = "gemini-api-key";
@@ -57,6 +85,7 @@ const TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 
 #[derive(Clone, Copy)]
 struct SessionOptions {
+    model: GeminiModel,
     new_prompt: bool,
     deadline: Instant,
 }
@@ -369,6 +398,7 @@ impl GeminiPlanner {
         end: f32,
         project: &Project,
         new_prompt: bool,
+        model: GeminiModel,
         deadline: Instant,
         cancellation: Arc<AtomicBool>,
         mut render_audio: impl FnMut(AudioRenderRequest) -> Result<AudioRender, String>,
@@ -380,10 +410,11 @@ impl GeminiPlanner {
             prompt,
             start,
             end,
-            SessionVariants { new_prompt },
+            SessionVariants { new_prompt, model },
         )
         .map_err(PlannerError::Io)?;
         let options = SessionOptions {
+            model,
             new_prompt,
             deadline,
         };
@@ -469,6 +500,7 @@ fn run_session_with_transport(
         start,
         end,
         SessionOptions {
+            model: GeminiModel::default(),
             new_prompt: false,
             deadline: Instant::now() + EDIT_TIMEOUT,
         },
@@ -509,7 +541,7 @@ fn run_session_with_transport_options(
         sequence += 1;
         let tools = dynamic_tool_declarations(loaded_tool_group);
         let mut request = serde_json::json!({
-            "model": GEMINI_MODEL,
+            "model": options.model.as_str(),
             "input": input,
             "tools": &tools,
             "system_instruction": system_instruction(options.new_prompt),
@@ -1557,6 +1589,7 @@ mod tests {
             },
             &|| false,
             &mut |sequence, request, _| {
+                assert_eq!(request["model"], "gemini-4-argon");
                 if sequence == 2 {
                     saw_retry_message = request
                         .to_string()
@@ -1617,6 +1650,7 @@ mod tests {
             0.0,
             4.0,
             SessionOptions {
+                model: GeminiModel::Flash38,
                 new_prompt: false,
                 deadline: Instant::now() + EDIT_TIMEOUT,
             },
@@ -1624,6 +1658,7 @@ mod tests {
             &mut |edit| Ok(edit.project),
             &|| false,
             &mut |sequence, request, _| {
+                assert_eq!(request["model"], "gemini-3.8-flash");
                 if sequence == 2 {
                     let request = request.to_string();
                     rejected_stale_call = request.contains("not currently available")
@@ -1680,6 +1715,7 @@ mod tests {
             0.0,
             4.0,
             SessionOptions {
+                model: GeminiModel::default(),
                 new_prompt: false,
                 deadline: Instant::now() + EDIT_TIMEOUT,
             },
@@ -1752,6 +1788,7 @@ mod tests {
             0.0,
             4.0,
             SessionOptions {
+                model: GeminiModel::default(),
                 new_prompt: false,
                 deadline: Instant::now() + EDIT_TIMEOUT,
             },

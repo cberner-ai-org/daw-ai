@@ -64,6 +64,7 @@ pub(crate) struct EditSession {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SessionVariants {
+    pub(crate) model: crate::gemini::GeminiModel,
     pub(crate) new_prompt: bool,
 }
 
@@ -113,7 +114,7 @@ impl EditSession {
                     "createdAt": unix_milliseconds(),
                     "updatedAt": unix_milliseconds(),
                     "status": "running",
-                    "model": crate::gemini::GEMINI_MODEL,
+                    "model": variants.model.as_str(),
                     "prompt": prompt,
                     "start": start,
                     "end": end,
@@ -730,7 +731,10 @@ mod tests {
             "test prompt variant",
             0.0,
             1.0,
-            SessionVariants { new_prompt: true },
+            SessionVariants {
+                new_prompt: true,
+                model: crate::gemini::GeminiModel::Flash36,
+            },
         )
         .expect("session with prompt variant");
 
@@ -738,6 +742,7 @@ mod tests {
             serde_json::from_str(&session.metadata_source().expect("session metadata"))
                 .expect("session metadata JSON");
         assert_eq!(metadata["newPrompt"], true);
+        assert_eq!(metadata["model"], "gemini-3.6-flash");
         assert!(metadata.get("slimPrompt").is_none());
         assert!(metadata.get("dynamicToolLoading").is_none());
         assert!(metadata.get("requireAnalysis").is_none());
