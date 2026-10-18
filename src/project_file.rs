@@ -4,9 +4,9 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::model::{
     CLIP_LIMIT, Clip, ClipEvent, EDIT_LOG_LIMIT, Edit, EditOperation, Effect, Instrument,
-    KEY_ZONE_LIMIT, KeyZone, MAX_MIDI_EVENTS_PER_CLIP, MAX_PROMPT_CHARACTERS, MIN_MIDI_NOTE_BEATS,
-    Modulator, PROJECT_SCHEMA_VERSION, Project, ProjectFileError, Routing, SURGE_ENGINE,
-    TRACK_LIMIT, Track, valid_operation_id, valid_surge_preset,
+    InstrumentRack, KEY_ZONE_LIMIT, KeyZone, MAX_MIDI_EVENTS_PER_CLIP, MAX_PROMPT_CHARACTERS,
+    MIN_MIDI_NOTE_BEATS, Modulator, PROJECT_SCHEMA_VERSION, Project, ProjectFileError, RACK_LIMIT,
+    Routing, SURGE_ENGINE, TRACK_LIMIT, Track, valid_operation_id, valid_surge_preset,
 };
 
 const MAX_TOOLS_PER_TRACK: usize = 256;
@@ -60,19 +60,33 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         .iter()
         .map(|track| track.instrument.id)
         .collect::<HashSet<_>>();
-    let rack = object(field(root, "instrumentRack")?, "instrument rack")?;
-    expect_type(rack, "instrumentRack")?;
-    let zone_values = array(rack, "keyZones")?;
-    if zone_values.len() > KEY_ZONE_LIMIT {
-        return Err(invalid(format!(
-            "instrument rack supports at most {KEY_ZONE_LIMIT} key zones"
-        )));
+    let rack_values = array(root, "instrumentRacks")?;
+    if rack_values.len() > RACK_LIMIT {
+        return Err(invalid("too many instrument racks"));
     }
-    let key_zones = zone_values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| parse_key_zone(value, index, &instrument_ids, &mut ids))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut racks = Vec::new();
+    let mut key_zones = Vec::new();
+    for value in rack_values {
+        let rack = object(value, "instrument rack")?;
+        expect_type(rack, "instrumentRack")?;
+        let rack_id = unique_id(rack, "id", &mut ids, "instrument rack")?;
+        let name = limited_string(rack, "name", 1, 64)?;
+        let zone_values = array(rack, "keyZones")?;
+        if key_zones.len() + zone_values.len() > KEY_ZONE_LIMIT {
+            return Err(invalid("too many key zones"));
+        }
+        for (index, value) in zone_values.iter().enumerate() {
+            key_zones.push(parse_key_zone(
+                value,
+                index,
+                rack_id,
+                &instrument_ids,
+                &mut ids,
+            )?);
+        }
+        racks.push(InstrumentRack { id: rack_id, name });
+    }
+    let rack_ids = racks.iter().map(|rack| rack.id).collect::<HashSet<_>>();
     let clip_values = array(root, "clips")?;
     if clip_values.len() > CLIP_LIMIT {
         return Err(invalid(format!(
@@ -81,7 +95,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
     }
     let clips = clip_values
         .iter()
-        .map(|value| parse_clip(value, duration, &mut ids))
+        .map(|value| parse_clip(value, duration, &rack_ids, &mut ids))
         .collect::<Result<Vec<_>, _>>()?;
     let edit_values = array(root, "edits")?;
     if edit_values.len() > EDIT_LOG_LIMIT {
@@ -118,6 +132,7 @@ pub(crate) fn parse_project(source: &str) -> Result<Project, ProjectFileError> {
         duration,
         version,
         tracks,
+        racks,
         key_zones,
         clips,
         edits,
@@ -242,6 +257,7 @@ fn parse_track(
 fn parse_key_zone(
     value: &JsonValue,
     index: usize,
+    rack_id: u64,
     instrument_ids: &HashSet<u64>,
     ids: &mut HashSet<u64>,
 ) -> Result<KeyZone, ProjectFileError> {
@@ -262,6 +278,7 @@ fn parse_key_zone(
         )));
     }
     Ok(KeyZone {
+        rack_id,
         id,
         low_note,
         high_note,
@@ -623,9 +640,14 @@ fn validate_routing_edges(
 fn parse_clip(
     value: &JsonValue,
     project_duration: f32,
+    rack_ids: &HashSet<u64>,
     ids: &mut HashSet<u64>,
 ) -> Result<Clip, ProjectFileError> {
     let clip = object(value, "MIDI clip")?;
+    let rack_id = integer(clip, "rackId")?;
+    if !rack_ids.contains(&rack_id) {
+        return Err(invalid("MIDI clip references an unknown rack"));
+    }
     let id = unique_id(clip, "id", ids, "MIDI clip")?;
     let start = range(clip, "start", 0.0, project_duration)?;
     let end = range(clip, "end", 0.0, project_duration)?;
@@ -673,6 +695,7 @@ fn parse_clip(
         .map(|value| parse_clip_event(value, loop_beats, ids))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Clip {
+        rack_id,
         id,
         label: limited_string(clip, "label", 1, 64)?,
         start,
@@ -1277,7 +1300,7 @@ mod tests {
             .remove("schemaVersion");
         assert!(parse_project(&project.to_string()).is_err());
 
-        for version in [1, 2, 3, 4, 5, 7] {
+        for version in (1..PROJECT_SCHEMA_VERSION).chain([PROJECT_SCHEMA_VERSION + 1]) {
             project["schemaVersion"] = JsonValue::from(version);
             assert!(parse_project(&project.to_string()).is_err());
         }

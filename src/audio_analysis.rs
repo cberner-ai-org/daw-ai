@@ -25,7 +25,7 @@ struct TrackRenderState<'a> {
 }
 
 struct RackRoutingIndex {
-    pitches_by_instrument: HashMap<u64, [bool; 128]>,
+    pitches_by_instrument: HashMap<(u64, u64), [bool; 128]>,
 }
 
 impl RackRoutingIndex {
@@ -33,7 +33,7 @@ impl RackRoutingIndex {
         let mut pitches_by_instrument = HashMap::new();
         for zone in &project.key_zones {
             let pitches = pitches_by_instrument
-                .entry(zone.instrument_id)
+                .entry((zone.rack_id, zone.instrument_id))
                 .or_insert([false; 128]);
             pitches[usize::from(zone.low_note)..=usize::from(zone.high_note)].fill(true);
         }
@@ -42,9 +42,9 @@ impl RackRoutingIndex {
         }
     }
 
-    fn track_receives_pitch(&self, track: &Track, pitch: u8) -> bool {
+    fn track_receives_pitch(&self, rack_id: u64, track: &Track, pitch: u8) -> bool {
         self.pitches_by_instrument
-            .get(&track.instrument.id)
+            .get(&(rack_id, track.instrument.id))
             .is_some_and(|pitches| pitches[usize::from(pitch)])
     }
 }
@@ -534,7 +534,7 @@ fn clip_events_in_window<'a>(
     let mut occurrences = Vec::new();
     for cycle in first_cycle..=last_cycle {
         for event in &clip.events {
-            if !routing.track_receives_pitch(track, event.pitch) {
+            if !routing.track_receives_pitch(clip.rack_id, track, event.pitch) {
                 continue;
             }
             let time = f64::from(clip.source_start)
@@ -601,7 +601,7 @@ fn maximum_voice_lifetime(project: &Project, track: &Track, routing: &RackRoutin
         .flat_map(|clip| {
             clip.events
                 .iter()
-                .filter(|event| routing.track_receives_pitch(track, event.pitch))
+                .filter(|event| routing.track_receives_pitch(clip.rack_id, track, event.pitch))
         })
         .map(|event| event.duration * beat_duration + 8.0)
         .fold(0.0_f32, f32::max)
@@ -879,13 +879,19 @@ mod tests {
             .instrument
             .id;
         studio
-            .create_key_zone(first_instrument, 60, 60)
+            .create_key_zone(4, first_instrument, 60, 60)
             .expect("overlapping same-instrument zone");
         studio
-            .create_key_zone(second_instrument, 60, 60)
+            .create_key_zone(4, second_instrument, 60, 60)
             .expect("layer zone");
+        studio.create_key_zone(4, first_instrument, 60, 72).unwrap();
+        let separate_rack = studio.create_instrument_rack("Independent").unwrap();
+        studio
+            .create_key_zone(separate_rack, second_instrument, 0, 127)
+            .unwrap();
         let mut project = studio.project().clone();
         project.clips.push(crate::model::Clip {
+            rack_id: 4,
             id: 1_000,
             label: "Rack test".to_owned(),
             start: 0.0,
@@ -926,6 +932,53 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(first[0].event.pitch, 60);
         assert_eq!(second[0].event.pitch, 60);
+        let mut independent = project.clips[0].clone();
+        independent.id = 1002;
+        independent.rack_id = separate_rack;
+        independent.events[0].id = 1003;
+        independent.events[0].time = 0.5;
+        project.clips.push(independent);
+        for (index, expected) in [(0, 1), (1, 2)] {
+            let rendered = render_region(&project, &[project.tracks[index].id], 0.0, 1.0).unwrap();
+            assert_eq!(rendered.event_count, expected);
+            assert!(rendered.samples.iter().any(|sample| sample.abs() > 0.0001));
+        }
+        let independent = &project.clips[1];
+        assert!(
+            clip_events_in_window(
+                &project,
+                &project.tracks[0],
+                &routing,
+                independent,
+                0.0,
+                1.0
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            clip_events_in_window(
+                &project,
+                &project.tracks[1],
+                &routing,
+                independent,
+                0.0,
+                1.0
+            )
+            .len(),
+            1
+        );
+        project.clips[0].events[0].pitch = 73;
+        assert!(
+            clip_events_in_window(
+                &project,
+                &project.tracks[0],
+                &routing,
+                &project.clips[0],
+                0.0,
+                1.0
+            )
+            .is_empty()
+        );
     }
 
     #[test]

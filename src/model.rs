@@ -4,11 +4,12 @@ use std::fmt::{self, Write};
 use serde::Serialize;
 
 pub(crate) const TRACK_LIMIT: usize = 128;
+pub(crate) const RACK_LIMIT: usize = 128;
 pub(crate) const KEY_ZONE_LIMIT: usize = 2_048;
 pub(crate) const CLIP_LIMIT: usize = 2_048;
 pub(crate) const EDIT_LOG_LIMIT: usize = 10_000;
 pub(crate) const MAX_PROMPT_CHARACTERS: usize = 2_000;
-pub(crate) const PROJECT_SCHEMA_VERSION: u64 = 6;
+pub(crate) const PROJECT_SCHEMA_VERSION: u64 = 7;
 pub(crate) const MAX_MIDI_EVENTS_PER_CLIP: usize = 1_024;
 pub(crate) const MIN_MIDI_NOTE_BEATS: f32 = 0.0625;
 pub(crate) const MAX_LOOP_PLAYBACK_BEATS: f32 = 16.0;
@@ -71,6 +72,7 @@ pub struct ClipEvent {
 
 #[derive(Clone, Debug)]
 pub struct Clip {
+    pub rack_id: u64,
     pub id: u64,
     pub label: String,
     pub start: f32,
@@ -82,8 +84,15 @@ pub struct Clip {
     pub events: Vec<ClipEvent>,
 }
 
+#[derive(Clone, Debug)]
+pub struct InstrumentRack {
+    pub id: u64,
+    pub name: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyZone {
+    pub rack_id: u64,
     pub id: u64,
     pub low_note: u8,
     pub high_note: u8,
@@ -189,6 +198,7 @@ pub struct Project {
     pub duration: f32,
     pub version: u64,
     pub tracks: Vec<Track>,
+    pub racks: Vec<InstrumentRack>,
     pub key_zones: Vec<KeyZone>,
     pub clips: Vec<Clip>,
     pub edits: Vec<Edit>,
@@ -196,6 +206,7 @@ pub struct Project {
 }
 
 pub(crate) struct MidiClipSpec {
+    pub(crate) rack_id: u64,
     pub(crate) label: String,
     pub(crate) start: f32,
     pub(crate) end: f32,
@@ -234,6 +245,10 @@ impl Project {
             bpm: 120,
             duration: 32.0,
             version: 1,
+            racks: vec![InstrumentRack {
+                id: 4,
+                name: "Main".to_owned(),
+            }],
             key_zones: Vec::new(),
             tracks: vec![empty_track(1)],
             clips: Vec::new(),
@@ -254,20 +269,27 @@ impl Project {
             bpm: 112,
             duration: 32.0,
             version: 1,
+            racks: vec![InstrumentRack {
+                id: 4,
+                name: "Main".to_owned(),
+            }],
             key_zones: vec![
                 KeyZone {
+                    rack_id: 4,
                     id: 102,
                     low_note: 24,
                     high_note: 47,
                     instrument_id: tracks[0].instrument.id,
                 },
                 KeyZone {
+                    rack_id: 4,
                     id: 202,
                     low_note: 48,
                     high_note: 59,
                     instrument_id: tracks[1].instrument.id,
                 },
                 KeyZone {
+                    rack_id: 4,
                     id: 302,
                     low_note: 60,
                     high_note: 127,
@@ -300,6 +322,9 @@ impl Project {
                 highest = highest.max(modulator.id);
             }
         }
+        for rack in &self.racks {
+            highest = highest.max(rack.id);
+        }
         for zone in &self.key_zones {
             highest = highest.max(zone.id);
         }
@@ -312,9 +337,10 @@ impl Project {
         highest
     }
 
-    pub(crate) fn track_receives_pitch(&self, track: &Track, pitch: u8) -> bool {
+    pub(crate) fn track_receives_pitch(&self, rack_id: u64, track: &Track, pitch: u8) -> bool {
         self.key_zones.iter().any(|zone| {
-            zone.instrument_id == track.instrument.id
+            zone.rack_id == rack_id
+                && zone.instrument_id == track.instrument.id
                 && (zone.low_note..=zone.high_note).contains(&pitch)
         })
     }
@@ -369,19 +395,37 @@ impl Project {
             }
             track.write_json(output);
         }
-        output.push_str("],\"instrumentRack\":{\"type\":\"instrumentRack\",\"keyZones\":[");
-        for (index, zone) in self.key_zones.iter().enumerate() {
+        output.push_str("],\"instrumentRacks\":[");
+        for (index, rack) in self.racks.iter().enumerate() {
             if index > 0 {
                 output.push(',');
             }
             write!(
                 output,
-                "{{\"id\":{},\"lowNote\":{},\"highNote\":{},\"instrumentId\":{}}}",
-                zone.id, zone.low_note, zone.high_note, zone.instrument_id
+                "{{\"id\":{},\"name\":{},\"type\":\"instrumentRack\",\"keyZones\":[",
+                rack.id,
+                json_string(&rack.name)
             )
             .expect("writing to a string cannot fail");
+            for (index, zone) in self
+                .key_zones
+                .iter()
+                .filter(|zone| zone.rack_id == rack.id)
+                .enumerate()
+            {
+                if index > 0 {
+                    output.push(',');
+                }
+                write!(
+                    output,
+                    "{{\"id\":{},\"lowNote\":{},\"highNote\":{},\"instrumentId\":{}}}",
+                    zone.id, zone.low_note, zone.high_note, zone.instrument_id
+                )
+                .expect("writing to a string cannot fail");
+            }
+            output.push_str("]}");
         }
-        output.push_str("]},\"clips\":[");
+        output.push_str("],\"clips\":[");
         for (index, clip) in self.clips.iter().enumerate() {
             if index > 0 {
                 output.push(',');
@@ -685,14 +729,15 @@ impl Clip {
             output,
             concat!(
                 "{{\"id\":{},\"label\":{},\"start\":{},\"end\":{},\"sourceStart\":{},",
-                "\"style\":{}"
+                "\"style\":{},\"rackId\":{}"
             ),
             self.id,
             json_string(&self.label),
             decimal(self.start),
             decimal(self.end),
             decimal(self.source_start),
-            json_string(&self.style)
+            json_string(&self.style),
+            self.rack_id
         )
         .expect("writing to a string cannot fail");
         write!(
@@ -1089,13 +1134,72 @@ impl Studio {
         Ok(())
     }
 
+    pub(crate) fn create_instrument_rack(&mut self, name: &str) -> Result<u64, StudioError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 64 || self.project.racks.len() >= RACK_LIMIT {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let id = self.take_id();
+        self.project.racks.push(InstrumentRack {
+            id,
+            name: name.to_owned(),
+        });
+        self.project.version += 1;
+        Ok(id)
+    }
+
+    pub(crate) fn update_instrument_rack(
+        &mut self,
+        rack_id: u64,
+        name: &str,
+    ) -> Result<(), StudioError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 64 {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let rack = self
+            .project
+            .racks
+            .iter_mut()
+            .find(|rack| rack.id == rack_id)
+            .ok_or(StudioError::UnknownSoundTool)?;
+        rack.name = name.to_owned();
+        self.project.version += 1;
+        Ok(())
+    }
+
+    pub(crate) fn delete_instrument_rack(&mut self, rack_id: u64) -> Result<(), StudioError> {
+        if self
+            .project
+            .clips
+            .iter()
+            .any(|clip| clip.rack_id == rack_id)
+        {
+            return Err(StudioError::InvalidSoundTool);
+        }
+        let index = self
+            .project
+            .racks
+            .iter()
+            .position(|rack| rack.id == rack_id)
+            .ok_or(StudioError::UnknownSoundTool)?;
+        self.project.racks.remove(index);
+        self.project
+            .key_zones
+            .retain(|zone| zone.rack_id != rack_id);
+        self.project.version += 1;
+        Ok(())
+    }
+
     pub(crate) fn create_key_zone(
         &mut self,
+        rack_id: u64,
         instrument_id: u64,
         low_note: u8,
         high_note: u8,
     ) -> Result<u64, StudioError> {
-        if low_note > high_note
+        if !self.project.racks.iter().any(|rack| rack.id == rack_id)
+            || low_note > high_note
             || self.project.key_zones.len() >= KEY_ZONE_LIMIT
             || !self
                 .project
@@ -1107,6 +1211,7 @@ impl Studio {
         }
         let id = self.take_id();
         self.project.key_zones.push(KeyZone {
+            rack_id,
             id,
             low_note,
             high_note,
@@ -1159,6 +1264,7 @@ impl Studio {
 
     pub(crate) fn add_configured_channel(
         &mut self,
+        rack_id: u64,
         source: &Track,
         description: &str,
         color: &str,
@@ -1166,7 +1272,8 @@ impl Studio {
         high_note: u8,
     ) -> Result<(u64, u64), StudioError> {
         let description = description.trim();
-        if self.project.tracks.len() >= TRACK_LIMIT
+        if !self.project.racks.iter().any(|rack| rack.id == rack_id)
+            || self.project.tracks.len() >= TRACK_LIMIT
             || self.project.key_zones.len() >= KEY_ZONE_LIMIT
             || description.is_empty()
             || description.chars().count() > 16
@@ -1208,6 +1315,7 @@ impl Studio {
         self.project.tracks.push(track);
         let zone_id = self.take_id();
         self.project.key_zones.push(KeyZone {
+            rack_id,
             id: zone_id,
             low_note,
             high_note,
@@ -1294,6 +1402,14 @@ impl Studio {
     }
 
     pub(crate) fn create_midi_clip(&mut self, spec: &MidiClipSpec) -> Result<u64, StudioError> {
+        if !self
+            .project
+            .racks
+            .iter()
+            .any(|rack| rack.id == spec.rack_id)
+        {
+            return Err(StudioError::UnknownSoundTool);
+        }
         validate_clip_fields(
             &spec.label,
             spec.start,
@@ -1320,6 +1436,7 @@ impl Studio {
             })
             .collect();
         self.project.clips.push(Clip {
+            rack_id: spec.rack_id,
             id: clip_id,
             label: spec.label.trim().to_owned(),
             start: spec.start,
@@ -1344,6 +1461,14 @@ impl Studio {
         selection_start: f32,
         selection_end: f32,
     ) -> Result<(), StudioError> {
+        if !self
+            .project
+            .racks
+            .iter()
+            .any(|rack| rack.id == spec.rack_id)
+        {
+            return Err(StudioError::UnknownSoundTool);
+        }
         validate_clip_fields(
             &spec.label,
             spec.start,
@@ -1403,6 +1528,7 @@ impl Studio {
             replacements.push(left);
         }
         replacements.push(Clip {
+            rack_id: spec.rack_id,
             id: clip_id,
             label: spec.label.trim().to_owned(),
             start: spec.start,
@@ -2238,6 +2364,7 @@ fn demo_role_track(id: u64, role: DemoPart) -> Track {
 
 fn demo_clip(id: u64, label: &str, role: DemoPart) -> Clip {
     Clip {
+        rack_id: 4,
         id,
         label: label.to_owned(),
         start: 0.0,
@@ -2407,6 +2534,91 @@ mod tests {
     }
 
     #[test]
+    fn racks_validate_references_and_preserve_clip_scope() {
+        let mut studio = Studio::new();
+        let rack_id = studio.create_instrument_rack("Lead").unwrap();
+        studio
+            .update_instrument_rack(rack_id, "Independent lead")
+            .unwrap();
+        let instrument = studio.project.tracks[2].instrument.id;
+        studio.create_key_zone(rack_id, instrument, 0, 127).unwrap();
+        let mut spec = MidiClipSpec {
+            rack_id,
+            label: "Rerouted".to_owned(),
+            start: 8.0,
+            end: 16.0,
+            playback_mode: "loop".to_owned(),
+            loop_beats: 4.0,
+            notes: vec![MidiNote {
+                time: 0.0,
+                duration: 1.0,
+                pitch: 48,
+                velocity: 0.8,
+            }],
+        };
+        studio.replace_midi_clip(12, &spec, 8.0, 16.0).unwrap();
+        assert_eq!(studio.project.clips.len(), 5);
+        for clip in studio
+            .project
+            .clips
+            .iter()
+            .filter(|clip| clip.id == 12 || clip.label == "Warm pulse")
+        {
+            assert_eq!(clip.rack_id, if clip.id == 12 { rack_id } else { 4 });
+        }
+        let saved = studio.project.to_json();
+        assert!(studio.delete_instrument_rack(rack_id).is_err());
+        assert_eq!(studio.project.to_json(), saved);
+        spec.rack_id = u64::MAX;
+        assert!(studio.create_midi_clip(&spec).is_err());
+        assert!(studio.replace_midi_clip(12, &spec, 0.0, 32.0).is_err());
+        assert!(
+            studio
+                .create_key_zone(u64::MAX, instrument, 0, 127)
+                .is_err()
+        );
+        assert_eq!(studio.project.to_json(), saved);
+        let restored = Project::from_json(&saved).unwrap();
+        assert_eq!(restored.to_json(), saved);
+        let source: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        for field in ["rackId", "missingRackId"] {
+            let mut invalid = source.clone();
+            if field == "rackId" {
+                invalid["clips"][0]["rackId"] = 999999.into();
+            } else {
+                invalid["clips"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("rackId");
+            }
+            assert!(Project::from_json(&invalid.to_string()).is_err());
+        }
+        let mut invalid = source.clone();
+        invalid["instrumentRacks"][1]["id"] = invalid["tracks"][0]["id"].clone();
+        assert!(Project::from_json(&invalid.to_string()).is_err());
+        let mut invalid = source;
+        invalid["instrumentRacks"][1]["keyZones"][0]["instrumentId"] = 999999.into();
+        assert!(Project::from_json(&invalid.to_string()).is_err());
+        studio.delete_midi_clip(12, 0.0, 32.0).unwrap();
+        studio.delete_instrument_rack(rack_id).unwrap();
+        assert!(
+            !studio
+                .project
+                .key_zones
+                .iter()
+                .any(|zone| zone.rack_id == rack_id)
+        );
+        assert!(
+            studio
+                .project
+                .tracks
+                .iter()
+                .any(|track| track.instrument.id == instrument)
+        );
+        Project::from_json(&studio.project.to_json()).unwrap();
+    }
+
+    #[test]
     fn midi_clip_splits_rekey_retained_events() {
         let mut deleted = Studio::new();
         deleted
@@ -2428,6 +2640,7 @@ mod tests {
             .replace_midi_clip(
                 11,
                 &MidiClipSpec {
+                    rack_id: 4,
                     label: "Replacement".to_owned(),
                     start: 8.0,
                     end: 16.0,
@@ -2470,6 +2683,7 @@ mod tests {
         let version = studio.project.version;
         let next_id = studio.next_id;
         let clip = MidiClipSpec {
+            rack_id: 4,
             label: "Capacity check".to_owned(),
             start: 8.0,
             end: 16.0,

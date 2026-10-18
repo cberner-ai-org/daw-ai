@@ -221,7 +221,7 @@ fn reset_is_undoable_without_losing_edit_idempotency() {
         "name",
         "bpm",
         "duration",
-        "instrumentRack",
+        "instrumentRacks",
         "clips",
         "tracks",
         "edits",
